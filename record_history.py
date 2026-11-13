@@ -268,6 +268,14 @@ def build_dialog(controller):
         if item.column() != 9 or not session_id: return
         try:
             text = save_memo(session_id, item.text())
+            import map_name
+            if map_name.learn_correction(session_id, text):
+                memos = load_memos()
+                table.blockSignals(True)
+                for index, other in enumerate(rows):
+                    other['memo'] = memos.get(other['session_id'], '')
+                    table.item(index, 9).setText(other['memo'])
+                table.blockSignals(False)
         except OSError as exc:
             tracker.log_error('사냥터 메모 저장', exc); return
         for row in rows:

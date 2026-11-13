@@ -293,6 +293,7 @@ class SharedController(tracker.MeasurementCore):
         from start_captures import StartCaptures
         self.start_captures = StartCaptures(tracker.BASE/'records'/'start-captures')
         self.capture_failures = {}
+        self.map_results = queue.Queue()
         config, warning = tracker.load_settings(tracker.BASE/'settings.json') if restore else ({}, None)
         self.auto_hud = config.get('auto_hud', True)
         if not self.auto_hud:
@@ -525,6 +526,8 @@ class SharedController(tracker.MeasurementCore):
         if not ok: return
         try:
             saved = save_memo(session_id, text)
+            import map_name
+            map_name.learn_correction(session_id, saved)
             self.status.set(f'사냥터 메모 저장 · {saved}' if saved else '사냥터 메모 지움')
         except OSError as exc:
             tracker.log_error('사냥터 메모 저장', exc); self.status.set('사냥터 메모 저장 실패')
@@ -652,6 +655,37 @@ class SharedController(tracker.MeasurementCore):
                         capture_interval=self.scan_seconds)
         for stage in stages:
             self.start_captures.submit(session.session_id, stage, full, frame, metadata)
+        if session.started is not None:
+            self.start_map_reading(session.session_id, full)
+
+    def start_map_reading(self, session_id, full):
+        """Read the minimap name once per measurement, off the UI thread."""
+        import map_name
+        if getattr(self, 'map_read_for', None) == session_id or not map_name.available():
+            return
+        self.map_read_for = session_id
+        def work():
+            try: raw = map_name.read(full)
+            except Exception as exc:
+                tracker.log_error('사냥터 이름 인식', exc); raw = None
+            self.map_results.put((session_id, raw))
+        threading.Thread(target=work, name='map-name', daemon=True).start()
+
+    def apply_map_results(self):
+        import map_name
+        from record_history import load_memos, save_memo
+        while True:
+            try: session_id, raw = self.map_results.get_nowait()
+            except queue.Empty: return
+            if not raw or load_memos().get(session_id):
+                continue  # never overwrite a memo the user already wrote
+            try:
+                name = save_memo(session_id, map_name.resolve(raw))
+                map_name.remember_auto(session_id, raw)
+                if session_id == self.session.session_id:
+                    self.status.set(f'사냥터 자동 인식 · {name}')
+            except OSError as exc:
+                tracker.log_error('사냥터 자동 메모 저장', exc)
 
     def check_efficiency_change(self):
         """After each new minute, ask once about a confirmed change in efficiency."""
@@ -812,6 +846,7 @@ class SharedController(tracker.MeasurementCore):
                 if total >= 60: timer += f' · 사냥 {active*100//total}%'
         self.timer_label.setText(timer)
         self.check_efficiency_change()
+        self.apply_map_results()
         snapshot = self.session.minute_result()
         if snapshot:
             one, six = self.session.valid_minute['one'], self.session.valid_minute['six']
