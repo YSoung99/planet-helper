@@ -48,6 +48,19 @@ class MapNameTests(unittest.TestCase):
         self.assertIsNone(map_name.parse_pick(reply({'0': 0, '1': .01, 'none': .99}), names))
         self.assertIsNone(map_name.parse_pick({'error': 'x'}, names))
 
+    def test_key_store_uses_stdin_on_linux_and_never_argv(self):
+        from unittest.mock import patch
+        import subprocess
+        calls = []
+        def run(command, **kwargs):
+            calls.append((command, kwargs.get('input')))
+            return subprocess.CompletedProcess(command, 0, '', '')
+        with patch.object(map_name.sys, 'platform', 'linux'), patch.object(map_name.subprocess, 'run', run):
+            map_name.store_key('  secret-value  ')
+        command, data = calls[0]
+        self.assertEqual(data, 'secret-value')
+        self.assertNotIn('secret-value', ' '.join(command))
+
 
 if __name__ == '__main__':
     unittest.main()

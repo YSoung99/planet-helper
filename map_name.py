@@ -155,14 +155,42 @@ def known_names(base=None):
 
 
 def gateway_key():
+    """API key from the environment, else the OS key store (macOS Keychain / Linux Secret Service)."""
     key = os.environ.get('LLM_GATEWAY_API_KEY', '')
-    if not key and sys.platform == 'darwin':
+    if not key:
+        command = (['/usr/bin/security', 'find-generic-password', '-s', KEYCHAIN_SERVICE, '-a', 'api-key', '-w']
+                   if sys.platform == 'darwin' else
+                   ['secret-tool', 'lookup', 'service', KEYCHAIN_SERVICE, 'account', 'api-key'])
         try:
-            key = subprocess.run(['/usr/bin/security', 'find-generic-password', '-s', KEYCHAIN_SERVICE,
-                                  '-a', 'api-key', '-w'], capture_output=True, text=True, timeout=60).stdout
+            key = subprocess.run(command, capture_output=True, text=True, timeout=60).stdout
         except (OSError, subprocess.SubprocessError):
             key = ''
     return key.strip() or None
+
+
+def store_key(key):
+    """Save (or with an empty key, delete) the API key in the OS key store. Raises OSError on failure."""
+    key = key.strip()
+    if sys.platform == 'darwin':
+        if key:
+            # -U updates an existing item; the Keychain item is shared with DotMaker.
+            command, data = ['/usr/bin/security', 'add-generic-password', '-U', '-s', KEYCHAIN_SERVICE,
+                             '-a', 'api-key', '-l', 'LLM Gateway', '-w', key], None
+        else:
+            command, data = ['/usr/bin/security', 'delete-generic-password', '-s', KEYCHAIN_SERVICE,
+                             '-a', 'api-key'], None
+    elif key:
+        # The secret goes through stdin so it never appears in the process list.
+        command, data = ['secret-tool', 'store', '--label=LLM Gateway', 'service', KEYCHAIN_SERVICE,
+                         'account', 'api-key'], key
+    else:
+        command, data = ['secret-tool', 'clear', 'service', KEYCHAIN_SERVICE, 'account', 'api-key'], None
+    try:
+        result = subprocess.run(command, input=data, capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise OSError(f'키 저장소를 사용할 수 없어요: {exc}') from exc
+    if result.returncode != 0 and key:  # deleting a key that is not there is fine
+        raise OSError((result.stderr or '키 저장 실패').strip()[:200])
 
 
 def parse_pick(reply, names):

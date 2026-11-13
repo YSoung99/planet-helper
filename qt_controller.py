@@ -505,6 +505,7 @@ class SharedController(tracker.MeasurementCore):
         menu.addAction('정보', self.show_information)
         menu.addAction('사냥 기록 비교', self.show_history)
         menu.addAction('이번 사냥터 메모', self.edit_memo)
+        menu.addAction('JEV API 키 설정', self.api_key_settings)
         menu.addAction('배경 투명도', self.opacity_settings)
         menu.addAction('기록 폴더 열기', self.open_records)
         menu.addAction('시작 화면 폴더 열기', self.open_start_captures)
@@ -516,6 +517,30 @@ class SharedController(tracker.MeasurementCore):
         from record_history import build_dialog
         self.history_dialog = build_dialog(self)
         self.history_dialog.show(); self.history_dialog.raise_()
+
+    def api_key_settings(self):
+        """Enter the LLM Gateway key used by JEV; it is kept only in the OS key store."""
+        from PySide6.QtWidgets import QInputDialog, QLineEdit
+        import map_name
+        has_key = map_name.gateway_key() is not None
+        text, ok = QInputDialog.getText(
+            self.window, 'JEV API 키',
+            ('현재: 저장됨' if has_key else '현재: 없음') + '\n\n'
+            'LLM Gateway API 키를 붙여넣어 주세요.\n'
+            '이 컴퓨터의 키 저장소(맥 키체인 / 리눅스 키링)에만 저장되고,\n'
+            '파일이나 GitHub에는 올라가지 않아요.\n'
+            '비워 두고 확인하면 저장된 키를 지워요.',
+            QLineEdit.EchoMode.Password)
+        if not ok: return
+        if not text.strip() and not has_key: return
+        try:
+            map_name.store_key(text)
+        except OSError as exc:
+            tracker.log_error('JEV API 키 저장', exc)
+            QMessageBox.warning(self.window, 'JEV API 키', f'저장하지 못했어요.\n{exc}')
+            return
+        saved = map_name.gateway_key() is not None
+        self.status.set('JEV API 키 저장됨' if saved else 'JEV API 키 삭제됨')
 
     def edit_memo(self):
         from PySide6.QtWidgets import QInputDialog
