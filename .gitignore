@@ -1,0 +1,33 @@
+# Allowlist: everything is ignored unless listed below, so hunting records,
+# settings, logs, screenshots and the virtualenv can never be committed.
+/*
+!/.gitignore
+!/.gitattributes
+!/README.md
+!/*.py
+!/PlanetEXP.spec
+!/PlanetEXP.icns
+!/exp_table.json
+!/requirements*.txt
+!/requirements*.lock
+!/start.bat
+!/개선내역.md
+!/사용방법.md
+!/경험치표_근거.md
+!/install-linux.sh
+!/tests/
+!/native/
+!/models/
+!/references/
+
+# Never commit inside allowed folders either
+__pycache__/
+*.pyc
+*.png
+*.jpg
+*.jpeg
+*.log
+*.jsonl
+*.csv
+/native/KeyRepeatHelper
+/native/ocr-rust/target/

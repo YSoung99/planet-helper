@@ -1,0 +1,14 @@
+[package]
+name = "planet-ocr-native"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "_planet_ocr"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+image = { version = "0.25", default-features = false }
+ort = { version = "=2.0.0-rc.15", default-features = false, features = ["std", "load-dynamic", "api-24"] }
+pyo3 = { version = "0.29", features = ["extension-module"] }
+regex = "1.12"

@@ -1,0 +1,18 @@
+{
+  "exit_code": 0,
+  "stages": [
+    {
+      "pulses": 1000,
+      "rss_kb": 15840
+    },
+    {
+      "pulses": 10000,
+      "rss_kb": 16016
+    },
+    {
+      "pulses": 100000,
+      "rss_kb": 16128
+    }
+  ],
+  "actual_events_posted": 0
+}
