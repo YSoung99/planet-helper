@@ -82,6 +82,108 @@ def by_memo(rows):
                   key=lambda item: -item[1])
 
 
+def by_level(rows):
+    """Weighted per-minute average per level (total EXP / total hunting time)."""
+    groups = {}
+    for row in rows:
+        if row['level'] is None: continue
+        gained, active = groups.get(row['level'], (0, 0.0))
+        groups[row['level']] = (gained+row['gained'], active+row['active'])
+    return [(level, gained*60/active) for level, (gained, active) in sorted(groups.items())]
+
+
+def build_chart(rows):
+    """Per-minute efficiency over time; hover a point for its details."""
+    from PySide6.QtCore import Qt, QPointF, QRectF
+    from PySide6.QtGui import QColor, QPainter, QPen, QPainterPath
+    from PySide6.QtWidgets import QWidget, QToolTip
+    from qt_controller import short_exp
+
+    class EfficiencyChart(QWidget):
+        LEFT, RIGHT, TOP, BOTTOM = 52, 12, 14, 24
+
+        def __init__(self, points):
+            super().__init__()
+            self.points = points  # oldest first
+            self.setMinimumHeight(170); self.setMouseTracking(True)
+            total_gain = sum(r['gained'] for r in points); total_time = sum(r['active'] for r in points)
+            self.average = total_gain*60/total_time if total_time else 0
+
+        def plot(self):
+            return QRectF(self.LEFT, self.TOP, self.width()-self.LEFT-self.RIGHT,
+                          self.height()-self.TOP-self.BOTTOM)
+
+        def scale(self):
+            values = [r['per_minute'] for r in self.points]
+            high = max(values)*1.1 if values else 1
+            return 0.0, high or 1
+
+        def position(self, index, value):
+            area, (low, high) = self.plot(), self.scale()
+            x = area.left()+(area.width()*index/(len(self.points)-1) if len(self.points) > 1 else area.width()/2)
+            return QPointF(x, area.bottom()-(value-low)/(high-low)*area.height())
+
+        def paintEvent(self, event):
+            painter = QPainter(self); painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+            area, (low, high) = self.plot(), self.scale()
+            painter.fillRect(self.rect(), QColor('#1b2330'))
+            painter.setPen(QColor('#84919f'))
+            for step in range(5):
+                value = low+(high-low)*step/4; y = area.bottom()-area.height()*step/4
+                painter.setPen(QPen(QColor('#2b3542'), 1)); painter.drawLine(QPointF(area.left(), y), QPointF(area.right(), y))
+                painter.setPen(QColor('#84919f'))
+                painter.drawText(QRectF(0, y-8, self.LEFT-6, 16), Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter, short_exp(value))
+            if not self.points:
+                painter.drawText(area, Qt.AlignmentFlag.AlignCenter, '기록 없음'); return
+            previous = None
+            for index, row in enumerate(self.points):  # level changes and date labels
+                x = self.position(index, 0).x()
+                if previous is not None and row['level'] != previous:
+                    painter.setPen(QPen(QColor('#3d4b5a'), 1, Qt.PenStyle.DotLine))
+                    painter.drawLine(QPointF(x, area.top()), QPointF(x, area.bottom()))
+                    painter.setPen(QColor('#9aa8b6')); painter.drawText(QPointF(x+3, area.top()+10), f'Lv.{row["level"]}')
+                previous = row['level']
+            labels = {0, len(self.points)-1, len(self.points)//2}
+            painter.setPen(QColor('#84919f'))
+            for index in sorted(labels):
+                row = self.points[index]
+                if row['started']:
+                    x = self.position(index, 0).x()
+                    box = (QRectF(x, area.bottom()+4, 60, 16), Qt.AlignmentFlag.AlignLeft) if index == 0 else \
+                          (QRectF(x-60, area.bottom()+4, 60, 16), Qt.AlignmentFlag.AlignRight) if index == len(self.points)-1 else \
+                          (QRectF(x-30, area.bottom()+4, 60, 16), Qt.AlignmentFlag.AlignCenter)
+                    painter.drawText(box[0], box[1], row['started'].strftime('%m/%d'))
+            if self.average:
+                y = self.position(0, self.average).y()
+                painter.setPen(QPen(QColor('#e8d9a8'), 1, Qt.PenStyle.DashLine))
+                painter.drawLine(QPointF(area.left(), y), QPointF(area.right(), y))
+                label = QRectF(area.left()+4, y-17, 130, 15)
+                painter.fillRect(label, QColor(27, 35, 48, 220))
+                painter.drawText(label, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, f'전체 평균 {self.average:,.0f}')
+            path = QPainterPath()
+            for index, row in enumerate(self.points):
+                point = self.position(index, row['per_minute'])
+                path.moveTo(point) if index == 0 else path.lineTo(point)
+            painter.setPen(QPen(QColor('#8fe0a8'), 2)); painter.drawPath(path)
+            for index, row in enumerate(self.points):
+                point = self.position(index, row['per_minute'])
+                short = row['active'] < 300  # under 5 minutes: noisy, draw faint
+                painter.setBrush(QColor('#4f6b5a' if short else '#b4e9c6')); painter.setPen(Qt.PenStyle.NoPen)
+                painter.drawEllipse(point, 3 if short else 4, 3 if short else 4)
+
+        def mouseMoveEvent(self, event):
+            if not self.points: return
+            x = event.position().x()
+            index = min(range(len(self.points)), key=lambda i: abs(self.position(i, 0).x()-x))
+            row = self.points[index]
+            when = row['started'].strftime('%m/%d %H:%M') if row['started'] else row['session_id']
+            memo = f" · {row['memo']}" if row.get('memo') else ''
+            QToolTip.showText(event.globalPosition().toPoint(),
+                f"{when} · Lv.{row['level']}{memo}\n분당 {row['per_minute']:,.0f} · 순수 사냥 {clock(row['active'])}", self)
+
+    return EfficiencyChart(list(reversed(rows)))
+
+
 def clock(seconds):
     seconds = int(seconds)
     return f'{seconds//3600}:{seconds%3600//60:02d}' if seconds >= 3600 else f'{seconds//60}분'
@@ -96,7 +198,7 @@ def build_dialog(controller):
     dialog = QDialog(controller.window)
     dialog.setWindowTitle('사냥 기록 비교')
     dialog.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
-    dialog.resize(720, 520)
+    dialog.resize(760, 700)
     dialog.setStyleSheet('QDialog {background:#151b24;} QLabel {color:#d5dee8;}'
                          'QTableWidget {background:#1b2330;color:#d5dee8;gridline-color:#2b3542;}'
                          'QHeaderView::section {background:#25303d;color:#b8c4d0;border:none;padding:4px;}')
@@ -106,6 +208,9 @@ def build_dialog(controller):
     spots = QLabel(); spots.setWordWrap(True); spots.setStyleSheet('color:#e8d9a8;')
     layout.addWidget(spots)
     rows = collect()
+    layout.addWidget(build_chart(rows))
+    levels = QLabel('레벨별 분당 평균 · ' + ' / '.join(f'Lv.{level} {rate:,.0f}' for level, rate in by_level(rows)))
+    levels.setWordWrap(True); levels.setStyleSheet('color:#9aa8b6;'); layout.addWidget(levels)
     headers = ['날짜', 'Lv', '순수 사냥', '휴식', '획득', '분당', '시간당', '사냥터 메모']
     table = QTableWidget(len(rows), len(headers))
     table.setHorizontalHeaderLabels(headers)

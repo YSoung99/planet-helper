@@ -1,5 +1,7 @@
 # 플래닛 도우미 (Planet Helper)
 
+[![tests](https://github.com/YSoung99/planet-helper/actions/workflows/tests.yml/badge.svg)](https://github.com/YSoung99/planet-helper/actions/workflows/tests.yml)
+
 MapleStory Worlds의 메이플 플래닛에서 **경험치 획득량을 화면 판독(OCR)으로 측정**하는 데스크톱 도우미예요.
 게임 메모리를 읽거나 게임 파일을 건드리지 않고, 화면 하단의 `EXP 숫자 [퍼센트]`만 읽어요.
 
@@ -60,6 +62,8 @@ git add -A && git commit -m "변경 내용" && git push   # 이 컴퓨터에서 
 ```bash
 QT_QPA_PLATFORM=offscreen .venv/bin/python -m unittest discover -s tests
 ```
+
+`git push`할 때마다 GitHub Actions가 Linux와 macOS에서 같은 테스트를 자동으로 돌려요.
 
 ## 라이선스와 출처
 

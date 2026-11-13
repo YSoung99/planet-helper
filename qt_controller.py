@@ -214,7 +214,7 @@ class WindowSelection(QDialog):
         self.move(available.center()-self.rect().center())
 
 
-class SharedController(tracker.App):
+class SharedController(tracker.MeasurementCore):
     # ---- Platform hooks (override in linux_app.py / mac_app.py) ----
     APP_TITLE = '플래닛 도우미'
     NATIVE_MENU_BAR = False
@@ -287,6 +287,9 @@ class SharedController(tracker.App):
         self.value = Value('경험치 대기 중')
         self.metrics = Value()
         tracker.BASE.mkdir(parents=True, exist_ok=True)
+        if restore:
+            try: tracker.prune_diagnostics()
+            except OSError as exc: tracker.log_error('진단 기록 정리', exc)
         from start_captures import StartCaptures
         self.start_captures = StartCaptures(tracker.BASE/'records'/'start-captures')
         self.capture_failures = {}
@@ -584,7 +587,7 @@ class SharedController(tracker.App):
 
     def worker(self):
         try:
-            tracker.App.worker(self)
+            tracker.MeasurementCore.worker(self)
         finally:
             client = getattr(self.capture_clients, 'client', None)
             if client is not None and hasattr(client, 'close'): client.close()

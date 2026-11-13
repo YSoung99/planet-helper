@@ -6,6 +6,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import qt_controller
 import tracker
 
 
@@ -40,19 +41,20 @@ class ResilienceTests(unittest.TestCase):
             target = Path(folder)/'export.csv'
             target.write_text('previous export')
             messages = []
-            app = tracker.App.__new__(tracker.App)
+            app = qt_controller.SharedController.__new__(qt_controller.SharedController)
+            app.window = None
             app.status = SimpleNamespace(set=messages.append)
             app.session = tracker.Session()
             app.session.accept((1000, 10), -1)
             app.session.accept((1000, 10), 0)
-            with patch.object(tracker.filedialog, 'asksaveasfilename', return_value=str(target)), \
+            with patch.object(qt_controller.QFileDialog, 'getSaveFileName', return_value=(str(target), 'CSV (*.csv)')), \
                     patch.object(Path, 'replace', side_effect=PermissionError('read only destination')):
                 app.export()
             self.assertEqual(target.read_text(), 'previous export')
             self.assertIn('CSV 저장 실패', messages[-1])
             self.assertIn('PermissionError', (Path(folder)/'last-error.log').read_text())
             self.assertEqual(list(Path(folder).glob('.planet-exp-*.tmp')), [])
-            with patch.object(tracker.filedialog, 'asksaveasfilename', return_value=str(target)):
+            with patch.object(qt_controller.QFileDialog, 'getSaveFileName', return_value=(str(target), 'CSV (*.csv)')):
                 app.export()
             with target.open(encoding='utf-8-sig', newline='') as stream:
                 rows = list(csv.reader(stream))
@@ -64,9 +66,11 @@ class ResilienceTests(unittest.TestCase):
             path = Path(folder)/'settings.json'
             path.write_text('{"level":169}')
             messages = []
-            app = tracker.App.__new__(tracker.App)
-            app.root = SimpleNamespace(winfo_x=lambda: 3, winfo_y=lambda: 542)
+            app = qt_controller.SharedController.__new__(qt_controller.SharedController)
+            app.window = SimpleNamespace(x=lambda: 3, y=lambda: 542)
             app.region = {'left': 683, 'top': 1370, 'width': 185, 'height': 23}
+            app.window_region, app.compact, app.always_on_top = None, True, True
+            app.window_opacity, app.auto_hud = .9, True
             app.session = tracker.Session(level=169)
             app.status = SimpleNamespace(set=messages.append)
             with patch.object(Path, 'replace', side_effect=PermissionError('read only destination')):

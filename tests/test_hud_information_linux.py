@@ -1,3 +1,7 @@
+import sys as _sys
+import unittest as _unittest
+if not _sys.platform.startswith('linux'):
+    raise _unittest.SkipTest('Linux-only (X11/evdev) tests')
 import os
 os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
 import tempfile

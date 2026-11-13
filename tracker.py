@@ -17,22 +17,6 @@ import traceback
 from datetime import datetime
 from collections import deque, Counter
 from pathlib import Path
-if sys.platform == 'darwin' and not getattr(sys, 'frozen', False):
-    # python-build-standalone keeps Tcl/Tk beside its Python runtime.
-    import _tkinter
-    runtime_lib = Path(sys.base_prefix)/'lib'
-    for variable, filename in (('TCL_LIBRARY', f'tcl{_tkinter.TCL_VERSION}/init.tcl'),
-                               ('TK_LIBRARY', f'tk{_tkinter.TK_VERSION}/tk.tcl')):
-        library = runtime_lib/filename
-        if library.exists(): os.environ.setdefault(variable, str(library.parent))
-try:
-    import tkinter as tk
-    from tkinter import filedialog
-    TK_ERROR = tk.TclError
-except ImportError:
-    # The native macOS package uses Qt and does not ship Tcl/Tk.
-    tk = filedialog = None
-    TK_ERROR = RuntimeError
 
 RESOURCES = Path(getattr(sys, '_MEIPASS', Path(__file__).resolve().parent))
 BASE = (Path(os.environ.get('PLANET_EXP_DATA_DIR',
@@ -56,6 +40,39 @@ def log_error(context, error):
             encoding='utf-8')
     except OSError:
         pass
+
+
+DIAGNOSTIC_SUFFIXES = ('-audit.jsonl', '-last-accepted.png', '-last-rejected.png')
+
+
+def prune_diagnostics(base=None, keep=20, log_limit=1_000_000, log_keep=200_000):
+    """Keep diagnostics for the newest `keep` measurements and cap launch.log.
+
+    Hunting records (CSV/JSON) are never touched. Returns the number of files removed.
+    """
+    base = Path(base or BASE)
+    folder = base/'records'
+    removed = 0
+    if folder.is_dir():
+        sessions = {}
+        for path in folder.iterdir():
+            for suffix in DIAGNOSTIC_SUFFIXES:
+                if path.is_file() and path.name.endswith(suffix):
+                    sessions.setdefault(path.name[:-len(suffix)], []).append(path)
+        for session_id in sorted(sessions)[:-keep or None] if keep else sorted(sessions):
+            for path in sessions[session_id]:
+                path.unlink(missing_ok=True); removed += 1
+    log = base/'launch.log'
+    try:
+        if log.stat().st_size > log_limit:
+            # Rewrite in place: the launcher appends through an O_APPEND descriptor.
+            with log.open('r+b') as stream:
+                stream.seek(-log_keep, 2); tail = stream.read()
+                tail = tail[tail.find(b'\n')+1:]
+                stream.seek(0); stream.write(tail); stream.truncate()
+    except OSError:
+        pass
+    return removed
 
 
 def current_boot_id():
@@ -694,168 +711,11 @@ def load_saved_session(path, level, now):
     return session
 
 
-class App:
-    def __init__(self, root, handoff=None):
-        self.root = root
-        root.report_callback_exception = self.report_callback_error
-        self.region = None
-        self.running = False
-        self.generation = 0
-        self.events = queue.Queue()
-        self.session = Session(level=169)
-        self.engine = None
-        self.last_update = None
-        self.scan_seconds = 0
-        self.target_seconds = 1.0
-        self.preview_frame = None
-        self.preview_stamp = None
-        self.preview_photo = None
-        self.save_warning = ''
-        self.audit_warning = ''
-        self.worker_ready = False
-        self.stop = threading.Event()
-        root.title('Planet EXP')
-        BASE.mkdir(parents=True, exist_ok=True)
-        root.geometry(f'280x492+{max(20, root.winfo_screenwidth()-300)}+90')
-        root.configure(bg='#151b24')
-        root.overrideredirect(True)
-        root.attributes('-topmost', True)
-        root.after(100, lambda: root.attributes('-alpha', 0.97))
-        root.resizable(False, False)
-        self.status = tk.StringVar(value='영역을 지정하고 측정을 시작하세요')
-        self.value = tk.StringVar(value='경험치 대기 중')
-        self.metrics = tk.StringVar()
-        self.canvas = tk.Canvas(root, width=280, height=492, bg='#151b24', highlightthickness=0)
-        c = self.canvas
-        c.pack(fill='both', expand=True)
-        c.create_rectangle(0, 0, 279, 491, outline='#35414d')
-        c.create_rectangle(1, 1, 279, 3, fill='#a8edbb', outline='')
-        c.create_text(15, 23, text='PLANET', fill='#f0f4f8', anchor='w', font=('Helvetica Neue', 10, 'bold'))
-        c.create_text(74, 23, text=f'/ EXP {APP_VERSION}', fill='#84919f', anchor='w', font=('Helvetica Neue', 8))
-        c.create_text(185, 23, text='Lv.', anchor='w', fill='#98a7b7', font=('Helvetica Neue', 8))
-        self.level_var = tk.IntVar(value=169)
-        self.level_picker = tk.Spinbox(root, from_=1, to=219, textvariable=self.level_var, command=self.change_level, width=4, bg='#25303d', fg='#b4e9c6', buttonbackground='#25303d', insertbackground='white', relief='flat', highlightthickness=0, font=('Helvetica Neue', 9))
-        self.level_picker.place(x=203, y=14, width=46, height=19)
-        self.level_picker.bind('<Return>', lambda e: self.change_level())
-        self.level_picker.bind('<FocusOut>', lambda e: self.change_level())
-        c.create_text(263, 23, text='×', fill='#84919f', font=('Helvetica Neue', 13), tags='close')
-        c.create_text(15, 50, text='총 획득 경험치', fill='#98a7b7', anchor='w', font=('Helvetica Neue', 9))
-        self.total_item = c.create_text(14, 78, text='0', fill='#f4f8fc', anchor='w', font=('Helvetica Neue', 25, 'bold'))
-        c.create_line(15, 106, 265, 106, fill='#2b3542')
-        c.create_text(15, 122, text='1분당 평균', fill='#98a7b7', anchor='w', font=('Helvetica Neue', 9))
-        c.create_text(151, 122, text='6분당 평균', fill='#98a7b7', anchor='w', font=('Helvetica Neue', 9))
-        self.minute_item = c.create_text(15, 145, text='—', fill='#b4e9c6', anchor='w', font=('Helvetica Neue', 13, 'bold'))
-        self.six_item = c.create_text(151, 145, text='—', fill='#b4e9c6', anchor='w', font=('Helvetica Neue', 13, 'bold'))
-        self.timer_item = c.create_text(265, 50, text='사냥 00:00:00', fill='#b4e9c6', anchor='e', font=('Helvetica Neue', 9, 'bold'))
-        c.create_text(15, 175, text='직전 1분 획득 ≈', fill='#98a7b7', anchor='w', font=('Helvetica Neue', 9))
-        c.create_text(151, 175, text='최근 6분 획득 ≈', fill='#98a7b7', anchor='w', font=('Helvetica Neue', 9))
-        self.recent_minute_item = c.create_text(15, 198, text='—', fill='#e9eef4', anchor='w', font=('Helvetica Neue', 13, 'bold'))
-        self.recent_six_item = c.create_text(151, 198, text='—', fill='#e9eef4', anchor='w', font=('Helvetica Neue', 13, 'bold'))
-        self.minute_info_item = c.create_text(15, 218, text='1분마다 집계 · 첫 결과 대기', fill='#84919f', anchor='w', font=('Helvetica Neue', 8))
-        c.create_oval(15, 230, 21, 236, fill='#7c8c9d', outline='', tags='indicator')
-        self.footer_item = c.create_text(28, 233, text='측정 대기', fill='#84919f', anchor='w', font=('Helvetica Neue', 8))
-        c.create_line(15, 247, 265, 247, fill='#2b3542')
-        for tag, label, x1, x2, command in (
-            ('region', '영역 지정', 15, 80, self.select),
-            ('reset', '새 측정', 86, 145, self.reset),
-            ('export', 'CSV 저장', 151, 211, self.export),
-        ):
-            c.create_rectangle(x1, 254, x2, 274, fill='#25303d', outline='', tags=tag)
-            c.create_text((x1+x2)/2, 264, text=label, fill='#c4cfda', font=('Helvetica Neue', 8), tags=tag)
-            c.tag_bind(tag, '<Button-1>', lambda e, callback=command: callback())
-        c.create_rectangle(217, 254, 265, 274, fill='#304e3d', outline='', tags='toggle')
-        self.toggle_item = c.create_text(241, 264, text='시작', fill='#c6f1d3', font=('Helvetica Neue', 9, 'bold'), tags='toggle')
-        c.tag_bind('close', '<Button-1>', lambda e: self.close())
-        c.tag_bind('toggle', '<Button-1>', lambda e: self.toggle())
-        c.create_line(15, 284, 265, 284, fill='#2b3542')
-        self.current_item = c.create_text(15, 300, text=self.value.get(), fill='#b4e9c6', anchor='w', font=('Helvetica Neue', 9))
-        self.baseline_item = c.create_text(15, 316, text='시작 기준 —', fill='#98a7b7', anchor='w', font=('Helvetica Neue', 8))
-        self.table_item = c.create_text(15, 332, text='169레벨 통 405,810,702 · 사진 대조', fill='#98a7b7', anchor='w', font=('Helvetica Neue', 8))
-        self.detail_item = c.create_text(15, 348, text=self.status.get(), width=250, fill='#a8b5c3', anchor='nw', font=('Helvetica Neue', 8))
-        c.create_text(15, 384, text='Medium · 2스레드 · 자동 기록 저장\n목표 1~5초 · CPU 부하 따라 조절\n첫 경험치 증가 확인부터 사냥 시간 측정', fill='#84919f', anchor='nw', font=('Helvetica Neue', 8))
-        c.create_text(15, 441, text='실제 인식 영역 · 가려지면 판독 보류', fill='#98a7b7', anchor='w', font=('Helvetica Neue', 8))
-        c.create_rectangle(15,453,265,484,fill='#101721',outline='#2b3542')
-        self.preview_item = c.create_image(15,453,anchor='nw')
-        self.preview_hint = c.create_text(140,468,text='측정 시작 후 표시',fill='#84919f',font=('Helvetica Neue',8))
-        def drag_start(event):
-            self.drag_origin = (event.x_root-root.winfo_x(), event.y_root-root.winfo_y())
-        def drag_move(event):
-            if hasattr(self, 'drag_origin'):
-                x, y = event.x_root-self.drag_origin[0], event.y_root-self.drag_origin[1]
-                if sys.platform == 'darwin':
-                    from macos_support import configure_window
-                    configure_window(root, (x, y, 280, 492))
-                else:
-                    root.geometry(f'{x:+d}{y:+d}')
-        c.bind('<Button-1>', drag_start)
-        c.bind('<B1-Motion>', drag_move)
-        c.bind('<ButtonRelease-1>', lambda event: self.save_config())
-        config, settings_warning = load_settings(BASE/'settings.json')
-        self.region = config.get('region')
-        self.session = Session(level=config.get('level', 169))
-        self.level_var.set(self.session.level)
-        position = config.get('position')
-        if position is not None:
-            self.place_window(position)
-        if sys.platform == 'darwin':
-            root.after(150, self.configure_mac_window)
-            root.bind('<Command-q>', lambda event: (self.close(), 'break')[1])
-            root.createcommand('tk::mac::Quit', self.close)
-            menu = tk.Menu(root, tearoff=False)
-            menu.add_command(label='화면 기록 권한', command=self.check_permission)
-            from macos_support import open_records
-            menu.add_command(label='기록 폴더 열기', command=lambda: open_records(BASE/'records'))
-            menu.add_separator()
-            menu.add_command(label='종료', command=self.close)
-            c.bind('<Button-2>', lambda event: menu.tk_popup(event.x_root, event.y_root))
-            c.bind('<Control-Button-1>', lambda event: menu.tk_popup(event.x_root, event.y_root))
-        self.restore_latest_record()
-        if handoff is not None:
-            self.resume_handoff(handoff)
-        if settings_warning:
-            self.status.set(settings_warning)
-        threading.Thread(target=self.worker, daemon=True).start()
-        root.after(200, self.poll)
-        root.protocol('WM_DELETE_WINDOW', self.close)
+class MeasurementCore:
+    """Measurement, OCR worker and record persistence shared by the Qt apps.
 
-    def configure_mac_window(self):
-        try:
-            from macos_support import configure_window
-            configure_window(self.root)
-        except Exception as exc:
-            log_error('macOS 창 표시', exc)
-
-    def report_callback_error(self, kind, value, tb):
-        try:
-            (BASE/'callback-error.log').write_text(''.join(traceback.format_exception(kind, value, tb)), encoding='utf-8')
-        except OSError:
-            pass
-        log_error('화면 동작', value)
-        self.status.set('화면 동작 오류 · callback-error.log 확인')
-
-    def place_window(self, position):
-        import mss
-        x, y = position
-        with mss.MSS() as capture:
-            monitors = capture.monitors[1:]
-        if not any(m['left'] <= x < m['left']+m['width']-40 and
-                   m['top'] <= y < m['top']+m['height']-40 for m in monitors):
-            x, y = max(20, self.root.winfo_screenwidth()-300), 90
-        if sys.platform == 'darwin':
-            from macos_support import configure_window
-            configure_window(self.root, (x, y, 280, 492))
-        else:
-            self.root.geometry(f'280x492{x:+d}{y:+d}')
-
-    def check_permission(self):
-        if sys.platform != 'darwin':
-            return True
-        from macos_support import ensure_capture_permission
-        allowed = ensure_capture_permission(self.root)
-        if not allowed:
-            self.status.set('화면 기록 권한 허용 후 앱 다시 실행')
-        return allowed
-
+    The UI lives in qt_controller.SharedController, which subclasses this.
+    """
     def restore_latest_record(self):
         folder = BASE/'records'
         if not folder.exists(): return
@@ -906,7 +766,7 @@ class App:
     def change_level(self):
         try:
             level = self.level_var.get()
-        except (ValueError, TK_ERROR):
+        except (ValueError, TypeError):
             self.level_var.set(self.session.level or 169)
             return
         if level == self.session.level: return
@@ -921,75 +781,6 @@ class App:
         self.value.set('경험치 대기 중')
         self.status.set('레벨 변경 · 시작으로 기준 재인식')
         self.save_config()
-
-    def select(self):
-        if not self.finish_measurement('영역 재지정'):
-            return
-        import mss
-        try:
-            with mss.MSS() as capture:
-                monitors = [dict(m) for m in capture.monitors[1:]]
-        except Exception as exc:
-            log_error('영역 선택', exc)
-            self.status.set('화면 정보 확인 실패 · 앱 다시 실행')
-            return
-        self.selection_windows = []
-        def cancel(event=None):
-            for win in self.selection_windows:
-                if win.winfo_exists(): win.destroy()
-            self.selection_windows = []
-        for index, monitor in enumerate(monitors):
-            self.select_monitor(monitor, index, cancel)
-
-    def select_monitor(self, monitor, index, cancel):
-        win = tk.Toplevel(self.root)
-        self.selection_windows.append(win)
-        win.title(f'Planet EXP Region {index}')
-        win.overrideredirect(True)
-        win.geometry(f'{monitor["width"]}x{monitor["height"]}{monitor["left"]:+d}{monitor["top"]:+d}')
-        win.attributes('-topmost', True)
-        # Select directly over the live desktop; never cover it with a capture.
-        win.configure(bg='#142536')
-        win.attributes('-alpha', 0.25)
-        canvas = tk.Canvas(win, bg='#142536', highlightthickness=0, cursor='crosshair')
-        canvas.pack(fill='both', expand=True)
-        canvas.create_text(20, 30, anchor='w', text='경험치 숫자와 [퍼센트]만 드래그 · ESC 취소', fill='#ffda70', font=('Helvetica Neue', 18, 'bold'))
-        selection = {}
-        def down(event):
-            selection['start'] = (event.x, event.y)
-            if 'rect' in selection: canvas.delete(selection['rect'])
-            selection['rect'] = canvas.create_rectangle(event.x, event.y, event.x, event.y, outline='#ff5555', width=2)
-        def move(event):
-            if 'start' in selection: canvas.coords(selection['rect'], *selection['start'], event.x, event.y)
-        def up(event):
-            if 'start' not in selection: return
-            x, y = selection['start']; left, top = min(x,event.x), min(y,event.y)
-            width, height = abs(event.x-x), abs(event.y-y)
-            if width < 40 or height < 8: return
-            self.region = dict(left=left+monitor['left'], top=top+monitor['top'], width=width, height=height)
-            self.save_config()
-            self.reset(); self.status.set('영역 저장됨 · 시작 버튼 클릭'); cancel()
-        canvas.bind('<Button-1>', down); canvas.bind('<B1-Motion>', move); canvas.bind('<ButtonRelease-1>', up)
-        win.bind('<Escape>', cancel)
-        win.update_idletasks()
-        if sys.platform == 'darwin':
-            from macos_support import configure_window
-            configure_window(win, (monitor['left'], monitor['top'], monitor['width'], monitor['height']))
-        win.attributes('-alpha', 0.25)
-        win.focus_force()
-
-    def toggle(self):
-        if not self.region:
-            self.select(); return
-        if self.running:
-            self.finish_measurement('사용자 정지')
-            self.status.set('정지 · 시작 시 새 측정'); return
-        if not self.check_permission():
-            return
-        if not self.reset():
-            return
-        self.running = True
-        self.status.set('인식기 준비 중')
 
     def reset(self):
         was_running = self.running
@@ -1146,135 +937,6 @@ class App:
                 del _capture_state.backend
             _capture_state.disabled = False
 
-    def poll(self):
-        if self.worker_ready and self.status.get().startswith('인식기 준비 실패'):
-            self.status.set('인식기 준비 완료 · 시작으로 새 측정' if not self.running else '인식기 복구 · 화면 확인 중')
-        try:
-            while True:
-                event = self.events.get_nowait()
-                generation, value, raw, score, error = event[:5]
-                observed_at = event[5] if len(event) > 5 else time.monotonic()
-                details = event[6] if len(event)>6 else {}
-                before = len(self.session.rows)
-                if generation != self.generation: continue
-                if details.get('initialization_error'):
-                    self.status.set('인식기 준비 실패 · 2초 후 재시도')
-                    continue
-                if not self.running: continue
-                if error:
-                    self.status.set(error[:55]+' · 자동 재시도 중')
-                elif value:
-                    old_count = len(self.session.rows)
-                    previous_value = self.session.last
-                    state = self.session.accept(value, observed_at, corroborated=details.get('temporal',{}).get('selected') is not None)
-                    if len(self.session.rows) > old_count:
-                        self.remember_accepted_capture(previous_value, details)
-                        try:
-                            self.save_observation()
-                            self.save_warning = ''
-                        except OSError as exc:
-                            log_error('자동 기록 저장', exc)
-                            self.save_warning = '자동 저장 실패 · CSV로 별도 보관'
-                            state += ' · 자동 저장 실패'
-                    self.status.set(f'{state} · 갱신 {self.scan_seconds:.1f}초')
-                    if self.session.last:
-                        exp,pct = self.session.last
-                        self.value.set(f'{exp:,}  [{pct:.2f}%]')
-                    if self.session.blocked:
-                        self.finish_measurement(state)
-                else:
-                    self.status.set('설명창 가림 · 경험치 바에서 마우스 이동' if details.get('covered') else '숫자 판독 보류 · 아래 영역/창 가림 확인')
-                try:
-                    self.save_audit(observed_at,value,raw,score,len(self.session.rows)>before,details)
-                    self.audit_warning = ''
-                except OSError as exc:
-                    log_error('진단 기록 저장', exc)
-                    self.audit_warning = '진단 저장 실패 · last-error.log 확인'
-        except queue.Empty:
-            pass
-        gained, hourly, _, _ = self.session.stats(time.monotonic())
-        per_minute = hourly / 60
-        per_six_minutes = per_minute * 6
-        self.metrics.set(f'총 획득 경험치  {gained:,.0f}\n1분당 평균       {per_minute:,.0f}\n6분당 평균       {per_six_minutes:,.0f}')
-        c = self.canvas
-        now = time.monotonic()
-        elapsed = int(self.session.elapsed(now))
-        timer = ('기준 확인 중' if self.session.first is None else '첫 증가 대기') if self.session.started is None else f'사냥 {elapsed//3600:02d}:{elapsed%3600//60:02d}:{elapsed%60:02d}'
-        c.itemconfigure(self.timer_item, text=timer)
-        snapshot = self.session.minute_result()
-        if snapshot:
-            one, six = self.session.valid_minute['one'], self.session.valid_minute['six']
-            c.itemconfigure(self.recent_minute_item,text=f'{one["one"]:,.0f}' if one else '미확정')
-            c.itemconfigure(self.recent_six_item,text=f'{six["six"]:,.0f}' if six else '미확정')
-            remaining = max(0, math.ceil((snapshot['index']+1)*60-self.session.elapsed(now)))
-            quality = '관측 공백 추정' if snapshot['estimated'] else '분별 집계'
-            if snapshot['one'] is None or snapshot['six'] is None:
-                info = f'공백 미확정 · 1분 {one["index"] if one else "—"}:00 / 6분 {six["index"] if six else "—"}:00'
-            else:
-                info = f'{quality} {snapshot["index"]}:00 · 다음 {remaining}초' if self.running else f'{snapshot["index"]}:00 집계 · 측정 정지'
-            if (self.running and snapshot['one'] is not None and snapshot['six'] is not None
-                    and self.session.elapsed(now) >= (snapshot['index']+1)*60):
-                info = f'집계 {snapshot["index"]}:00 유지 · 새 관측 대기'
-        else:
-            text = '첫 1분 대기' if self.session.started is not None else '집계 대기'
-            c.itemconfigure(self.recent_minute_item,text=text)
-            c.itemconfigure(self.recent_six_item,text=text)
-            remaining = max(0,60-int(self.session.elapsed(now)))
-            info = f'첫 집계까지 {remaining}초 · 1분마다 갱신' if self.session.started is not None else '첫 증가 후 1분마다 집계'
-        c.itemconfigure(self.minute_info_item,text=info)
-        c.itemconfigure(self.total_item, text=f'{gained:,.0f}')
-        c.itemconfigure(self.minute_item, text=f'{per_minute:,.0f}' if self.session.started is not None and elapsed >= 5 else '계산 중' if self.session.started is not None else '—')
-        c.itemconfigure(self.six_item, text=f'{per_six_minutes:,.0f}' if self.session.started is not None and elapsed >= 5 else '계산 중' if self.session.started is not None else '—')
-        c.itemconfigure(self.toggle_item, text='정지' if self.running else '새 시작' if self.session.first else '시작', font=('Helvetica Neue', 8, 'bold'))
-        warning = self.status.get()
-        if not self.running:
-            footer = '측정 대기' if self.session.first is None else '이전 기록 · 측정 정지' if self.session.restored else '측정 정지'
-        elif self.session.started is None and self.session.first:
-            footer = '준비 완료 · 첫 경험치 증가 대기'
-        elif '재시도' in warning or '오류' in warning:
-            footer = '캡처 재시도 중'
-        else:
-            footer = f'갱신 {self.scan_seconds:.1f}초 · 목표 {self.target_seconds:.1f}초' if self.session.first else '숫자 확인 중'
-        if self.running and self.session.samples and now-self.session.samples[-1][0] > 5:
-            footer = f'인식 지연 · {int(now-self.session.samples[-1][0])}초 전 값'
-        if self.save_warning or self.audit_warning:
-            footer = self.save_warning or self.audit_warning
-        c.itemconfigure(self.footer_item, text=footer)
-        c.itemconfigure(self.current_item, text=self.value.get())
-        baseline = f'시작 기준 {self.session.first[0]:,}' if self.session.first else '시작 기준 —'
-        c.itemconfigure(self.baseline_item, text=baseline)
-        known = self.session.level is not None and self.session.level in EXP_TABLE
-        checked = str(self.session.level) in EXP_METADATA.get('screenshot_verified', {})
-        if known:
-            suffix = '사진 대조' if checked else '참고표'
-            if self.session.last:
-                table_text = f'남음 {self.session.total-self.session.last[0]:,} · 통 {self.session.total:,}'
-            else:
-                table_text = f'{self.session.level}레벨 통 {self.session.total:,} · {suffix}'
-        else:
-            table_text = '경험치통 추정치 사용'
-        c.itemconfigure(self.table_item, text=table_text)
-        c.itemconfigure(self.detail_item, text=self.status.get())
-        delayed = self.session.samples and now-self.session.samples[-1][0]>5
-        c.itemconfigure('indicator', fill='#e7b86e' if self.running and delayed else '#a8edbb' if self.running else '#7c8c9d')
-        if self.preview_frame is not None and self.preview_frame[1] != self.preview_stamp:
-            from PIL import ImageTk
-            frame,self.preview_stamp = self.preview_frame
-            self.preview_photo = ImageTk.PhotoImage(frame.resize((250,31)))
-            c.itemconfigure(self.preview_item,image=self.preview_photo)
-            c.itemconfigure(self.preview_hint,text='')
-        self.root.after(200, self.poll)
-
-    def save_config(self):
-        try:
-            BASE.mkdir(parents=True, exist_ok=True)
-            temporary = BASE/'settings.json.tmp'
-            temporary.write_text(json.dumps({'region': self.region, 'position': [self.root.winfo_x(), self.root.winfo_y()], 'level': self.session.level}), encoding='utf-8')
-            temporary.replace(BASE/'settings.json')
-        except OSError as exc:
-            log_error('설정 저장', exc)
-            self.status.set('창 위치/영역 저장 실패')
-
     def save_observation(self):
         folder = BASE/'records'
         folder.mkdir(exist_ok=True)
@@ -1356,50 +1018,6 @@ class App:
                 frame.save(folder/name)
                 self.saved_frame_keys[group] = key
 
-    def export(self):
-        target = filedialog.asksaveasfilename(defaultextension='.csv', initialfile='planet-exp.csv', filetypes=[('CSV','*.csv')])
-        if not target: return
-        temporary = None
-        try:
-            destination = Path(target)
-            with tempfile.NamedTemporaryFile('w', newline='', encoding='utf-8-sig',
-                    dir=destination.parent, prefix='.planet-exp-', suffix='.tmp', delete=False) as stream:
-                temporary = Path(stream.name)
-                writer=csv.writer(stream); writer.writerow(['관측 시각','현재 경험치','퍼센트','사냥 초','총 획득 경험치','상태']); writer.writerows(self.session.rows)
-            temporary.replace(destination)
-        except OSError as exc:
-            log_error('CSV 저장', exc)
-            self.status.set('CSV 저장 실패 · 저장 위치/권한 확인')
-        else:
-            self.status.set('CSV 저장 완료')
-        finally:
-            if temporary is not None:
-                try: temporary.unlink(missing_ok=True)
-                except OSError: pass
 
-    def close(self):
-        if not self.finish_measurement('앱 종료'):
-            return
-        self.save_config()
-        self.stop.set(); self.root.destroy()
-
-if __name__ == '__main__':
-    import argparse
-    parser = argparse.ArgumentParser(description='Planet EXP tracker')
-    parser.add_argument('--resume-handoff', type=Path, default=None)
-    parser.add_argument('--self-test-report', type=Path, default=None)
-    options = parser.parse_args()
-    if options.self_test_report is not None:
-        from diagnostics import run_diagnostics
-        run_diagnostics(options.self_test_report)
-        sys.exit(0)
-    try: ctypes.windll.shcore.SetProcessDpiAwareness(2)
-    except (AttributeError, OSError): pass
-    try:
-        App(tk.Tk(), handoff=options.resume_handoff).root.mainloop()
-    except Exception as exc:
-        log_error('앱 실행', exc)
-        from tkinter import messagebox
-        messagebox.showerror('메이플 플래닛 EXP',
-                             f'앱을 실행하지 못했어요.\n{exc}\n\n오류 기록: {BASE / "last-error.log"}')
-        raise
+# Backwards-compatible name used by tests and diagnostics.
+App = MeasurementCore

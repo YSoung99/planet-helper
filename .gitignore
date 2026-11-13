@@ -4,13 +4,13 @@
 !/.gitignore
 !/.gitattributes
 !/README.md
+!/.github/
 !/*.py
 !/PlanetEXP.spec
 !/PlanetEXP.icns
 !/exp_table.json
 !/requirements*.txt
 !/requirements*.lock
-!/start.bat
 !/개선내역.md
 !/사용방법.md
 !/경험치표_근거.md

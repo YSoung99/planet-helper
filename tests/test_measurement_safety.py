@@ -226,9 +226,11 @@ class MeasurementSafetyTests(unittest.TestCase):
 
     def test_failed_final_save_preserves_session_and_blocks_reset_level_change_and_close(self):
         with tempfile.TemporaryDirectory() as folder, patch.object(tracker, 'BASE', Path(folder)):
-            for action in ('reset', 'change_level', 'close'):
+            for action in ('reset', 'change_level', 'shutdown'):
                 with self.subTest(action=action):
-                    app = tracker.App.__new__(tracker.App)
+                    import qt_controller
+                    app = qt_controller.SharedController.__new__(qt_controller.SharedController)
+                    app.key_repeat = SimpleNamespace(shutdown=lambda: None)
                     app.session = tracker.Session(level=169)
                     establish(app.session, (172680132, 42.55))
                     app.session.accept((172680232, 42.55), 2)
