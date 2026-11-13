@@ -55,8 +55,10 @@ def summarize(csv_path):
         started = datetime.strptime(csv_path.stem[:15], '%Y%m%d-%H%M%S')
     except ValueError:
         started = None
+    import segments
     return dict(session_id=csv_path.stem, started=started, level=level, active=active, idle=idle,
-                gained=gained, per_minute=gained*60/active)
+                gained=gained, per_minute=gained*60/active,
+                changes=segments.find_changes(session.minute_snapshots))
 
 
 def collect(base=None):
@@ -66,8 +68,12 @@ def collect(base=None):
         row = summarize(path)
         if row: rows.append(row)
     memos = load_memos(base)
+    import segments
+    tags = segments.load_tags(base)
     for row in rows:
         row['memo'] = memos.get(row['session_id'], '')
+        for change in row['changes']:
+            change['tag'] = tags.get(row['session_id'], {}).get(str(change['minute']), '')
     return rows
 
 
@@ -184,6 +190,18 @@ def build_chart(rows):
     return EfficiencyChart(list(reversed(rows)))
 
 
+def change_text(changes):
+    from qt_controller import short_exp
+    return ' / '.join(f"{c['minute']}분~ {short_exp(c['before'])}→{short_exp(c['after'])}"
+                      + (f" ({c['tag']})" if c.get('tag') else '') for c in changes) or '—'
+
+
+def ratio(row):
+    """Share of the measured time spent hunting (EXP rising), in percent."""
+    total = row['active']+row['idle']
+    return row['active']*100/total if total else 0.0
+
+
 def clock(seconds):
     seconds = int(seconds)
     return f'{seconds//3600}:{seconds%3600//60:02d}' if seconds >= 3600 else f'{seconds//60}분'
@@ -198,7 +216,7 @@ def build_dialog(controller):
     dialog = QDialog(controller.window)
     dialog.setWindowTitle('사냥 기록 비교')
     dialog.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
-    dialog.resize(760, 700)
+    dialog.resize(900, 700)
     dialog.setStyleSheet('QDialog {background:#151b24;} QLabel {color:#d5dee8;}'
                          'QTableWidget {background:#1b2330;color:#d5dee8;gridline-color:#2b3542;}'
                          'QHeaderView::section {background:#25303d;color:#b8c4d0;border:none;padding:4px;}')
@@ -211,7 +229,7 @@ def build_dialog(controller):
     layout.addWidget(build_chart(rows))
     levels = QLabel('레벨별 분당 평균 · ' + ' / '.join(f'Lv.{level} {rate:,.0f}' for level, rate in by_level(rows)))
     levels.setWordWrap(True); levels.setStyleSheet('color:#9aa8b6;'); layout.addWidget(levels)
-    headers = ['날짜', 'Lv', '순수 사냥', '휴식', '획득', '분당', '시간당', '사냥터 메모']
+    headers = ['날짜', 'Lv', '순수 사냥', '휴식', '사냥 비율', '획득', '분당', '시간당', '효율 변화', '사냥터 메모']
     table = QTableWidget(len(rows), len(headers))
     table.setHorizontalHeaderLabels(headers)
     table.verticalHeader().setVisible(False)
@@ -220,20 +238,24 @@ def build_dialog(controller):
     for index, row in enumerate(rows):
         cells = [row['started'].strftime('%m/%d %H:%M') if row['started'] else row['session_id'],
                  str(row['level'] or '—'), clock(row['active']), clock(row['idle']) if row['idle'] >= 60 else '—',
-                 short_exp(row['gained']), f"{row['per_minute']:,.0f}", short_exp(row['per_minute']*60), row['memo']]
+                 f"{ratio(row):.0f}%",
+                 short_exp(row['gained']), f"{row['per_minute']:,.0f}", short_exp(row['per_minute']*60),
+                 change_text(row['changes']), row['memo']]
         for column, text in enumerate(cells):
             item = QTableWidgetItem(text)
-            if column < 7:
+            if column < 9:
                 item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
                 if column >= 4: item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
             else:
                 item.setData(Qt.ItemDataRole.UserRole, row['session_id'])
-            if column == 5 and row['per_minute'] == best:
+            if column == 4 and ratio(row) < 50:
+                item.setForeground(QColor('#e7b86e'))
+            if column == 6 and row['per_minute'] == best:
                 item.setForeground(QColor('#8fe0a8'))
             table.setItem(index, column, item)
     header = table.horizontalHeader()
     header.setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
-    header.setSectionResizeMode(7, QHeaderView.ResizeMode.Stretch)
+    header.setSectionResizeMode(9, QHeaderView.ResizeMode.Stretch)
 
     def refresh_spots():
         ranked = by_memo(rows)
@@ -243,7 +265,7 @@ def build_dialog(controller):
 
     def edited(item):
         session_id = item.data(Qt.ItemDataRole.UserRole)
-        if item.column() != 7 or not session_id: return
+        if item.column() != 9 or not session_id: return
         try:
             text = save_memo(session_id, item.text())
         except OSError as exc:

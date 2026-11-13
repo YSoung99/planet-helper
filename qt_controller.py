@@ -653,6 +653,52 @@ class SharedController(tracker.MeasurementCore):
         for stage in stages:
             self.start_captures.submit(session.session_id, stage, full, frame, metadata)
 
+    def check_efficiency_change(self):
+        """After each new minute, ask once about a confirmed change in efficiency."""
+        count = len(self.session.minute_snapshots)
+        key = (self.session.session_id, count)
+        if key == getattr(self, '_change_checked', None):
+            return
+        self._change_checked = key
+        pending = None
+        if self.running and count:
+            import segments
+            asked = segments.load_tags().get(self.session.session_id, {})
+            for change in segments.find_changes(self.session.minute_snapshots):
+                if str(change['minute']) not in asked:
+                    pending = change
+        self.pending_change = pending
+        if pending is None:
+            self.change_prompt.setVisible(False)
+        else:
+            direction = '▲' if pending['after'] > pending['before'] else '▼'
+            self.change_prompt.setText(
+                f"{direction} {pending['minute']}분째부터 분당 {short_exp(pending['before'])} → {short_exp(pending['after'])}"
+                ' · 뭐가 달라졌나요? (눌러서 태그)')
+            if self.change_prompt.isHidden():
+                self.change_prompt.setVisible(True)
+                from display_panel import resize
+                resize(self)
+
+    def answer_change_prompt(self):
+        change = getattr(self, 'pending_change', None)
+        if change is None: return
+        from PySide6.QtWidgets import QInputDialog
+        import segments
+        text, ok = QInputDialog.getText(
+            self.window, '효율 변화',
+            f"{change['minute']}분째부터 분당 {change['before']:,.0f} → {change['after']:,.0f}\n"
+            '여기서 뭐가 달라졌나요? (예: 버프 끝, 파티 합류, 맵 이동)\n비워 두고 확인하면 다시 묻지 않아요.')
+        if not ok: return
+        try:
+            segments.save_tag(self.session.session_id, change['minute'], text)
+        except OSError as exc:
+            tracker.log_error('효율 변화 태그 저장', exc); return
+        self._change_checked = None
+        self.change_prompt.setVisible(False)
+        from display_panel import resize
+        resize(self)
+
     def continue_level_up(self, new_level):
         """Keep the running measurement when the HUD shows a higher level."""
         old = self.session.level
@@ -762,7 +808,10 @@ class SharedController(tracker.MeasurementCore):
             timer = f'사냥 {active//3600:02d}:{active%3600//60:02d}:{active%60:02d}'
             if idle:
                 timer += f' · {"휴식 중" if self.session.resting(now) else "휴식"} {idle//60}:{idle%60:02d}'
+                total = active+idle
+                if total >= 60: timer += f' · 사냥 {active*100//total}%'
         self.timer_label.setText(timer)
+        self.check_efficiency_change()
         snapshot = self.session.minute_result()
         if snapshot:
             one, six = self.session.valid_minute['one'], self.session.valid_minute['six']
