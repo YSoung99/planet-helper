@@ -26,6 +26,28 @@ class MapNameTests(unittest.TestCase):
             self.assertEqual(memos['c'], '내가 쓴 메모')
             self.assertEqual(map_name.resolve('사자왕의 성 · 낮은 성벽위', base), '사자왕의 성 · 낮은 성벽3')
 
+    def test_jev_is_asked_only_when_ocr_is_not_a_confirmed_name(self):
+        with tempfile.TemporaryDirectory() as base:
+            asked = []
+            ask = lambda picture, names: asked.append(names) or names[0]
+            self.assertIsNone(map_name.choose('사자왕의 성 · 낮은 성벽스', None, base, ask))  # nothing confirmed yet
+            record_history.save_memo('typed', '사자왕의 성 · 낮은 성벽2', base)
+            self.assertIsNone(map_name.choose('사자왕의 성 · 낮은 성벽2', None, base, ask))
+            self.assertEqual(asked, [])
+            self.assertEqual(map_name.choose('사자왕의 성 · 낮은 성벽스', None, base, ask), '사자왕의 성 · 낮은 성벽2')
+            map_name.learn_alias('사자왕의 성 · 낮은 성벽스', '사자왕의 성 · 낮은 성벽2', base)
+            self.assertIsNone(map_name.choose('사자왕의 성 · 낮은 성벽스', None, base, ask))
+            self.assertEqual(len(asked), 1)
+
+    def test_jev_answer_needs_high_probability_and_a_listed_name(self):
+        names = ['사자왕의 성 · 낮은 성벽2', '사자왕의 성 · 높은 성벽1']
+        reply = lambda probabilities: {'answers': [{'name': 'map', 'type': 'choice', 'probabilities': [
+            {'value': value, 'probability': p} for value, p in probabilities.items()]}]}
+        self.assertEqual(map_name.parse_pick(reply({'0': .02, '1': .97, 'none': .01}), names), names[1])
+        self.assertIsNone(map_name.parse_pick(reply({'0': .6, '1': .3, 'none': .1}), names))
+        self.assertIsNone(map_name.parse_pick(reply({'0': 0, '1': .01, 'none': .99}), names))
+        self.assertIsNone(map_name.parse_pick({'error': 'x'}, names))
+
 
 if __name__ == '__main__':
     unittest.main()

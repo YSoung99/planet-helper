@@ -665,25 +665,30 @@ class SharedController(tracker.MeasurementCore):
             return
         self.map_read_for = session_id
         def work():
-            try: raw = map_name.read(full)
+            raw = picked = None
+            try:
+                raw = map_name.read(full)
+                picked = map_name.choose(raw, map_name.title_area(full))
             except Exception as exc:
-                tracker.log_error('사냥터 이름 인식', exc); raw = None
-            self.map_results.put((session_id, raw))
+                tracker.log_error('사냥터 이름 인식', exc)
+            self.map_results.put((session_id, raw, picked))
         threading.Thread(target=work, name='map-name', daemon=True).start()
 
     def apply_map_results(self):
         import map_name
         from record_history import load_memos, save_memo
         while True:
-            try: session_id, raw = self.map_results.get_nowait()
+            try: session_id, raw, picked = self.map_results.get_nowait()
             except queue.Empty: return
-            if not raw or load_memos().get(session_id):
+            if not (raw or picked) or load_memos().get(session_id):
                 continue  # never overwrite a memo the user already wrote
             try:
-                name = save_memo(session_id, map_name.resolve(raw))
-                map_name.remember_auto(session_id, raw)
+                name = save_memo(session_id, picked or map_name.resolve(raw))
+                if raw:
+                    if picked: map_name.learn_alias(raw, picked)  # same misread next time needs no JEV call
+                    map_name.remember_auto(session_id, raw)
                 if session_id == self.session.session_id:
-                    self.status.set(f'사냥터 자동 인식 · {name}')
+                    self.status.set(f'사냥터 자동 인식 · {name}' + (' (JEV 확인)' if picked else ''))
             except OSError as exc:
                 tracker.log_error('사냥터 자동 메모 저장', exc)
 
