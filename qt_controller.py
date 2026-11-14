@@ -61,14 +61,16 @@ def short_exp(value):
     return f'{value/1e8:.2f}억' if value >= 1e8 else f'{value/1e4:,.0f}만' if value >= 1e4 else f'{value:,.0f}'
 
 
-def level_eta_text(rate, session):
+def level_eta_text(rate, session, *, compact=False):
     """Hourly EXP and time to the next level from the cumulative per-minute average."""
     level = f'Lv.{session.level} ' if session.level else ''
     if rate['status'] != 'ready' or not rate['cumulative'] or not session.total or not session.last:
-        return f'{level}레벨업 예상 · 평균 집계 후 표시'
+        return '레벨업 예상 —' if compact else f'{level}레벨업 예상 · 평균 집계 후 표시'
     remaining = max(0, session.total-session.last[0])
     minutes = math.ceil(remaining/rate['cumulative'])
     eta = f'{minutes//60}시간 {minutes%60}분' if minutes >= 60 else f'{minutes}분'
+    if compact:
+        return f'레벨업 약 {eta}'
     ups = f' · 레벨업 {len(session.level_ups)}회' if session.level_ups else ''
     return (f'{level}시간당 {short_exp(rate["cumulative"]*60)} · 레벨업까지 {eta} '
             f'({remaining/session.total*100:.1f}% 남음){ups}')
@@ -83,10 +85,10 @@ class TrackerWindow(QWidget):
 
     def paintEvent(self, event):
         painter = QPainter(self)
-        painter.fillRect(self.rect(), QColor(21, 27, 36, round(self.controller.window_opacity*255)))
+        painter.fillRect(self.rect(), QColor(13, 23, 36, round(self.controller.window_opacity*255)))
         painter.setPen(QPen(QColor('#35414d'), 1))
         painter.drawRect(self.rect().adjusted(0, 0, -1, -1))
-        painter.fillRect(0, 0, self.width(), 3, QColor('#a8edbb'))
+
 
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton and event.position().y() < 44:
@@ -462,6 +464,8 @@ class SharedController(tracker.MeasurementCore):
         self.compact_average.setToolTip(info)
         self.compact_six_average.setToolTip(info)
         self.level_eta.setText(level_eta_text(rate, self.session))
+        self.compact_level_eta.setText(level_eta_text(rate, self.session, compact=True))
+        self.compact_level_eta.setToolTip(self.level_eta.text())
 
     def update_repeat(self, state):
         enabled = bool(state.get('enabled'))
@@ -550,6 +554,11 @@ class SharedController(tracker.MeasurementCore):
         menu = QMenu(self.window)
         menu.addAction('정보', self.show_information)
         menu.addAction('사냥 기록 비교', self.show_history)
+        pinned = menu.addAction('항상 맨 위')
+        pinned.setCheckable(True)
+        pinned.setChecked(self.always_on_top)
+        pinned.toggled.connect(self.toggle_pin)
+        menu.addAction('연타 설정', self.repeat_settings)
         collect = menu.addAction('대기 중 최근 경험치 모으기')
         collect.setCheckable(True)
         collect.setChecked(self.recent_recording)
@@ -1165,19 +1174,22 @@ class SharedController(tracker.MeasurementCore):
         self.total_label.setText(f'{gained:,.0f}')
         self.compact_total.setText(self.total_label.text())
         self.update_rate_display(now)
+        hunt_time = '사냥 00:00:00'
         if self.session.started is None:
             timer = '기준 확인 중' if self.session.first is None else '첫 증가 대기'
         else:
             active, idle = int(self.session.active_elapsed(now)), int(self.session.idle(now))
             gap = int(self.session.gap_seconds(now))
-            timer = f'사냥 {active//3600:02d}:{active%3600//60:02d}:{active%60:02d}'
+            hunt_time = f'사냥 {active//3600:02d}:{active%3600//60:02d}:{active%60:02d}'
+            timer = hunt_time
             if idle:
                 timer += f' · {"휴식 중" if self.session.resting(now) else "휴식"} {idle//60}:{idle%60:02d}'
                 total = active+idle
                 if total >= 60 and not gap: timer += f' · 사냥 {active*100//total}%'
             if gap:
                 timer += f' · 공백 {gap//60}:{gap%60:02d}'
-        self.timer_label.setText(timer)
+        self.timer_label.setText(hunt_time if self.compact else timer)
+        self.timer_label.setToolTip(timer)
         while not self.hunt_activity_results.empty():
             generation, stamp, observation = self.hunt_activity_results.get_nowait()
             if self.running and generation == self.generation:
@@ -1281,6 +1293,11 @@ class SharedController(tracker.MeasurementCore):
         self.ui_label.setText(ui_text)
         self.title_label.setToolTip(ui_text)
         self.toggle_button.setText('측정 정지' if self.running else '측정 시작')
+        if self.toggle_button.property('running') != self.running:
+            self.toggle_button.setProperty('running', self.running)
+            style = self.toggle_button.style()
+            style.unpolish(self.toggle_button)
+            style.polish(self.toggle_button)
         self.update_recent_button(now)
         self.auto_measure_tick(now)
         if self.preview_frame is not None and self.preview_frame[1] != self.preview_stamp:
