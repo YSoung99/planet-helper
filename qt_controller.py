@@ -316,6 +316,8 @@ class SharedController(tracker.MeasurementCore):
         self.auto_hud = config.get('auto_hud', True)
         self.recent_recording = config.get('recent_recording', True)
         self.burning = config.get('burning', False)
+        self.auto_measure = config.get('auto_measure', False)
+        self.auto_start_hold = None
         self.jev_enabled = config.get('jev_enabled', False)
         self.recent_permission = start_worker and self.has_background_capture_permission()
         self.recent_exp = RecentExp()
@@ -552,6 +554,10 @@ class SharedController(tracker.MeasurementCore):
         collect.setCheckable(True)
         collect.setChecked(self.recent_recording)
         collect.toggled.connect(self.set_recent_recording)
+        automatic = menu.addAction('경험치 증가 시 자동 측정 · 5분 정지 시 자동 종료')
+        automatic.setCheckable(True)
+        automatic.setChecked(self.auto_measure)
+        automatic.toggled.connect(self.set_auto_measure)
         burning = menu.addAction('플래닛 버닝 적용')
         burning.setCheckable(True)
         burning.setChecked(self.burning)
@@ -675,7 +681,14 @@ class SharedController(tracker.MeasurementCore):
             self.select(); return
         if self.running:
             self.finish_measurement('사용자 정지')
-            self.status.set('정지 · 시작 시 새 측정'); return
+            if self.auto_measure:
+                # Do not restart the measurement the user just stopped.
+                self.auto_start_hold = time.monotonic()
+                self.status.set('정지 · 경험치가 1분 멈춘 뒤부터 자동 시작')
+            else:
+                self.status.set('정지 · 시작 시 새 측정')
+            return
+        self.auto_start_hold = None
         if not self.check_permission() or not self.reset(): return
         self.recent_permission = True
         self.running = True
@@ -685,8 +698,51 @@ class SharedController(tracker.MeasurementCore):
     def collect_recent(self):
         return self.recent_recording and self.recent_permission and self.auto_hud
 
+    AUTO_START_GAINS = 2
+    AUTO_START_WINDOW = 60.0
+    AUTO_END_SECONDS = 300.0
+    auto_measure = False
+    auto_start_hold = None
+
+    def set_auto_measure(self, enabled):
+        self.auto_measure = enabled
+        self.auto_start_hold = None
+        if enabled and not self.recent_recording:
+            self.set_recent_recording(True)  # automatic start reads the idle EXP buffer
+        else:
+            self.save_config()
+
+    def auto_measure_tick(self, now):
+        """Start on repeated EXP gains and end after a long observed pause."""
+        if not self.auto_measure:
+            return
+        if self.running:
+            session = self.session
+            if (session.started is not None and session.last_gain_at is not None and session.samples
+                    and session.samples[-1][0]-session.last_gain_at >= self.AUTO_END_SECONDS):
+                reason = f'경험치 {int(self.AUTO_END_SECONDS//60)}분 정지 · 자동 종료'
+                if self.finish_measurement(reason):
+                    self.status.set(reason+' · 다시 오르면 새 측정')
+            return
+        buffer = self.recent_exp
+        usable = self.collect_recent() and buffer.source is not None and buffer.source[0] == self.generation
+        gains = buffer.increase_stamps() if usable else []
+        if self.auto_start_hold is not None:
+            if gains and gains[-1] > self.auto_start_hold:
+                self.auto_start_hold = gains[-1]
+            if now-self.auto_start_hold < tracker.IDLE_AFTER:
+                return
+            self.auto_start_hold = None
+            buffer.clear()  # gains from before the pause belong to the stopped hunt
+            return
+        recent_gains = [stamp for stamp in gains if now-stamp <= self.AUTO_START_WINDOW]
+        if len(recent_gains) >= self.AUTO_START_GAINS and buffer.available(now):
+            self.start_with_recent()
+
     def set_recent_recording(self, enabled):
         self.recent_recording = enabled
+        if not enabled:
+            self.auto_measure = False
         if enabled:
             self.recent_permission = self.has_background_capture_permission()
         self.recent_exp.clear()
@@ -1226,6 +1282,7 @@ class SharedController(tracker.MeasurementCore):
         self.title_label.setToolTip(ui_text)
         self.toggle_button.setText('측정 정지' if self.running else '측정 시작')
         self.update_recent_button(now)
+        self.auto_measure_tick(now)
         if self.preview_frame is not None and self.preview_frame[1] != self.preview_stamp:
             frame, self.preview_stamp = self.preview_frame
             frame = frame.convert('RGB')
@@ -1258,7 +1315,7 @@ class SharedController(tracker.MeasurementCore):
                 'compact': self.compact, 'always_on_top': self.always_on_top,
                 'window_opacity': self.window_opacity, 'auto_hud': self.auto_hud,
                 'recent_recording': self.recent_recording, 'burning': self.burning,
-                'jev_enabled': self.jev_enabled,
+                'jev_enabled': self.jev_enabled, 'auto_measure': self.auto_measure,
             }), encoding='utf-8')
             temporary.replace(tracker.BASE/'settings.json')
         except OSError as exc:

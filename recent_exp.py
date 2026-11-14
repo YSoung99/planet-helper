@@ -37,3 +37,9 @@ class RecentExp:
         return (self.readable and len(self.points) >= 2
                 and 0 <= now-self.points[-1][0] <= self.FRESHNESS
                 and self.points[-1][1][0] > self.points[0][1][0])
+
+    def increase_stamps(self):
+        """Capture times at which the EXP value rose above the previous point."""
+        points = list(self.points)
+        return [stamp for (_, before), (stamp, after) in zip(points, points[1:])
+                if after[0] > before[0]]

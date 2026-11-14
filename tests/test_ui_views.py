@@ -176,3 +176,84 @@ class ViewTests(unittest.TestCase):
         self.assertTrue(c.footer.isVisibleTo(c.window))
         self.assertIn('감소 충돌',c.footer.text())
         self.assertIn('자동 저장 실패',c.footer.toolTip())
+
+    def feed_recent(self, points, source=None):
+        c = self.c
+        source = source or (c.generation, 7, 169, (1600, 900), 'classic')
+        for stamp, exp in points:
+            c.events.put((c.generation, (exp, 42.55), '', .99, None, stamp,
+                          {'recent': True, 'source': source}))
+
+    def live(self, stamp, exp):
+        c = self.c
+        c.events.put((c.generation, (exp, 42.55), '', .99, None, stamp,
+                      {'detected_level': 169, 'window_id': 7, 'content_points': (1600, 900),
+                       'ui_kind': 'classic', 'temporal': {'selected': 1}}))
+
+    def test_automatic_measurement_starts_on_repeated_gains_and_ends_after_long_pause(self):
+        c = self.c
+        c.recent_permission = True
+        base = 172680132
+        self.feed_recent([(100, base), (102, base+100)])
+        with patch('time.monotonic', return_value=103):
+            c.poll()
+            self.assertFalse(c.running)  # switched off by default
+            c.set_auto_measure(True)
+            self.assertTrue(tracker.load_settings(tracker.BASE/'settings.json')[0]['auto_measure'])
+            c.poll()
+            self.assertFalse(c.running)  # one gain can be a quest reward
+        self.feed_recent([(104, base+200)])
+        with patch('time.monotonic', return_value=105):
+            c.poll()
+            self.assertTrue(c.running)
+            self.assertEqual(c.session.stats(105)[0], 200)
+            first = c.session.session_id
+        for stamp in range(107, 104+int(c.AUTO_END_SECONDS), 4):
+            self.live(stamp, base+200)
+        with patch('time.monotonic', return_value=104+c.AUTO_END_SECONDS-1):
+            c.poll()
+            self.assertTrue(c.running)
+        end = 104+c.AUTO_END_SECONDS+1
+        self.live(end, base+200)
+        with patch('time.monotonic', return_value=end):
+            c.poll()
+        self.assertFalse(c.running)
+        self.assertIn('자동 종료', c.session.stop_reason)
+        self.assertEqual(c.session.session_id, first)
+        self.assertTrue((tracker.BASE/'records'/(first+'.csv')).exists())
+
+    def test_manual_stop_holds_automatic_start_until_exp_pauses(self):
+        c = self.c
+        c.recent_permission = True
+        c.set_auto_measure(True)
+        base = 172680132
+        self.feed_recent([(100, base), (102, base+100), (104, base+200)])
+        with patch('time.monotonic', return_value=105):
+            c.poll()
+            self.assertTrue(c.running)
+            c.toggle()
+            self.assertFalse(c.running)
+        stopped = c.session.session_id
+        self.feed_recent([(106, base+300), (108, base+400), (110, base+500)])
+        with patch('time.monotonic', return_value=111):
+            c.poll()
+        self.assertFalse(c.running)  # still hunting right after the manual stop
+        self.feed_recent([(stamp, base+500) for stamp in range(112, 176, 4)])
+        with patch('time.monotonic', return_value=173):
+            c.poll()
+        self.assertFalse(c.running)
+        self.feed_recent([(174, base+500), (176, base+600), (178, base+700)])
+        with patch('time.monotonic', return_value=179):
+            c.poll()
+        self.assertTrue(c.running)
+        self.assertNotEqual(c.session.session_id, stopped)
+
+    def test_turning_off_recent_collection_turns_off_automatic_measurement(self):
+        c = self.c
+        c.recent_recording = False
+        with patch.object(type(c), 'has_background_capture_permission', return_value=True):
+            c.set_auto_measure(True)
+            self.assertTrue(c.recent_recording)
+            c.set_recent_recording(False)
+        self.assertFalse(c.auto_measure)
+        self.assertFalse(tracker.load_settings(tracker.BASE/'settings.json')[0]['auto_measure'])
