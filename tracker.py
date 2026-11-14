@@ -122,7 +122,8 @@ def load_settings(path):
         clean['level'] = level
     else:
         invalid.append('level')
-    for key in ('compact', 'always_on_top', 'auto_hud', 'recent_recording', 'burning', 'jev_enabled'):
+    for key in ('compact', 'always_on_top', 'auto_hud', 'recent_recording', 'burning', 'jev_enabled',
+                'auto_measure'):
         if key in payload:
             if type(payload[key]) is bool:
                 clean[key] = payload[key]
