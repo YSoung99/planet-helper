@@ -44,42 +44,42 @@ jobs:
           else
             python -m unittest discover -s tests -v
           fi
-    - name: Verify Linux installation and version switch
-      if: runner.os == 'Linux'
-      shell: bash
-      run: |
-        set -euo pipefail
-        root="$(mktemp -d)"
-        git archive HEAD | tar -x -C "$root"
-        python -m venv --system-site-packages "$root/.venv"
-        HOME="$root/test-home" "$root/install-linux.sh"
-        app="$root/.planet-helper-versions/v1.4.2-smoke"
-        mkdir -p "$app"
-        git archive HEAD | tar -x -C "$app"
-        python -m venv --system-site-packages "$app/.venv"
-        "$app/install-linux.sh" --prepare
-        marker="$root/settings.json"
-        printf '{"compact":true}\n' > "$marker"
-        HOME="$root/test-home" "$root/test-home/.local/bin/planet-helper" &
-        parent=$!
-        trap 'kill "$parent" 2>/dev/null || true' EXIT
-        for attempt in {1..50}; do
-          if test -s "$root/.app.lock"; then break; fi
-          sleep .2
-        done
-        test -s "$root/.app.lock"
-        kill -0 "$parent"
-        kill -KILL "$parent"
-        wait "$parent" || true
-        trap - EXIT
-        python - "$root" <<'PYTEST'
-        from pathlib import Path
-        import sys
-        import linux_updates as updates
-        root = Path(sys.argv[1])
-        updates.switch(root, '.', 'v1.4.2-smoke')
-        assert updates.state(root) == {'current': 'v1.4.2-smoke', 'previous': '.'}
-        updates.switch(root, 'v1.4.2-smoke', '.')
-        assert updates.state(root) == {'current': '.', 'previous': 'v1.4.2-smoke'}
-        assert (root / 'settings.json').is_file()
-        PYTEST
+      - name: Verify Linux installation and version switch
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          root="$(mktemp -d)"
+          git archive HEAD | tar -x -C "$root"
+          python -m venv --system-site-packages "$root/.venv"
+          HOME="$root/test-home" "$root/install-linux.sh"
+          app="$root/.planet-helper-versions/v1.4.2-smoke"
+          mkdir -p "$app"
+          git archive HEAD | tar -x -C "$app"
+          python -m venv --system-site-packages "$app/.venv"
+          "$app/install-linux.sh" --prepare
+          marker="$root/settings.json"
+          printf '{"compact":true}\n' > "$marker"
+          HOME="$root/test-home" "$root/test-home/.local/bin/planet-helper" &
+          parent=$!
+          trap 'kill "$parent" 2>/dev/null || true' EXIT
+          for attempt in {1..50}; do
+            if test -s "$root/.app.lock"; then break; fi
+            sleep .2
+          done
+          test -s "$root/.app.lock"
+          kill -0 "$parent"
+          kill -KILL "$parent"
+          wait "$parent" || true
+          trap - EXIT
+          python - "$root" <<'PYTEST'
+          from pathlib import Path
+          import sys
+          import linux_updates as updates
+          root = Path(sys.argv[1])
+          updates.switch(root, '.', 'v1.4.2-smoke')
+          assert updates.state(root) == {'current': 'v1.4.2-smoke', 'previous': '.'}
+          updates.switch(root, 'v1.4.2-smoke', '.')
+          assert updates.state(root) == {'current': '.', 'previous': 'v1.4.2-smoke'}
+          assert (root / 'settings.json').is_file()
+          PYTEST
