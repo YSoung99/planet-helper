@@ -4,6 +4,7 @@ Shared behaviour is in qt_controller.py so the Linux app gets the same changes.
 """
 import ctypes
 import subprocess
+import sys
 
 import tracker
 from qt_controller import (SharedController, Value, LevelValue, TrackerWindow, Selection,  # noqa: F401
@@ -31,6 +32,17 @@ class Controller(SharedController):
     CAPTURE_BACKENDS = ('sck-window',)
     REPEAT_NEEDS_PERMISSION = True
 
+    def __init__(self, application, start_worker=True, restore=True, start_repeat=None):
+        super().__init__(application, start_worker, restore, start_repeat)
+        if getattr(sys, 'frozen', False) and restore and start_worker:
+            from update_panel import MacUpdateBackend, UpdatePanel
+            from PySide6.QtWidgets import QPushButton
+            self.update_button = QPushButton('업데이트')
+            self.updates = UpdatePanel(self, MacUpdateBackend())
+            self.update_button.clicked.connect(self.updates.show)
+            self.window.layout().itemAt(0).layout().insertWidget(1, self.update_button)
+            self.menu_bar.actions()[0].menu().addAction('업데이트 및 롤백', self.updates.show)
+
     def native_overlay(self, widget, level=3):
         native_overlay(widget, level)
 
@@ -43,6 +55,8 @@ class Controller(SharedController):
 
     def extra_menu_actions(self, menu):
         menu.addAction('화면 기록 권한', self.check_permission)
+        if hasattr(self, 'updates'):
+            menu.addAction('업데이트 및 롤백', self.updates.show)
 
     def has_background_capture_permission(self):
         from macos_support import has_capture_permission

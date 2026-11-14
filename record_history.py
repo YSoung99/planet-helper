@@ -58,6 +58,7 @@ def summarize(csv_path):
         started = None
     import segments
     return dict(session_id=csv_path.stem, started=started, level=level, active=active, idle=idle,
+                character_name=session.character_name,
                 gained=gained, per_minute=rate['cumulative'], rate_gain=rate['rate_gain'],
                 rate_seconds=rate['duration'], gap=session.gap_seconds(0.0), gap_gain=session.gap_gain,
                 blocked=session.blocked, stop_reason=session.stop_reason,
@@ -220,7 +221,7 @@ def build_dialog(controller):
     from PySide6.QtCore import Qt
     from PySide6.QtGui import QColor
     from PySide6.QtWidgets import (QDialog, QVBoxLayout, QLabel, QTableWidget, QTableWidgetItem,
-                                   QHeaderView, QAbstractItemView)
+                                   QHeaderView, QAbstractItemView, QComboBox, QHBoxLayout)
     from qt_controller import short_exp
     dialog = QDialog(controller.window)
     dialog.setWindowTitle('사냥 기록 비교')
@@ -233,47 +234,30 @@ def build_dialog(controller):
     hint = QLabel('분당 평균은 측정 화면과 같은 기준이에요. 인식 공백의 시간과 경험치는 효율에서 제외해요. 사냥터 메모는 두 번 눌러 편집할 수 있어요.')
     hint.setWordWrap(True); layout.addWidget(hint)
     spots = QLabel(); spots.setWordWrap(True); spots.setStyleSheet('color:#e8d9a8;')
+    all_rows = collect()
+    character_names = sorted({row['character_name'] for row in all_rows if row['character_name']})
+    character_picker = QComboBox()
+    character_picker.setAccessibleName('사냥 기록 캐릭터')
+    character_picker.addItem('전체 캐릭터', None)
+    for name in character_names:
+        character_picker.addItem(name, name)
+    if any(row['character_name'] is None for row in all_rows):
+        character_picker.addItem('캐릭터 미확인', '')
+    filter_row = QHBoxLayout()
+    filter_row.addWidget(QLabel('캐릭터'))
+    filter_row.addWidget(character_picker, 1)
+    layout.addLayout(filter_row)
     layout.addWidget(spots)
-    rows = collect()
-    layout.addWidget(build_chart(rows))
-    levels = QLabel('레벨별 분당 평균 · ' + ' / '.join(f'Lv.{level} {rate:,.0f}' for level, rate in by_level(rows)))
+    chart_layout = QVBoxLayout()
+    layout.addLayout(chart_layout)
+    levels = QLabel()
     levels.setWordWrap(True); levels.setStyleSheet('color:#9aa8b6;'); layout.addWidget(levels)
-    headers = ['날짜', 'Lv', '순수 사냥', '휴식', '인식 공백', '관측 중 사냥', '획득', '분당', '시간당', '효율 변화', '사냥터 메모']
+    headers = ['날짜', '캐릭터', 'Lv', '순수 사냥', '휴식', '인식 공백', '관측 중 사냥', '획득', '분당', '시간당', '효율 변화', '사냥터 메모']
     memo_column = len(headers)-1
-    table = QTableWidget(len(rows), len(headers))
+    table = QTableWidget(0, len(headers))
     table.setHorizontalHeaderLabels(headers)
     table.verticalHeader().setVisible(False)
     table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-    best = max((row['per_minute'] for row in comparable(rows)), default=None)
-    for index, row in enumerate(rows):
-        rate = row['per_minute']
-        warning = '확인 필요' if row['blocked'] else '관측 부족' if rate is None else ''
-        cells = [row['started'].strftime('%m/%d %H:%M') if row['started'] else row['session_id'],
-                 str(row['level'] or '—'), clock(row['active']), clock(row['idle']) if row['idle'] else '—',
-                 clock(row['gap']) if row['gap'] else '—',
-                 f"{ratio(row):.0f}%",
-                 short_exp(row['gained']), warning or f"{rate:,.0f}", '—' if warning else short_exp(rate*60),
-                 '—' if row['blocked'] else change_text(row['changes']), row['memo']]
-        for column, text in enumerate(cells):
-            item = QTableWidgetItem(text)
-            if column < memo_column:
-                item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
-                if column >= 4: item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-            else:
-                item.setData(Qt.ItemDataRole.UserRole, row['session_id'])
-            if column == 4 and row['gap']:
-                observed = row['active']+row['idle']
-                coverage = observed/(observed+row['gap'])*100
-                item.setToolTip(f"관측률 {coverage:.0f}% · 공백 사이 증가분 {row['gap_gain']:,.0f} EXP\n"
-                                '총 획득에 포함, 효율에서 제외')
-            if column == 5 and ratio(row) < 50:
-                item.setForeground(QColor('#e7b86e'))
-            if column == 7 and row['blocked']:
-                item.setForeground(QColor('#e7b86e'))
-                item.setToolTip(row['stop_reason'])
-            if column == 7 and not warning and rate == best:
-                item.setForeground(QColor('#8fe0a8'))
-            table.setItem(index, column, item)
     header = table.horizontalHeader()
     header.setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
     header.setSectionResizeMode(memo_column, QHeaderView.ResizeMode.Stretch)
@@ -293,8 +277,9 @@ def build_dialog(controller):
             if map_name.learn_correction(session_id, text):
                 memos = load_memos()
                 table.blockSignals(True)
-                for index, other in enumerate(rows):
+                for other in all_rows:
                     other['memo'] = memos.get(other['session_id'], '')
+                for index, other in enumerate(rows):
                     table.item(index, memo_column).setText(other['memo'])
                 table.blockSignals(False)
         except OSError as exc:
@@ -303,9 +288,62 @@ def build_dialog(controller):
             if row['session_id'] == session_id: row['memo'] = text
         refresh_spots()
 
+    rows = []
+    empty = QLabel('표시할 사냥 기록이 아직 없어요.')
+
+    def render_records():
+        nonlocal rows
+        name = character_picker.currentData()
+        rows = [row for row in all_rows if name is None or (row['character_name'] or '') == name]
+        if chart_layout.count():
+            chart_layout.takeAt(0).widget().deleteLater()
+        chart_layout.addWidget(build_chart(rows))
+        levels.setText('레벨별 분당 평균 · ' + ' / '.join(
+            f'Lv.{level} {rate:,.0f}' for level, rate in by_level(rows)))
+        table.blockSignals(True)
+        table.clearContents()
+        table.setRowCount(len(rows))
+        best = max((row['per_minute'] for row in comparable(rows)), default=None)
+        for index, row in enumerate(rows):
+            rate = row['per_minute']
+            warning = '확인 필요' if row['blocked'] else '관측 부족' if rate is None else ''
+            cells = [row['started'].strftime('%m/%d %H:%M') if row['started'] else row['session_id'],
+                     row['character_name'] or '—', str(row['level'] or '—'), clock(row['active']), clock(row['idle']) if row['idle'] else '—',
+                     clock(row['gap']) if row['gap'] else '—',
+                     f"{ratio(row):.0f}%",
+                     short_exp(row['gained']), warning or f"{rate:,.0f}", '—' if warning else short_exp(rate*60),
+                     '—' if row['blocked'] else change_text(row['changes']), row['memo']]
+            for column, text in enumerate(cells):
+                item = QTableWidgetItem(text)
+                if column < memo_column:
+                    item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+                    if column >= 5: item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+                else:
+                    item.setData(Qt.ItemDataRole.UserRole, row['session_id'])
+                if column == 5 and row['gap']:
+                    observed = row['active']+row['idle']
+                    coverage = observed/(observed+row['gap'])*100
+                    item.setToolTip(f"관측률 {coverage:.0f}% · 공백 사이 증가분 {row['gap_gain']:,.0f} EXP\n"
+                                    '총 획득에 포함, 효율에서 제외')
+                if column == 6 and ratio(row) < 50:
+                    item.setForeground(QColor('#e7b86e'))
+                if column == 8 and row['blocked']:
+                    item.setForeground(QColor('#e7b86e'))
+                    item.setToolTip(row['stop_reason'])
+                if column == 8 and not warning and rate == best:
+                    item.setForeground(QColor('#8fe0a8'))
+                table.setItem(index, column, item)
+        table.blockSignals(False)
+        empty.setVisible(not rows)
+        refresh_spots()
+
     table.itemChanged.connect(edited)
-    refresh_spots()
+    character_picker.currentIndexChanged.connect(render_records)
     layout.addWidget(table)
-    if not rows:
-        layout.addWidget(QLabel('표시할 사냥 기록이 아직 없어요.'))
+    layout.addWidget(empty)
+    session_name = controller.session.character_name
+    if session_name in character_names:
+        character_picker.setCurrentIndex(character_picker.findData(session_name))
+    else:
+        render_records()
     return dialog

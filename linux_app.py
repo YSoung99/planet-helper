@@ -19,6 +19,22 @@ class Controller(SharedController):
     CAPTURE_OPTIONS = {'require_active': True}
     CAPTURE_BACKENDS = ('kwin-game-region', 'xcomposite-game-window')
 
+    def __init__(self, application, start_worker=True, restore=True, start_repeat=None):
+        super().__init__(application, start_worker, restore, start_repeat)
+        install_root = os.environ.get('PLANET_HELPER_INSTALL_ROOT')
+        if install_root and restore and start_worker:
+            from linux_updates import LinuxUpdateBackend
+            from update_panel import UpdatePanel
+            from PySide6.QtWidgets import QPushButton
+            self.update_button = QPushButton('업데이트')
+            self.updates = UpdatePanel(self, LinuxUpdateBackend(install_root))
+            self.update_button.clicked.connect(self.updates.show)
+            self.window.layout().itemAt(0).layout().insertWidget(1, self.update_button)
+
+    def extra_menu_actions(self, menu):
+        if hasattr(self, 'updates'):
+            menu.addAction('업데이트 및 롤백', self.updates.show)
+
     def native_overlay(self, widget, level=3):
         native_overlay(widget, level)
 

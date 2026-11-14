@@ -19,10 +19,10 @@ from collections import deque, Counter
 from pathlib import Path
 
 RESOURCES = Path(getattr(sys, '_MEIPASS', Path(__file__).resolve().parent))
-BASE = (Path(os.environ.get('PLANET_EXP_DATA_DIR',
-        str(Path.home()/'Library'/'Application Support'/'Maple Planet Helper Auto Trial')))
-        if sys.platform == 'darwin' else Path(__file__).resolve().parent)
-APP_VERSION = '1.4.0-auto.3'
+BASE = Path(os.environ.get('PLANET_EXP_DATA_DIR') or (
+    Path.home()/'Library'/'Application Support'/'Maple Planet Helper Auto Trial'
+    if sys.platform == 'darwin' else Path(__file__).resolve().parent))
+APP_VERSION = '1.4.2'
 MAX_BOUNDARY_GAP = 10.0
 BURNING_MAX_LEVEL = 120  # Planet Up & Up grants one bonus level, capped at 120.
 IDLE_AFTER = 60.0  # no EXP gain for longer than this counts as a break
@@ -367,6 +367,8 @@ class Session:
         self.baseline_candidate = None
         self.last_observed = None
         self.restored = False
+        self.character_name = None
+        self.character_conflict = False
         self.session_id = time.strftime('%Y%m%d-%H%M%S') + f'-{time.time_ns()%1000000000:09d}'
         self.started = None
         self.rate_anchor = None
@@ -709,6 +711,10 @@ def load_saved_session(path, level, now):
     session = Session(level=level)
     last_wall = datetime.fromisoformat(rows[-1]['관측 시각']).timestamp()
     session.session_id = path.stem
+    nickname = state.get('character_name')
+    session.character_conflict = state.get('character_conflict') is True
+    if isinstance(nickname, str) and not session.character_conflict:
+        session.character_name = nickname
     last_observed_at = now-(final_elapsed-last_elapsed)
     hunting_phases = ('hunting', 'hunting_resume')
     hunting_rows = [row for row in rows if row.get('상태') in hunting_phases]
@@ -1101,6 +1107,10 @@ class MeasurementCore:
                    'level': self.session.level, 'required_exp': self.session.total,
                    'required_exp_screenshot_verified': str(self.session.level) in EXP_METADATA.get('screenshot_verified', {}),
                    'minute_snapshot':self.session.minute_result()}
+        if self.session.character_name:
+            summary['character_name'] = self.session.character_name
+        if self.session.character_conflict:
+            summary['character_conflict'] = True
         if self.session.rate_anchor is not None:
             anchor_time, anchor_exp = self.session.rate_anchor
             summary['rate_anchor'] = [round((anchor_time-self.session.started)*1000),

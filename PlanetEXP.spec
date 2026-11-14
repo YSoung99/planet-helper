@@ -3,7 +3,7 @@ from PyInstaller.utils.hooks import collect_data_files, collect_submodules
 
 source = Path(SPECPATH)
 data = collect_data_files('rapidocr', excludes=['models/**'])
-data += [(str(source/'exp_table.json'), '.'), (str(source/'models'), 'models')]
+data += [(str(source/'exp_table.json'), '.'), (str(source/'models'), 'models'), (str(source/'mac_update_swap.sh'), '.')]
 # Game screenshots used by self-checks are kept out of the public repository;
 # bundle them only when they exist on this machine.
 data += [(str(path), 'verification') for path in sorted((source/'verification').glob('*.png'))]
@@ -19,7 +19,7 @@ coll = COLLECT(exe, a.binaries, a.datas, strip=False, upx=False, name='PlanetHel
 app = BUNDLE(coll, name='플래닛 도우미 자동인식 시험용.app', icon=str(source/'PlanetEXP.icns'),
              bundle_identifier='local.codex.planethelper.autotrial',
              info_plist={'CFBundleDisplayName': '플래닛 도우미 자동인식 시험용',
-                         'CFBundleShortVersionString': '1.4.0', 'CFBundleVersion': '3',
+                         'CFBundleShortVersionString': '1.4.2', 'CFBundleVersion': '5',
                          'NSHighResolutionCapable': True,
                          'LSMinimumSystemVersion': '14.0',
                          'NSScreenCaptureUsageDescription': '게임 화면의 경험치 숫자를 읽어 획득량을 계산합니다.',

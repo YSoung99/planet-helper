@@ -35,11 +35,15 @@ git clone https://github.com/YSoung99/planet-helper.git ~/.local/share/planet-he
 cd ~/.local/share/planet-helper && ./install-linux.sh
 ```
 
-앱 메뉴에서 **플래닛 도우미**를 실행하세요. 기록과 설정은 같은 폴더의 `records/`, `settings.json`에 저장되며 git에는 올라가지 않아요.
+앱 메뉴에서 **플래닛 도우미**를 실행하세요. 기록과 설정은 최초 설치 폴더의 `records/`, `settings.json`에 저장돼요. 기존 설치라면 위 설치 스크립트를 새 소스에서 한 번 다시 실행해야 앱 내 업데이트가 연결돼요.
+
+릴리스에서 `planet-helper-linux.tar.gz`를 내려받아 빈 폴더에 풀고 `./install-linux.sh`를 실행해도 돼요. 가상환경과 고정 의존성을 설치하려면 Python 3.14, venv, 인터넷 연결이 필요해요.
 
 선택: Rust OCR 가속 모듈은 `native/ocr-rust/README.md`를 따라 빌드하면 `_planet_ocr.so`로 사용돼요. 없으면 기본 RapidOCR을 써요.
 
 ## macOS 설치 (Apple Silicon, macOS 14 이상)
+
+[GitHub 릴리스](https://github.com/YSoung99/planet-helper/releases)에서 `planet-helper-macos-arm64.zip`을 내려받아 압축을 풀고 앱을 응용 프로그램에 옮겨요. 소스에서 실행하거나 빌드할 수도 있어요.
 
 ```bash
 git clone https://github.com/YSoung99/planet-helper.git ~/planet-helper
@@ -51,6 +55,12 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements-macos.lock
 
 처음 실행하면 **화면 기록** 권한(연타를 쓰면 **손쉬운 사용·입력 모니터링**도)을 허용해야 해요.
 기록은 `~/Library/Application Support/Maple Planet Helper Auto Trial/`에 저장돼요.
+
+## 업데이트와 사냥 기록
+
+설치된 앱에서 **업데이트**를 누르면 새 릴리스를 확인하거나 이전 설치로 롤백할 수 있어요. 앱은 시작할 때와 실행 중 30분마다 설치 가능한 릴리스를 확인해요. 업데이트와 롤백 직전에는 진행 중인 측정을 저장하고 앱을 다시 열어요.
+
+**사냥 기록 비교**에서 닉네임으로 기록과 효율을 볼 수 있어요. 닉네임이 없는 예전 기록은 **캐릭터 미확인**에 표시돼요.
 
 ## 두 컴퓨터 동기화
 

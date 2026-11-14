@@ -5,21 +5,23 @@ set -eu
 app_dir="$(cd "$(dirname "$0")" && pwd)"
 
 if [ ! -x "$app_dir/.venv/bin/python" ]; then
-    python3 -m venv "$app_dir/.venv"
+    "${PLANET_HELPER_PYTHON:-python3}" -m venv "$app_dir/.venv"
 fi
 "$app_dir/.venv/bin/python" -m pip install --quiet --upgrade pip
 "$app_dir/.venv/bin/python" -m pip install --quiet -r "$app_dir/requirements-linux.lock"
 
+if [ "${1:-}" = --prepare ]; then
+    QT_QPA_PLATFORM=offscreen "$app_dir/.venv/bin/python" -c 'import sys; sys.path.insert(0, sys.argv[1]); import linux_app' "$app_dir"
+    exit 0
+fi
 mkdir -p "$HOME/.local/bin" "$HOME/.local/share/applications"
 cat > "$HOME/.local/bin/planet-helper" <<EOF
 #!/bin/bash
 set -eu
 app_dir="$app_dir"
-exec 9>"\$app_dir/app.lock"
-flock -n 9 || exit 0
 cd "\$app_dir"
 export PYTHONUNBUFFERED=1
-exec "\$app_dir/.venv/bin/python" "\$app_dir/linux_app.py" "\$@" >>"\$app_dir/launch.log" 2>&1
+exec "\$app_dir/.venv/bin/python" "\$app_dir/linux_updates.py" launch "\$app_dir" "\$@" >>"\$app_dir/launch.log" 2>&1
 EOF
 chmod +x "$HOME/.local/bin/planet-helper"
 

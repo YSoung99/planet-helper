@@ -21,6 +21,7 @@ from PySide6.QtCore import Qt, QRect, QTimer, QObject, Signal
 from PySide6.QtGui import QAction, QColor, QImage, QPainter, QPen, QPixmap, QShortcut, QKeySequence
 from PySide6.QtWidgets import (QApplication, QWidget, QLabel, QPushButton, QSpinBox,
     QVBoxLayout, QHBoxLayout, QGridLayout, QFrame, QFileDialog, QMessageBox, QMenu, QMenuBar, QDialog, QComboBox)
+import character_hud
 import hunt_activity
 import map_name
 import tracker
@@ -305,6 +306,10 @@ class SharedController(tracker.MeasurementCore):
         self.hunt_activity = hunt_activity.Activity()
         self.hunt_activity_results = queue.SimpleQueue()
         self.hunt_activity_lock = threading.Lock()
+        self.character_results = queue.SimpleQueue()
+        self.character_candidate = (None, None)
+        self.character_identity = (None, None)
+        self.character_source = None
         config, warning = tracker.load_settings(tracker.BASE/'settings.json') if restore else ({}, None)
         self.auto_hud = config.get('auto_hud', True)
         self.recent_recording = config.get('recent_recording', True)
@@ -672,6 +677,7 @@ class SharedController(tracker.MeasurementCore):
         if not self.check_permission() or not self.reset(): return
         self.recent_permission = True
         self.running = True
+        self.source_label.setText('MapleStory Worlds · 게임 창 캡처')
         self.status.set('레벨·경험치 위치 자동 탐색 중' if self.auto_hud else '게임 창 연결 · 인식기 준비 중')
 
     def collect_recent(self):
@@ -762,7 +768,11 @@ class SharedController(tracker.MeasurementCore):
             if full is not None and self.hunt_activity_lock.acquire(blocking=False):
                 observed_at = (stamp + time.monotonic()) / 2
                 try:
-                    threading.Thread(target=self.read_hunt_activity, args=(generation, observed_at, full),
+                    level_roi = image.info.get('level_region')
+                    style = image.info.get('ui_kind')
+                    window = image.info.get('window_id')
+                    threading.Thread(target=self.read_hunt_activity,
+                                     args=(generation, observed_at, full, window, level_roi, style),
                                      name='hunt-activity', daemon=True).start()
                 except RuntimeError as exc:
                     self.hunt_activity_lock.release()
@@ -771,12 +781,18 @@ class SharedController(tracker.MeasurementCore):
             image.info.pop('full_game_image', None)
         return image
 
-    def read_hunt_activity(self, generation, stamp, frame):
+    def read_hunt_activity(self, generation, stamp, frame, window, level_roi, style):
         try:
             observation = hunt_activity.read(frame)
             self.hunt_activity_results.put((generation, stamp, observation))
         except Exception as exc:
             tracker.log_error('사냥 신호 판독', exc)
+        try:
+            if level_roi is not None:
+                identity = character_hud.read(frame, level_roi, style)
+                self.character_results.put((generation, window, identity))
+        except Exception as exc:
+            tracker.log_error('캐릭터 HUD 판독', exc)
         finally:
             self.hunt_activity_lock.release()
 
@@ -962,6 +978,13 @@ class SharedController(tracker.MeasurementCore):
         for overlay in self.overlays: overlay.close()
         self.overlays = []
 
+    def update_capture_label(self):
+        if not self.auto_hud:
+            self.source_label.setText('MapleStory Worlds · 수동 영역')
+            return
+        identity = [text for text in reversed(self.character_identity) if text]
+        self.source_label.setText(' · '.join([f'Lv. {self.session.level}', *identity]))
+
     def poll(self):
         if self.worker_ready and self.status.get().startswith('인식기 준비 실패'):
             self.status.set('인식기 준비 완료 · 시작으로 새 측정' if not self.running else '인식기 복구 · 화면 확인 중')
@@ -1017,7 +1040,12 @@ class SharedController(tracker.MeasurementCore):
                 self.window_region = details['window_region']
                 self.save_config()
             if details.get('backend') in self.CAPTURE_BACKENDS:
-                self.source_label.setText(f'자동 인식 · Lv. {self.session.level} · 게임 창' if self.auto_hud else 'MapleStory Worlds · 수동 영역')
+                source = (generation, details.get('window_id'))
+                if source != self.character_source:
+                    self.character_source = source
+                    self.character_candidate = (None, None)
+                    self.character_identity = (None, None)
+                self.update_capture_label()
             before = len(self.session.rows)
             before_first, before_started = self.session.first, self.session.started
             if error: self.status.set(str(error)[:80]+' · 자동 재시도 중')
@@ -1087,6 +1115,25 @@ class SharedController(tracker.MeasurementCore):
                 self.hunt_activity.update(generation, stamp, observation)
         self.activity_label.setText(self.hunt_activity.text(self.generation, now) if self.running
                                     else '사냥 신호 · 측정 대기')
+        while not self.character_results.empty():
+            generation, window, current = self.character_results.get_nowait()
+            if not self.running or (generation, window) != self.character_source:
+                continue
+            self.character_identity = tuple(
+                reading if reading and reading == candidate else None
+                for reading, candidate in zip(current, self.character_candidate))
+            self.character_candidate = current
+            self.update_capture_label()
+            nickname = self.character_identity[1]
+            session = self.session
+            if nickname and not session.character_conflict and nickname != session.character_name:
+                session.character_conflict = session.character_name is not None
+                session.character_name = None if session.character_conflict else nickname
+                if session.rows:
+                    try:
+                        self.save_summary()
+                    except OSError as exc:
+                        tracker.log_error('사냥 기록 캐릭터 저장', exc)
         self.check_efficiency_change()
         self.apply_map_results()
         snapshot = self.session.minute_result()
