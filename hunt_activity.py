@@ -25,9 +25,26 @@ class Observation:
     interrupted: bool = False
 
 
-def read(frame):
+def read(frame, cache=None):
+    """Read one full game frame.
+
+    ``cache`` (a dict owned by one caller) keeps the last OCR result for each
+    crop. OCR is deterministic for identical pixels, so a byte-identical crop
+    reuses that result instead of running recognition again.
+    """
     import numpy as np
     import map_name
+
+    def recognized(name, image, detect):
+        key = (image.mode, image.size, image.tobytes())
+        if cache is not None:
+            hit = cache.get(name)
+            if hit is not None and hit[0] == key:
+                return hit[1]
+        lines = map_name.recognize_lines(image, detect=detect)
+        if cache is not None:
+            cache[name] = (key, lines)
+        return lines
 
     width, height = frame.size
     header = np.asarray(frame.crop((round(width*.43), round(height*.208),
@@ -37,12 +54,12 @@ def read(frame):
     if edges.std() < 6 and 32 <= edges.mean() <= 64:
         from PIL import Image
         title = Image.fromarray(header).resize((272, 50))
-        for text, score in map_name.recognize_lines(title, detect=False):
+        for text, score in recognized('header', title, False):
             if score >= .85 and '투명도형찾기' in re.sub(r'\s+', '', text):
                 return Observation(frozenset(), interrupted=True)
 
     crop = frame.crop((round(width*.715), round(height*.67), width, round(height*.88)))
-    return Observation(reward_types(map_name.recognize_lines(crop)))
+    return Observation(reward_types(recognized('rewards', crop, True)))
 
 
 @dataclass

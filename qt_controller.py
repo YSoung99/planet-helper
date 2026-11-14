@@ -306,10 +306,12 @@ class SharedController(tracker.MeasurementCore):
         self.hunt_activity = hunt_activity.Activity()
         self.hunt_activity_results = queue.SimpleQueue()
         self.hunt_activity_lock = threading.Lock()
+        self.hunt_activity_cache = {}
         self.character_results = queue.SimpleQueue()
         self.character_candidate = (None, None)
         self.character_identity = (None, None)
         self.character_source = None
+        self.character_recheck_at = 0.0
         config, warning = tracker.load_settings(tracker.BASE/'settings.json') if restore else ({}, None)
         self.auto_hud = config.get('auto_hud', True)
         self.recent_recording = config.get('recent_recording', True)
@@ -771,6 +773,8 @@ class SharedController(tracker.MeasurementCore):
                     level_roi = image.info.get('level_region')
                     style = image.info.get('ui_kind')
                     window = image.info.get('window_id')
+                    if not self.character_read_needed(generation, window, stamp):
+                        level_roi = None
                     threading.Thread(target=self.read_hunt_activity,
                                      args=(generation, observed_at, full, window, level_roi, style),
                                      name='hunt-activity', daemon=True).start()
@@ -783,7 +787,7 @@ class SharedController(tracker.MeasurementCore):
 
     def read_hunt_activity(self, generation, stamp, frame, window, level_roi, style):
         try:
-            observation = hunt_activity.read(frame)
+            observation = hunt_activity.read(frame, self.hunt_activity_cache)
             self.hunt_activity_results.put((generation, stamp, observation))
         except Exception as exc:
             tracker.log_error('사냥 신호 판독', exc)
@@ -795,6 +799,14 @@ class SharedController(tracker.MeasurementCore):
             tracker.log_error('캐릭터 HUD 판독', exc)
         finally:
             self.hunt_activity_lock.release()
+
+    CHARACTER_RECHECK_SECONDS = 300.0
+
+    def character_read_needed(self, generation, window, now):
+        """Skip the character OCR once job and name are confirmed for this window."""
+        confirmed = ((generation, window) == self.character_source
+                     and all(self.character_identity))
+        return not confirmed or now >= self.character_recheck_at
 
     DISCOVERY_PERIOD = 1.0
 
@@ -1045,6 +1057,7 @@ class SharedController(tracker.MeasurementCore):
                     self.character_source = source
                     self.character_candidate = (None, None)
                     self.character_identity = (None, None)
+                    self.character_recheck_at = 0.0
                 self.update_capture_label()
             before = len(self.session.rows)
             before_first, before_started = self.session.first, self.session.started
@@ -1123,6 +1136,8 @@ class SharedController(tracker.MeasurementCore):
                 reading if reading and reading == candidate else None
                 for reading, candidate in zip(current, self.character_candidate))
             self.character_candidate = current
+            if all(self.character_identity):
+                self.character_recheck_at = time.monotonic() + self.CHARACTER_RECHECK_SECONDS
             self.update_capture_label()
             nickname = self.character_identity[1]
             session = self.session
