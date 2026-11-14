@@ -14,9 +14,11 @@ class RecordHistoryTests(unittest.TestCase):
             self.assertEqual(record_history.load_memos(base), {})
 
     def test_spot_average_is_weighted_by_hunting_time(self):
-        rows = [dict(memo='A', gained=600, active=60), dict(memo='A', gained=0, active=60),
-                dict(memo='B', gained=100, active=60), dict(memo='', gained=999, active=60)]
-        self.assertEqual(record_history.by_memo(rows), [('A', 300.0, 120, 2), ('B', 100.0, 60, 1)])
+        rows = [dict(memo='A', gained=9999, active=60, rate_gain=600, rate_seconds=60, per_minute=600, blocked=False),
+                dict(memo='A', gained=200, active=120, rate_gain=200, rate_seconds=120, per_minute=100, blocked=False),
+                dict(memo='A', gained=9999, active=60, rate_gain=9999, rate_seconds=60, per_minute=9999, blocked=True),
+                dict(memo='A', gained=200, active=10, rate_gain=200, rate_seconds=10, per_minute=None, blocked=False)]
+        self.assertEqual(record_history.by_memo(rows), [('A', 800/3, 180, 2)])
 
 
 if __name__ == '__main__':

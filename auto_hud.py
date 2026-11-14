@@ -129,7 +129,7 @@ class HudLocator:
                 # A level must have a visible LV anchor directly to its left.
                 anchor_box = (max(0, x-round(dh*3.2)), max(0, y-3),
                               min(w, right+2), min(h, bottom+3))
-                anchored, _ = recognize(self.engine, image.crop(anchor_box))
+                anchored, anchor_score = recognize(self.engine, image.crop(anchor_box))
                 if not re.match(r'^\s*L\s*V[.:\s]', anchored, re.I):
                     continue
                 box = (max(0, x-2), max(0, y-2), min(w, right+2), min(h, bottom+2))
@@ -144,6 +144,12 @@ class HudLocator:
                 votes = Counter(int(raw) for raw, score in readings
                                 if score >= .90 and re.fullmatch(r'[1-9]\d{0,2}', raw)
                                 and int(raw) in tracker.EXP_TABLE)
+                # The wider crop can corroborate a crisp digit reading when
+                # one of the two digit-only variants falls below the cutoff.
+                anchored_level = re.fullmatch(r'\s*L\s*V[.:\s]+([1-9]\d{0,2})\s*', anchored, re.I)
+                if (anchor_score >= .90 and anchored_level and len(votes) == 1
+                        and all(raw == anchored_level[1] for raw, _ in readings)):
+                    votes[int(anchored_level[1])] += 1
                 if votes and votes.most_common(1)[0][1] >= 2:
                     levels.append((votes.most_common(1)[0][0], normalized(box, image.size),
                                    'classic' if kind == 'orange' else 'new'))
@@ -248,14 +254,13 @@ def exp_image(full, hud):
 
 class AutomaticCapture:
     """Own all discovery state on the worker thread, scoped to its generation."""
+    FULL_RECHECK_SECONDS = 30.0
+
     def __init__(self, client, locator, clock=time.monotonic):
         self.client, self.locator, self.clock = client, locator, clock
         self.gate = Confirmation()
         self.generation = None
-        self.hud = None
-        self.next_check = 0
-        self.verified_at = None
-        self.content_points = None
+        self.reset()
 
     def reset(self):
         self.hud = None
@@ -263,47 +268,78 @@ class AutomaticCapture:
         self.gate.clear()
         self.verified_at = None
         self.content_points = None
+        self.tracking_roi = None
+        self.level_pixels = None
+
+    def _prepare_tracking(self, full, hud):
+        from window_capture import pixel_rect
+        lx, ly, lw, lh = pixel_rect(hud.level_roi, *full.size)
+        ex, ey, ew, eh = pixel_rect(hud.exp_roi, *full.size)
+        # Include the LV label as well as the digits. Use one capture so the
+        # level and EXP always come from the same game frame.
+        guard_left = max(0, lx-round(lh*3.2))
+        level_box = (guard_left, ly, lx+lw, ly+lh)
+        track_box = (min(guard_left, ex), min(ly, ey), max(lx+lw, ex+ew), max(ly+lh, ey+eh))
+        self.tracking_roi = normalized(track_box, full.size)
+        x, y, w, h = pixel_rect(self.tracking_roi, *full.size)
+        self.tracking_size = w, h
+        self.level_box = (guard_left-x, ly-y, lx+lw-x, ly+lh-y)
+        self.exp_box = (ex-x, ey-y, ex+ew-x, ey+eh-y)
+        self.level_pixels = full.crop(level_box).convert('RGB').tobytes()
+
+    def _rediscover(self, now, expected_level, baseline_set, include_full):
+        try:
+            full = self.client.snapshot()
+            hud = self.locator.locate(full)
+        except Exception:
+            self.reset()
+            raise
+        # Once re-confirmation starts, do not fall back to a stale ROI.
+        self.hud = None
+        if not self.gate.accept(hud, now):
+            raise HudNotFound(f'레벨 {hud.level} · 경험치 위치 재확인 {self.gate.count}/3')
+        if baseline_set and hud.level != expected_level:
+            raise HudLevelChanged(expected_level, hud.level)
+        self._prepare_tracking(full, hud)
+        self.hud, self.next_check = hud, now+self.FULL_RECHECK_SECONDS
+        self.verified_at = now
+        self.content_points = full.info.get('content_points')
+        image = exp_image(full, hud)
+        image.info.update(auto_confirmed=True, ui_verified_at=now, hud_capture='discovery')
+        if not include_full:
+            image.info.pop('full_game_image', None)
+        return image
 
     def read(self, generation, expected_level, baseline_set, include_full):
         if generation != self.generation:
             self.reset()
             self.generation = generation
         now = self.clock()
-        if self.hud is None or now >= self.next_check:
-            try:
-                full = self.client.snapshot()
-                hud = self.locator.locate(full)
-            except Exception:
-                self.reset()
-                raise
-            if not self.gate.accept(hud, now):
-                raise HudNotFound(f'레벨 {hud.level} · 경험치 위치 재확인 {self.gate.count}/3')
-            if baseline_set and hud.level != expected_level:
-                raise HudLevelChanged(expected_level, hud.level)
-            self.hud, self.next_check = hud, now+5
-            self.verified_at = now
-            self.content_points = full.info.get('content_points')
-            image = exp_image(full, hud)
-            image.info['auto_confirmed'] = True
-            image.info['ui_verified_at'] = self.verified_at
-            if not include_full:
-                image.info.pop('full_game_image', None)
-            return image
+        if (self.hud is None or now >= self.next_check or now-self.verified_at > 8
+                or (baseline_set and self.hud.level != expected_level)):
+            return self._rediscover(now, expected_level, baseline_set, include_full)
         try:
-            image = self.client.snapshot(roi=self.hud.exp_roi, include_full=include_full)
+            band = self.client.snapshot(roi=self.tracking_roi, include_full=include_full)
         except ValueError:
             self.reset()
             raise HudNotFound('게임 창 크기 변경 · 표시 위치 다시 찾는 중')
         except Exception:
             self.reset()
             raise
-        if image.info.get('window_id') != self.hud.window_id:
+        if band.info.get('window_id') != self.hud.window_id:
             self.reset()
             raise HudNotFound('게임 창 변경 · 표시 위치 다시 찾는 중')
-        if image.info.get('content_points') != self.content_points:
+        if band.info.get('content_points') != self.content_points or band.size != self.tracking_size:
             self.reset()
             raise HudNotFound('게임 창 크기 변경 · 표시 위치 다시 찾는 중')
+        if band.crop(self.level_box).convert('RGB').tobytes() != self.level_pixels:
+            self.reset()
+            raise HudNotFound('레벨 표시 변경 · 위치 다시 확인 중')
+        self.verified_at = now
+        self.gate.at = now
+        image = band.crop(self.exp_box)
         image.info.update(detected_level=self.hud.level, level_region=self.hud.level_roi,
+                          window_region=self.hud.exp_roi, hud_capture='tracking',
                           auto_detected=True, auto_confirmed=True, ui_kind=self.hud.ui_kind,
                           game_image_size=self.hud.size, ui_verified_at=self.verified_at)
         return image

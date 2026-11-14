@@ -61,6 +61,8 @@ def verify(first, capture, total, previous, cancelled, wait, level=None):
         if wait(.15) or cancelled():
             return None, {'checked': True, 'reason': 'cancelled'}, frames
         frames.append(capture(True))
+        if frames[-1].get('capture_context') != first.get('capture_context'):
+            return None, {'checked': True, 'reason': 'source_changed'}, frames
     if cancelled():
         return None, {'checked': True, 'reason': 'cancelled'}, frames
     index, reason = decide(frames, total, level)

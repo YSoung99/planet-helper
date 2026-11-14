@@ -9,7 +9,7 @@ from unittest.mock import Mock, patch
 from PIL import Image
 from PySide6.QtWidgets import QApplication
 import tracker
-from auto_hud import AutomaticCapture, Confirmation, Hud, HudLevelChanged, HudNotFound
+from auto_hud import AutomaticCapture, Confirmation, Hud, HudLevelChanged, HudLocator, HudNotFound
 from mac_app import Controller
 
 
@@ -17,6 +17,17 @@ def hud(**changes):
     roi = dict(left=.40, top=.95, width=.14, height=.035, reference_aspect=1.6)
     level_roi = dict(left=.035, top=.95, width=.04, height=.03, reference_aspect=1.6)
     return replace(Hud(170, (34514347, 8.06), roi, level_roi, 100, (1600, 1000)), **changes)
+
+
+def snapshot(image, roi=None, include_full=False):
+    if roi is None:
+        return image
+    from window_capture import pixel_rect
+    x, y, w, h = pixel_rect(roi, *image.size)
+    cropped = image.crop((x, y, x+w, y+h))
+    if include_full:
+        cropped.info['full_game_image'] = image
+    return cropped
 
 
 class ConfirmationTests(unittest.TestCase):
@@ -37,12 +48,34 @@ class ConfirmationTests(unittest.TestCase):
         self.assertTrue(gate.accept(hud(value=(34514349, 8.06)), 3))
 
 
+class LevelReadingTests(unittest.TestCase):
+    def test_anchor_corroborates_only_matching_digit_variants(self):
+        image = Image.new('RGB', (1719, 866))
+        locator = HudLocator(Mock())
+        with patch('auto_hud.color_groups', side_effect=lambda im, kind:
+                   [(66, 828, 104, 849)] if kind == 'orange' else []):
+            for anchor, raw, binary, succeeds in [
+                (('LV. 41', .93848), ('41', .8779), ('41', .99953), True),
+                (('LV. 40', .9978), ('41', .8779), ('41', .99953), False),
+                (('LV. 41', .93848), ('40', .8779), ('41', .99953), False),
+                (('LV. 41', .89), ('41', .8779), ('41', .99953), False),
+                (('LV. 41', .93848), ('41', .8779), ('41', .89), False),
+            ]:
+                with self.subTest(anchor=anchor, raw=raw, binary=binary):
+                    with patch('auto_hud.recognize', side_effect=[anchor, raw, binary]):
+                        if succeeds:
+                            self.assertEqual(locator.read_level(image)[0], 41)
+                        else:
+                            with self.assertRaises(HudNotFound):
+                                locator.read_level(image)
+
+
 class CaptureTests(unittest.TestCase):
     def setUp(self):
         self.image = Image.new('RGB', (1600, 1000))
         self.image.info['window_id'] = 100
         self.client = Mock()
-        self.client.snapshot.return_value = self.image
+        self.client.snapshot.side_effect = lambda **kwargs: snapshot(self.image, **kwargs)
         self.locator = Mock()
         self.locator.locate.return_value = hud()
         self.now = 1
@@ -62,10 +95,43 @@ class CaptureTests(unittest.TestCase):
         self.assertIs(image.info['full_game_image'], self.image)
         self.now = 4
         self.capture.read(1, 170, True, False)
-        self.client.snapshot.assert_called_with(roi=hud().exp_roi, include_full=False)
+        self.client.snapshot.assert_called_with(roi=self.capture.tracking_roi, include_full=False)
         with self.assertRaises(HudNotFound):
             self.capture.read(2, 170, False, True)
         self.assertEqual(self.capture.gate.count, 1)
+
+    def test_tracking_returns_the_exact_exp_pixels_without_relocating_every_five_seconds(self):
+        self.confirmed()
+        self.image.putpixel((650, 960), (240, 240, 240))
+        for stamp in (4, 8, 12, 16):
+            self.now = stamp
+            image = self.capture.read(1, 170, True, False)
+            expected = snapshot(self.image, hud().exp_roi)
+            self.assertEqual(image.tobytes(), expected.tobytes())
+            self.assertEqual(image.info['window_region'], hud().exp_roi)
+            self.assertEqual(image.info['ui_verified_at'], stamp)
+            self.assertNotIn('full_game_image', image.info)
+        self.assertEqual(self.locator.locate.call_count, 3)
+        self.now = 17
+        self.assertIs(self.capture.read(1, 170, True, True).info['full_game_image'], self.image)
+
+    def test_changed_level_pixels_immediately_invalidate_tracking(self):
+        self.confirmed()
+        self.image.putpixel((80, 960), (255, 255, 255))
+        self.locator.locate.return_value = hud(level=171)
+        self.now = 4
+        with self.assertRaises(HudNotFound):
+            self.capture.read(1, 170, True, False)
+        self.assertIsNone(self.capture.hud)
+        for stamp in (5, 6):
+            self.now = stamp
+            with self.assertRaises(HudNotFound):
+                self.capture.read(1, 170, True, False)
+        self.now = 7
+        with self.assertRaises(HudLevelChanged):
+            self.capture.read(1, 170, True, False)
+        self.now = 8
+        self.assertEqual(self.capture.read(1, 171, True, False).info['detected_level'], 171)
 
     def test_confirmed_level_change_stops_existing_session(self):
         with self.assertRaises(HudLevelChanged):

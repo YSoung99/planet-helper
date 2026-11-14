@@ -37,7 +37,7 @@ class IdleTimeTests(unittest.TestCase):
         self.assertAlmostEqual(s.idle(1200), 545)
         self.assertAlmostEqual(s.active_elapsed(1200), 1200-545)
         gained, hourly, _, _ = s.stats(1200)
-        self.assertAlmostEqual(hourly, gained/(1200-545)*3600)
+        self.assertAlmostEqual(hourly, gained/(1201-545)*3600)
         rate = s.rate_estimate(1200)
         self.assertEqual(rate['status'], 'ready')
         self.assertAlmostEqual(rate['duration'], 1201-545)  # anchored at the observation before the first gain

@@ -36,7 +36,7 @@ class AccountingTests(unittest.TestCase):
         self.assertEqual(s.stats(103)[0], 1)
         self.assertEqual(s.stats(103)[1], 0)
         self.assertEqual(s.elapsed(108), 5)
-        self.assertEqual(s.stats(108)[1], 720)
+        self.assertEqual(s.stats(108)[1], 0)
 
     def test_zero_percent_baseline(self):
         self.assertEqual(tracker.parse('0[0.00%]'), (0, 0))
@@ -131,10 +131,12 @@ class AccountingTests(unittest.TestCase):
         self.assertEqual(first['one'],310)
         s.accept((1400,14),80)
         self.assertEqual(s.minute_result(),first)
+        for t in range(82, 122, 2):
+            s.accept((1000+t*5, 10+t*.05),t)
         s.accept((1610,16.1),122)
         self.assertEqual(s.minute_result()['index'],2)
-        self.assertEqual(s.minute_result()['one'],300)
-        self.assertEqual(s.minute_result()['six'],610)
+        self.assertIsNone(s.minute_result()['one'])
+        self.assertIsNone(s.minute_result()['six'])
 
     def test_six_minute_snapshot_slides_over_completed_minutes(self):
         s=tracker.Session();establish(s, (1000,10),0);s.accept((1001,10.01),1)
@@ -189,7 +191,8 @@ class AccountingTests(unittest.TestCase):
             restored=tracker.load_saved_session(path,169,1000)
             self.assertEqual(restored.stats(2000)[0],20)
             self.assertEqual(restored.elapsed(2000),60)
-            self.assertEqual(restored.minute_result()['one'],20)
+            self.assertIsNone(restored.minute_result()['one'])
+            self.assertEqual(restored.gap_gain,10)
             self.assertEqual(restored.last,(172680152,42.55))
 
     def test_minute_snapshot_is_retained_during_missing_readings(self):

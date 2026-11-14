@@ -44,6 +44,10 @@ class Controller(SharedController):
     def extra_menu_actions(self, menu):
         menu.addAction('화면 기록 권한', self.check_permission)
 
+    def has_background_capture_permission(self):
+        from macos_support import has_capture_permission
+        return has_capture_permission()
+
     def check_permission(self):
         from PySide6.QtWidgets import QMessageBox
         from macos_support import has_capture_permission

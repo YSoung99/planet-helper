@@ -100,8 +100,8 @@ class MeasurementSafetyTests(unittest.TestCase):
         self.assertIsNone(s.minute_snapshots[2]['one'])
         self.assertIsNone(s.minute_result()['one'])
         self.assertEqual(s.valid_minute['one'], first)
-        # Internal gaps do not invalidate a six-minute total whose endpoints are known.
-        self.assertEqual(s.valid_minute['six']['six'], 1210)
+        self.assertIsNone(s.minute_result()['six'])
+        self.assertEqual(s.valid_minute['six']['six'], first['six'])
         self.assertEqual(s.stats(242)[0], 1210)
         for stamp in range(244, 303, 2):
             exp = 1000+stamp*5
@@ -123,7 +123,9 @@ class MeasurementSafetyTests(unittest.TestCase):
             restored = tracker.load_saved_session(Path(folder)/'records'/(s.session_id+'.csv'), 169, 1000)
             self.assertEqual(restored.elapsed(2000), 30)
             self.assertEqual(restored.stats(2000)[0], 200)
-            self.assertEqual(restored.stats(2000)[1]/60, 400)
+            self.assertIsNone(restored.rate_estimate(2000)['cumulative'])
+            self.assertEqual(restored.gap_seconds(2000), 20)
+            self.assertEqual(restored.rate_estimate(2000)['duration'], 12)
             self.assertEqual(restored.stop_reason, '사용자 정지')
             self.assertTrue(restored.restored)
             # Wall-clock adjustments must not override the saved monotonic hunting duration.
@@ -135,7 +137,7 @@ class MeasurementSafetyTests(unittest.TestCase):
                 csv.writer(stream).writerows(rows)
             restored = tracker.load_saved_session(path, 169, 2000)
             self.assertEqual(restored.elapsed(3000), 30)
-            self.assertEqual(restored.stats(3000)[1]/60, 400)
+            self.assertEqual(restored.rate_estimate(3000), restored.rate_estimate(2000))
 
     def test_inconsistent_summary_cannot_override_the_observation_ledger(self):
         with tempfile.TemporaryDirectory() as folder, patch.object(tracker, 'BASE', Path(folder)):
@@ -169,8 +171,9 @@ class MeasurementSafetyTests(unittest.TestCase):
             self.assertEqual(restored.elapsed(1000), 60)
             self.assertEqual(restored.stats(1000)[0], 12000)
             self.assertEqual(restored.minute_result()['index'], 1)
-            self.assertEqual(restored.valid_minute['one']['one'], 12000)
-            self.assertEqual(restored.valid_minute['six']['six'], 12000)
+            self.assertIsNone(restored.valid_minute['one'])
+            self.assertIsNone(restored.valid_minute['six'])
+            self.assertEqual(restored.gap_seconds(1000), 60)
 
     def test_failed_csv_append_is_repaired_without_dropping_or_duplicating_rows(self):
         with tempfile.TemporaryDirectory() as folder, patch.object(tracker, 'BASE', Path(folder)):

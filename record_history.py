@@ -45,19 +45,22 @@ def summarize(csv_path):
         session = tracker.load_saved_session(csv_path, level, 0.0)
     except (OSError, ValueError, KeyError, TypeError, ZeroDivisionError):
         return None
-    if session is None or session.started is None:
+    if session is None or (session.started is None and not session.blocked):
         return None
     active, idle = session.active_elapsed(0.0), session.idle(0.0)
     gained = session.last[0]-session.first[0]
-    if active < 60 or gained <= 0:
+    if gained <= 0 and not session.blocked:
         return None
+    rate = session.rate_estimate(0.0)
     try:
         started = datetime.strptime(csv_path.stem[:15], '%Y%m%d-%H%M%S')
     except ValueError:
         started = None
     import segments
     return dict(session_id=csv_path.stem, started=started, level=level, active=active, idle=idle,
-                gained=gained, per_minute=gained*60/active,
+                gained=gained, per_minute=rate['cumulative'], rate_gain=rate['rate_gain'],
+                rate_seconds=rate['duration'], gap=session.gap_seconds(0.0), gap_gain=session.gap_gain,
+                blocked=session.blocked, stop_reason=session.stop_reason,
                 changes=segments.find_changes(session.minute_snapshots))
 
 
@@ -80,10 +83,10 @@ def collect(base=None):
 def by_memo(rows):
     """Weighted per-minute average per hunting spot (total EXP / total hunting time)."""
     groups = {}
-    for row in rows:
+    for row in comparable(rows):
         if not row['memo']: continue
         gained, active, count = groups.get(row['memo'], (0, 0.0, 0))
-        groups[row['memo']] = (gained+row['gained'], active+row['active'], count+1)
+        groups[row['memo']] = (gained+row['rate_gain'], active+row['rate_seconds'], count+1)
     return sorted(((memo, gained*60/active, active, count) for memo, (gained, active, count) in groups.items()),
                   key=lambda item: -item[1])
 
@@ -91,11 +94,15 @@ def by_memo(rows):
 def by_level(rows):
     """Weighted per-minute average per level (total EXP / total hunting time)."""
     groups = {}
-    for row in rows:
+    for row in comparable(rows):
         if row['level'] is None: continue
         gained, active = groups.get(row['level'], (0, 0.0))
-        groups[row['level']] = (gained+row['gained'], active+row['active'])
+        groups[row['level']] = (gained+row['rate_gain'], active+row['rate_seconds'])
     return [(level, gained*60/active) for level, (gained, active) in sorted(groups.items())]
+
+
+def comparable(rows):
+    return (row for row in rows if row['per_minute'] is not None and not row['blocked'])
 
 
 def build_chart(rows):
@@ -112,7 +119,7 @@ def build_chart(rows):
             super().__init__()
             self.points = points  # oldest first
             self.setMinimumHeight(170); self.setMouseTracking(True)
-            total_gain = sum(r['gained'] for r in points); total_time = sum(r['active'] for r in points)
+            total_gain = sum(r['rate_gain'] for r in points); total_time = sum(r['rate_seconds'] for r in points)
             self.average = total_gain*60/total_time if total_time else 0
 
         def plot(self):
@@ -187,7 +194,7 @@ def build_chart(rows):
             QToolTip.showText(event.globalPosition().toPoint(),
                 f"{when} · Lv.{row['level']}{memo}\n분당 {row['per_minute']:,.0f} · 순수 사냥 {clock(row['active'])}", self)
 
-    return EfficiencyChart(list(reversed(rows)))
+    return EfficiencyChart(list(reversed(list(comparable(rows)))))
 
 
 def change_text(changes):
@@ -204,7 +211,9 @@ def ratio(row):
 
 def clock(seconds):
     seconds = int(seconds)
-    return f'{seconds//3600}:{seconds%3600//60:02d}' if seconds >= 3600 else f'{seconds//60}분'
+    if seconds >= 3600:
+        return f'{seconds//3600}:{seconds%3600//60:02d}:{seconds%60:02d}'
+    return f'{seconds//60}:{seconds%60:02d}'
 
 
 def build_dialog(controller):
@@ -221,7 +230,7 @@ def build_dialog(controller):
                          'QTableWidget {background:#1b2330;color:#d5dee8;gridline-color:#2b3542;}'
                          'QHeaderView::section {background:#25303d;color:#b8c4d0;border:none;padding:4px;}')
     layout = QVBoxLayout(dialog)
-    hint = QLabel('사냥터 메모 칸을 두 번 눌러 입력하세요. 분당 평균은 휴식(경험치 1분 이상 정지)을 뺀 순수 사냥 시간 기준입니다.')
+    hint = QLabel('분당 평균은 측정 화면과 같은 기준이에요. 인식 공백의 시간과 경험치는 효율에서 제외해요. 사냥터 메모는 두 번 눌러 편집할 수 있어요.')
     hint.setWordWrap(True); layout.addWidget(hint)
     spots = QLabel(); spots.setWordWrap(True); spots.setStyleSheet('color:#e8d9a8;')
     layout.addWidget(spots)
@@ -229,33 +238,45 @@ def build_dialog(controller):
     layout.addWidget(build_chart(rows))
     levels = QLabel('레벨별 분당 평균 · ' + ' / '.join(f'Lv.{level} {rate:,.0f}' for level, rate in by_level(rows)))
     levels.setWordWrap(True); levels.setStyleSheet('color:#9aa8b6;'); layout.addWidget(levels)
-    headers = ['날짜', 'Lv', '순수 사냥', '휴식', '사냥 비율', '획득', '분당', '시간당', '효율 변화', '사냥터 메모']
+    headers = ['날짜', 'Lv', '순수 사냥', '휴식', '인식 공백', '관측 중 사냥', '획득', '분당', '시간당', '효율 변화', '사냥터 메모']
+    memo_column = len(headers)-1
     table = QTableWidget(len(rows), len(headers))
     table.setHorizontalHeaderLabels(headers)
     table.verticalHeader().setVisible(False)
     table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-    best = max((row['per_minute'] for row in rows), default=0)
+    best = max((row['per_minute'] for row in comparable(rows)), default=None)
     for index, row in enumerate(rows):
+        rate = row['per_minute']
+        warning = '확인 필요' if row['blocked'] else '관측 부족' if rate is None else ''
         cells = [row['started'].strftime('%m/%d %H:%M') if row['started'] else row['session_id'],
-                 str(row['level'] or '—'), clock(row['active']), clock(row['idle']) if row['idle'] >= 60 else '—',
+                 str(row['level'] or '—'), clock(row['active']), clock(row['idle']) if row['idle'] else '—',
+                 clock(row['gap']) if row['gap'] else '—',
                  f"{ratio(row):.0f}%",
-                 short_exp(row['gained']), f"{row['per_minute']:,.0f}", short_exp(row['per_minute']*60),
-                 change_text(row['changes']), row['memo']]
+                 short_exp(row['gained']), warning or f"{rate:,.0f}", '—' if warning else short_exp(rate*60),
+                 '—' if row['blocked'] else change_text(row['changes']), row['memo']]
         for column, text in enumerate(cells):
             item = QTableWidgetItem(text)
-            if column < 9:
+            if column < memo_column:
                 item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
                 if column >= 4: item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
             else:
                 item.setData(Qt.ItemDataRole.UserRole, row['session_id'])
-            if column == 4 and ratio(row) < 50:
+            if column == 4 and row['gap']:
+                observed = row['active']+row['idle']
+                coverage = observed/(observed+row['gap'])*100
+                item.setToolTip(f"관측률 {coverage:.0f}% · 공백 사이 증가분 {row['gap_gain']:,.0f} EXP\n"
+                                '총 획득에 포함, 효율에서 제외')
+            if column == 5 and ratio(row) < 50:
                 item.setForeground(QColor('#e7b86e'))
-            if column == 6 and row['per_minute'] == best:
+            if column == 7 and row['blocked']:
+                item.setForeground(QColor('#e7b86e'))
+                item.setToolTip(row['stop_reason'])
+            if column == 7 and not warning and rate == best:
                 item.setForeground(QColor('#8fe0a8'))
             table.setItem(index, column, item)
     header = table.horizontalHeader()
     header.setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
-    header.setSectionResizeMode(9, QHeaderView.ResizeMode.Stretch)
+    header.setSectionResizeMode(memo_column, QHeaderView.ResizeMode.Stretch)
 
     def refresh_spots():
         ranked = by_memo(rows)
@@ -265,7 +286,7 @@ def build_dialog(controller):
 
     def edited(item):
         session_id = item.data(Qt.ItemDataRole.UserRole)
-        if item.column() != 9 or not session_id: return
+        if item.column() != memo_column or not session_id: return
         try:
             text = save_memo(session_id, item.text())
             import map_name
@@ -274,7 +295,7 @@ def build_dialog(controller):
                 table.blockSignals(True)
                 for index, other in enumerate(rows):
                     other['memo'] = memos.get(other['session_id'], '')
-                    table.item(index, 9).setText(other['memo'])
+                    table.item(index, memo_column).setText(other['memo'])
                 table.blockSignals(False)
         except OSError as exc:
             tracker.log_error('사냥터 메모 저장', exc); return
@@ -286,5 +307,5 @@ def build_dialog(controller):
     refresh_spots()
     layout.addWidget(table)
     if not rows:
-        layout.addWidget(QLabel('비교할 기록이 아직 없어요. (1분 이상 사냥한 기록만 표시)'))
+        layout.addWidget(QLabel('표시할 사냥 기록이 아직 없어요.'))
     return dialog

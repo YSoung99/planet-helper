@@ -31,6 +31,15 @@ class TemporalTests(unittest.TestCase):
         selected,evidence,frames=verify(frame(100),lambda force:self.fail(),10000,(100,1.0),lambda:False,lambda delay:False)
         self.assertFalse(evidence['checked']);self.assertEqual(frames,[])
 
+    def test_burst_cannot_confirm_experience_across_roi_or_level_changes(self):
+        first = dict(frame(100), capture_context=(178, 'old ROI'))
+        for context in ((179, 'old ROI'), (178, 'new ROI')):
+            followup = dict(frame(100, stamp=1), capture_context=context)
+            selected, evidence, _ = verify(first, lambda force: followup, 10000, None,
+                                           lambda:False, lambda delay:False)
+            self.assertIsNone(selected)
+            self.assertEqual(evidence['reason'], 'source_changed')
+
     def test_advancing_sequence_preserves_middle_capture_timestamp(self):
         remaining=iter([frame(110,stamp=11),frame(900,stamp=12)])
         selected,evidence,_=verify(frame(100,stamp=10),lambda force:next(remaining),10000,None,

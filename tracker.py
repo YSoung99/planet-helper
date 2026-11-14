@@ -24,6 +24,7 @@ BASE = (Path(os.environ.get('PLANET_EXP_DATA_DIR',
         if sys.platform == 'darwin' else Path(__file__).resolve().parent)
 APP_VERSION = '1.4.0-auto.3'
 MAX_BOUNDARY_GAP = 10.0
+BURNING_MAX_LEVEL = 120  # Planet Up & Up grants one bonus level, capped at 120.
 IDLE_AFTER = 60.0  # no EXP gain for longer than this counts as a break
 try:
     EXP_METADATA = json.loads((RESOURCES/'exp_table.json').read_text(encoding='utf-8'))
@@ -121,7 +122,7 @@ def load_settings(path):
         clean['level'] = level
     else:
         invalid.append('level')
-    for key in ('compact', 'always_on_top', 'auto_hud'):
+    for key in ('compact', 'always_on_top', 'auto_hud', 'recent_recording', 'burning', 'jev_enabled'):
         if key in payload:
             if type(payload[key]) is bool:
                 clean[key] = payload[key]
@@ -281,11 +282,11 @@ def capture_image(capture, region):
     return frame
 
 class LoadController:
-    """Bound the scheduling target to 1..5 seconds; this is not a hard CPU cap."""
+    """Back off for system load and time spent by the capture/verification loop."""
     def __init__(self):
         self.base = 1.0
 
-    def period(self, system_load, cpu_seconds):
+    def period(self, system_load, work_seconds, cpu_seconds=0):
         self.base = min(5.0, max(1.0, self.base))
         if system_load >= 85:
             self.base = min(5.0, self.base + 1.0)
@@ -293,7 +294,9 @@ class LoadController:
             self.base = min(5.0, self.base + .5)
         elif system_load < 50:
             self.base = max(1.0, self.base - .25)
-        return min(5.0, max(self.base, max(0, cpu_seconds) / .20))
+        # Wall time protects the capture loop. CPU time also accounts for
+        # native OCR running on several threads in parallel.
+        return min(5.0, max(self.base, work_seconds / .50, cpu_seconds / .75))
 
 
 class LineReader:
@@ -391,8 +394,13 @@ class Session:
         self.first_gain = 0  # EXP of the packet that started the hunt timer
         self.idle_closed = 0.0  # finished breaks (seconds beyond IDLE_AFTER)
         self.last_gain_at = None
+        self.gap_closed = 0.0
+        self.gap_gain = 0
+        self.last_gap = None
+        self.resume_boundary_pending = False
 
     def accept(self, value, now, corroborated=False, baseline_verified=False):
+        now = round(now, 3)  # Match the precision of the saved observation ledger.
         if self.blocked:
             return self.stop_reason
         if self.last_observed is not None and now <= self.last_observed:
@@ -479,9 +487,11 @@ class Session:
         elif self.started is None and exp > self.first[0]:
             self.started = confirmed_start
             self.first_gain = exp-self.first[0]
-            self.establish_rate_anchor(now, exp)
+            self.establish_rate_anchor(now, exp, boundary=self.resume_boundary_pending)
         if self.total is None and pct > 0: self.total = exp/(pct/100)
-        self._note_gain(now, exp, self.last[0] if self.last else None)
+        boundary = self.resume_boundary_pending
+        self._account_observation(now, exp, boundary)
+        self.resume_boundary_pending = False
         self.last = value
         self.samples.append((now, exp))
         self._advance_minute_snapshots()
@@ -489,38 +499,60 @@ class Session:
             self.samples.popleft()
         wall = time.time()+now-time.monotonic()
         stamp = time.strftime('%Y-%m-%d %H:%M:%S',time.localtime(wall))+f'.{int(wall%1*1000):03d}'
-        self.rows.append((stamp, exp, pct, round(self.elapsed(now),3), exp-self.first[0], 'waiting' if self.started is None else 'hunting'))
+        phase = 'waiting' if self.started is None else 'hunting_resume' if boundary else 'hunting'
+        self.rows.append((stamp, exp, pct, round(self.elapsed(now),3), exp-self.first[0], phase))
         return '기준 확보 · 첫 경험치 증가 대기' if self.started is None else '측정 중 · 숫자/퍼센트 검증'
 
-    def _note_gain(self, stamp, exp, previous_exp):
-        """Close a break when EXP rises again after more than IDLE_AFTER seconds."""
+    def _account_observation(self, stamp, exp, boundary=False):
+        """Classify the interval before appending the new accepted observation."""
         if self.started is None:
             return
         if self.last_gain_at is None:
             self.last_gain_at = stamp
-        elif previous_exp is not None and exp > previous_exp:
-            gap = stamp-self.last_gain_at
-            if gap > IDLE_AFTER:
-                self.idle_closed += gap-IDLE_AFTER
-            self.last_gain_at = stamp
+        elif self.samples:
+            previous_stamp, previous_exp = self.samples[-1]
+            span = round(stamp-previous_stamp, 3)
+            if span > MAX_BOUNDARY_GAP or boundary:
+                self.idle_closed += max(0.0, previous_stamp-self.last_gain_at-IDLE_AFTER)
+                self.gap_closed += span
+                self.gap_gain += max(0, exp-previous_exp)
+                self.last_gap = (previous_stamp, stamp)
+                self.last_gain_at = stamp
+            elif exp > previous_exp:
+                self.idle_closed += max(0.0, stamp-self.last_gain_at-IDLE_AFTER)
+                self.last_gain_at = stamp
+
+    def gap_seconds(self, now):
+        if self.started is None or not self.samples:
+            return 0.0
+        end = self.ended if self.ended is not None else now
+        tail = max(0.0, end-self.samples[-1][0])
+        return self.gap_closed + (tail if round(tail, 3) > MAX_BOUNDARY_GAP else 0.0)
+
+    def observation_end(self, now):
+        end = self.ended if self.ended is not None else now
+        return min(end, self.samples[-1][0]) if self.samples else end
 
     def idle_until(self, stamp):
-        """Break seconds up to `stamp`, including a break still in progress."""
+        """Breaks are inferred only through the last normal observation."""
         if self.started is None or self.last_gain_at is None:
             return 0.0
-        return self.idle_closed+max(0.0, stamp-self.last_gain_at-IDLE_AFTER)
+        return self.idle_closed+max(0.0, self.observation_end(stamp)-self.last_gain_at-IDLE_AFTER)
 
     def idle(self, now):
-        return self.idle_until(self.ended if self.ended is not None else now)
+        return self.idle_until(now)
 
     def resting(self, now):
-        return (self.ended is None and self.last_gain_at is not None
-                and now-self.last_gain_at > IDLE_AFTER)
+        return (self.ended is None and self.last_gain_at is not None and self.samples
+                and now-self.samples[-1][0] <= MAX_BOUNDARY_GAP
+                and self.samples[-1][0]-self.last_gain_at > IDLE_AFTER)
 
     def active_elapsed(self, now):
-        return max(0.0, self.elapsed(now)-self.idle(now))
+        if self.started is None:
+            return 0.0
+        return max(0.0, self.observation_end(now)-self.started-self.gap_closed-self.idle(now))
 
-    def level_up(self, new_level):
+    def level_up(self, new_level, *, burning=False):
         """Continue across a level-up by moving history into the new level's EXP scale.
 
         On level-up the in-game EXP drops by the old level's requirement, so every
@@ -530,7 +562,10 @@ class Session:
         old = self.level
         if self.first is None or self.blocked or old is None or new_level is None or new_level <= old:
             return False
-        steps = range(old, new_level)
+        steps = list(range(old, new_level))
+        if burning and old < BURNING_MAX_LEVEL:
+            cap = min(new_level, BURNING_MAX_LEVEL)
+            steps = list(range(old, cap, 2)) + list(range(cap, new_level))
         if any(EXP_TABLE.get(level) is None for level in steps) or EXP_TABLE.get(new_level) is None:
             return False
         shift = sum(EXP_TABLE[level] for level in steps)
@@ -555,13 +590,13 @@ class Session:
                 if stamp == left_t: return float(left_exp), 0.0
                 if stamp == right_t: return float(right_exp), 0.0
                 ratio = (stamp-left_t)/(right_t-left_t)
-                return left_exp+(right_exp-left_exp)*ratio, right_t-left_t
+                return left_exp+(right_exp-left_exp)*ratio, round(right_t-left_t, 3)
         return None, None
 
-    def establish_rate_anchor(self, stamp, exp):
+    def establish_rate_anchor(self, stamp, exp, boundary=False):
         if self.rate_anchor is not None:
             return
-        if self.samples and 0 < stamp-self.samples[-1][0] <= 10:
+        if not boundary and self.samples and 0 < round(stamp-self.samples[-1][0], 3) <= MAX_BOUNDARY_GAP:
             self.rate_anchor = self.samples[-1]
             self.rate_anchor_kind = 'previous_observation'
         else:
@@ -574,11 +609,12 @@ class Session:
         from rates import estimate
         # Rates are measured to the last observation; count breaks only up to it.
         idle = self.idle_until(self.samples[-1][0]) if self.samples else 0.0
-        return estimate(self.samples, self.rate_anchor, now, self.ended, window, idle=idle)
+        return estimate(self.samples, self.rate_anchor, now, self.ended, window, idle=idle,
+                        gap_seconds=self.gap_closed, gap_gain=self.gap_gain, last_gap=self.last_gap)
 
     def _advance_minute_snapshots(self):
         if self.started is None: return
-        completed = max(0, int((self.samples[-1][0]-self.started)//60))
+        completed = max(0, round((self.samples[-1][0]-self.started)*1000)//60000)
         while len(self.minute_snapshots) < completed:
             index = len(self.minute_snapshots)+1
             exp, gap = self._boundary_exp(self.started+index*60)
@@ -589,6 +625,13 @@ class Session:
                 'one':max(0.0,cumulative-previous['cumulative']) if cumulative is not None and previous['cumulative'] is not None else None,
                 'six':max(0.0,cumulative-oldest['cumulative']) if cumulative is not None and oldest['cumulative'] is not None else None,
                 'gap':gap, 'estimated':max(gap or 0,previous['gap'] or 0,oldest['gap'] or 0)>5}
+            if self.last_gap:
+                left, right = self.last_gap
+                end = self.started+index*60
+                for key, span in (('one', 1), ('six', 6)):
+                    start = self.started+max(0, index-span)*60
+                    if left < end and start < right:
+                        snapshot[key] = None
             self.minute_snapshots.append(snapshot)
             for key in self.valid_minute:
                 if snapshot[key] is not None:
@@ -635,16 +678,12 @@ class Session:
         return max(0.0, points[-1][1] - baseline)
 
     def stats(self, now):
-        if self.ended is not None: now = self.ended
         if self.first is None:
             return 0, 0, 0, None
-        elapsed = self.active_elapsed(now)
         gained = self.last[0] - self.first[0]
-        hourly = gained / elapsed * 3600 if elapsed >= 5 else 0
-        recent = 0
-        if self.samples:
-            stamp, exp = self.samples[0]
-            recent = (self.last[0] - exp) / max(now-stamp, .001) * 3600
+        rate = self.rate_estimate(now)
+        hourly = (rate['cumulative'] or 0)*60
+        recent = (rate['recent'] or 0)*60
         eta = (self.total-self.last[0]) / hourly * 3600 if hourly > 0 and self.total else None
         return gained, hourly, recent, eta
 
@@ -671,7 +710,8 @@ def load_saved_session(path, level, now):
     last_wall = datetime.fromisoformat(rows[-1]['관측 시각']).timestamp()
     session.session_id = path.stem
     last_observed_at = now-(final_elapsed-last_elapsed)
-    hunting_rows = [row for row in rows if row.get('상태') == 'hunting']
+    hunting_phases = ('hunting', 'hunting_resume')
+    hunting_rows = [row for row in rows if row.get('상태') in hunting_phases]
     if hunting_rows:
         session.started = now-final_elapsed
         session.first_gain = int(hunting_rows[0]['총 획득 경험치'])
@@ -684,28 +724,46 @@ def load_saved_session(path, level, now):
     for row in rows:
         exp,pct = first_raw+int(row['총 획득 경험치'])+offset,float(row['퍼센트'])
         elapsed = float(row['사냥 초'])
+        hunting = row.get('상태') in hunting_phases
+        boundary = row.get('상태') == 'hunting_resume'
         if session.started is not None:
-            stamp = session.started+elapsed if row.get('상태') == 'hunting' else min(session.started-.001, session.started+(datetime.fromisoformat(row['관측 시각']).timestamp()-start_wall))
+            stamp = session.started+elapsed if hunting else min(session.started-.001, session.started+(datetime.fromisoformat(row['관측 시각']).timestamp()-start_wall))
         else:
             stamp = last_observed_at+(datetime.fromisoformat(row['관측 시각']).timestamp()-last_wall)
         if session.first is None: session.first = (exp,pct)
-        if row.get('상태') == 'hunting' and session.rate_anchor is None:
-            session.establish_rate_anchor(stamp, exp)
-        if row.get('상태') == 'hunting':
-            session._note_gain(stamp, exp, session.last[0] if session.last else None)
+        if hunting and session.rate_anchor is None:
+            saved_anchor = state.get('rate_anchor')
+            if (isinstance(saved_anchor, list) and len(saved_anchor) == 2
+                    and all(type(value) is int for value in saved_anchor)
+                    and round(elapsed*1000)-10000 <= saved_anchor[0] <= round(elapsed*1000)
+                    and saved_anchor[1] in (0, session.first_gain)):
+                anchor_time = session.started+saved_anchor[0]/1000
+                session.rate_anchor = (anchor_time, session.first[0]+saved_anchor[1])
+                session.rate_anchor_kind = 'previous_observation' if anchor_time < stamp else 'first_increase'
+                session.samples.clear()
+                if anchor_time < stamp:
+                    session.samples.append(session.rate_anchor)
+            else:
+                session.establish_rate_anchor(stamp, exp, boundary)
+        if hunting:
+            session._account_observation(stamp, exp, boundary)
         session.last = (exp,pct)
         session.samples.append((stamp,exp))
-        if row.get('상태') == 'hunting':
+        if hunting:
             session._advance_minute_snapshots()
         while len(session.samples)>1 and session.samples[1][0]<stamp-360:
             session.samples.popleft()
-        session.rows.append((row['관측 시각'],exp,pct,elapsed,int(row['총 획득 경험치']),row.get('상태','hunting')))
+        session.rows.append((row['관측 시각'],int(row['현재 경험치']),pct,elapsed,int(row['총 획득 경험치']),row.get('상태','hunting')))
     if session.total is None and session.last[1]>0:
         session.total = session.last[0]/(session.last[1]/100)
     session.ended = now
     session.last_observed = session.samples[-1][0]
     session.blocked = bool(state.get('blocked', False))
     session.stop_reason = state.get('stop_reason', '')
+    if isinstance(state.get('level_ups'), list):
+        session.level_ups = [tuple(step) for step in state['level_ups']
+                             if isinstance(step, list) and len(step) == 3
+                             and all(type(value) is int for value in step)]
     session.restored = True
     session.persisted_rows = len(session.rows)
     return session
@@ -754,6 +812,7 @@ class MeasurementCore:
             restored.ended = None
             restored.restored = False
             restored.stop_reason = ''
+            restored.resume_boundary_pending = True
             self.session = restored
             self.running = True
             self.status.set('업데이트 완료 · 기존 측정 이어서 진행')
@@ -836,27 +895,42 @@ class MeasurementCore:
             load_control = LoadController()
             reader = None
             previous_capture = None
+            recent_previous = None
+            collect_recent = getattr(self, 'collect_recent', lambda: False)
             psutil.cpu_percent()  # Prime sampling; the first result is not meaningful.
             import mss
             from PIL import Image, ImageOps
             with mss.MSS() as capture:
                 self.worker_ready = True
                 while not self.stop.is_set():
-                    if not self.running:
+                    recent = not self.running
+                    if recent and not collect_recent():
                         self.stop.wait(.2); continue
                     generation, region = self.generation, dict(self.region or {})
+                    cycle_started = time.monotonic()
                     try:
-                        cycle_started = time.monotonic()
                         cpu_started = sum(process.cpu_times()[:2])
                         system_load = psutil.cpu_percent()
                         if self.engine is None: self.engine = create_ocr_engine()
                         if reader is None: reader = LineReader(self.engine)
                         from temporal_ocr import verify, save_rejected, save_conflict, usable_image
+                        verification_wait = 0.0
+
+                        def wait_for_confirmation(seconds):
+                            nonlocal verification_wait
+                            started = time.monotonic()
+                            interrupted = self.stop.wait(seconds)
+                            verification_wait += time.monotonic()-started
+                            return interrupted
+
                         def take_frame(force=False):
                             capture_started = time.monotonic()
                             capture_wall = time.time()
                             custom_capture = getattr(self, 'capture_frame', None)
-                            image = custom_capture(region) if callable(custom_capture) else capture_image(capture, region)
+                            if recent:
+                                image = custom_capture(region, recent=True)
+                            else:
+                                image = custom_capture(region) if callable(custom_capture) else capture_image(capture, region)
                             capture_finished = time.monotonic()
                             observed = (capture_started+capture_finished)/2
                             pixels = np.asarray(image)
@@ -869,20 +943,51 @@ class MeasurementCore:
                                 level = image.info.get('detected_level', self.session.level)
                                 value,score,raw,reused=reader.read(image,observed,force=force,level=level)
                                 variants=list(reader.last_readings)
+                            capture_context = (image.info.get('window_id'), image.info.get('content_points'),
+                                               image.info.get('window_region'), image.info.get('detected_level'),
+                                               image.info.get('ui_kind'), image.info.get('capture_backend'), image.size)
                             return dict(image=image,value=value,score=score,raw=raw,reused=reused,
+                                        capture_context=capture_context,
                                         rejection_reason='blank' if blank else 'covered' if orange>.02 else None,
                                         observed_at=observed,covered=bool(orange>.02),variants=variants,
                                         capture_started=capture_started,capture_finished=capture_finished,
                                         capture_wall=capture_wall)
-                        force=(self.session.first is None or self.session.pending_jump is not None
-                               or self.session.decrease_count>0 or self.session.small_decrease_count>0 or self.session.mismatch_count>0)
+                        force = not recent and (self.session.first is None or self.session.pending_jump is not None
+                                                or self.session.decrease_count > 0
+                                                or self.session.small_decrease_count > 0 or self.session.mismatch_count > 0)
                         initial=take_frame(force)
                         observed_level=initial['image'].info.get('detected_level',self.session.level)
                         observed_total=EXP_TABLE.get(observed_level,self.session.total)
-                        selected,evidence,frames=verify(initial,take_frame,observed_total,self.session.last,
-                            lambda:generation!=self.generation or not self.running or self.stop.is_set(),self.stop.wait,
+                        previous = self.session.last
+                        if recent:
+                            previous = None
+                            if (recent_previous and recent_previous[:2] == (generation, initial['capture_context'])
+                                    and 0 < initial['observed_at']-recent_previous[2] <= MAX_BOUNDARY_GAP):
+                                previous = recent_previous[3]
+                        selected,evidence,frames=verify(initial,take_frame,observed_total,previous,
+                            lambda: generation != self.generation or recent == self.running or self.stop.is_set()
+                            or (recent and not collect_recent()), wait_for_confirmation,
                             level=observed_level)
                         if evidence['reason']=='cancelled':continue
+                        if recent:
+                            frame = selected or frames[-1]
+                            info = frame['image'].info
+                            value = frame['value'] if selected and info.get('auto_confirmed') else None
+                            stamp = frame['observed_at']
+                            if value is not None:
+                                recent_previous = (generation, frame['capture_context'], stamp, value)
+                            elif evidence['reason'] == 'source_changed':
+                                recent_previous = None
+                            source = (generation, info.get('window_id'), observed_level,
+                                      info.get('content_points'), info.get('ui_kind'))
+                            self.events.put((generation, value, '', frame['score'], None, stamp,
+                                             {'recent': True, 'source': source,
+                                              'source_changed': evidence['reason'] == 'source_changed'}))
+                            work = max(0, time.monotonic()-cycle_started-verification_wait)
+                            cpu = max(0, sum(process.cpu_times()[:2])-cpu_started)
+                            period = max(2.0, load_control.period(system_load, work, cpu))
+                            self.stop.wait(max(0, period-(time.monotonic()-cycle_started)))
+                            continue
                         frame=selected or frames[-1]
                         image=frame['image'];observed_at=frame['observed_at']
                         self.preview_frame=(image.copy(),time.monotonic())
@@ -900,22 +1005,34 @@ class MeasurementCore:
                             ui_kind=image.info.get('ui_kind'),game_image_size=image.info.get('game_image_size'),
                             ui_verified_at=image.info.get('ui_verified_at'),
                             window_id=image.info.get('window_id'),window_title=image.info.get('window_title'),
+                            content_points=image.info.get('content_points'),
                             window_bounds=image.info.get('window_bounds'),variants=frame['variants'],temporal=evidence,
                             verification_frames=frames or [initial])
-                        if selected is None:
+                        if selected is None and evidence['reason'] != 'source_changed':
                             try:save_rejected(BASE/'records'/'verification-frames',frames,evidence)
                             except OSError as exc:
                                 details['verification_save_error']=str(exc);log_error('확인 이미지 저장',exc)
-                        elif self.session.last and selected['value'][0] < self.session.last[0]:
+                        elif selected is not None and self.session.last and selected['value'][0] < self.session.last[0]:
                             try:
                                 save_conflict(BASE/'records'/'verification-frames',
                                     getattr(self,'last_accepted_evidence',None),frames,evidence,self.session.last,
                                     self.session.session_id,generation)
                             except OSError as exc:
                                 details['verification_save_error']=str(exc);log_error('감소 충돌 이미지 저장',exc)
-                        self.target_seconds=load_control.period(system_load,sum(process.cpu_times()[:2])-cpu_started)
+                        work_seconds = max(0, time.monotonic()-cycle_started-verification_wait)
+                        cpu_seconds = max(0, sum(process.cpu_times()[:2])-cpu_started)
+                        self.target_seconds = load_control.period(system_load, work_seconds, cpu_seconds)
+                        details['work_seconds'] = work_seconds
+                        details['cpu_seconds'] = cpu_seconds
+                        details['hud_capture'] = image.info.get('hud_capture')
                         self.events.put((generation,frame['value'] if selected else None,frame['raw'],frame['score'],None,observed_at,details))
                     except Exception as exc:
+                        if recent:
+                            recent_previous = None
+                            self.events.put((generation, None, '', 0, str(exc), time.monotonic(),
+                                             {'recent': True, 'source_changed': True}))
+                            self.stop.wait(max(0, 2.0-(time.monotonic()-cycle_started)))
+                            continue
                         if isinstance(exc, subprocess.TimeoutExpired):
                             reason = '화면 캡처 시간 초과'
                         elif isinstance(exc, subprocess.CalledProcessError):
@@ -967,20 +1084,27 @@ class MeasurementCore:
         folder = BASE/'records'
         folder.mkdir(exist_ok=True)
         rows = self.session.rows
+        now = time.monotonic()
         # Raw endpoints match the CSV even after a level-up shifted the session scale.
-        summary = {'version':4, 'app_version':APP_VERSION, 'timing':'first_increase',
+        summary = {'version':5, 'app_version':APP_VERSION, 'timing':'first_increase',
                    'baseline': [rows[0][1], rows[0][2]] if rows else self.session.first,
                    'last': [rows[-1][1], rows[-1][2]] if rows else self.session.last,
                    'gained': self.session.last[0]-self.session.first[0],
                    'level_ups': [list(step) for step in self.session.level_ups],
-                   'elapsed_seconds': self.session.elapsed(time.monotonic()),
-                   'active_seconds': self.session.active_elapsed(time.monotonic()),
-                   'idle_seconds': self.session.idle(time.monotonic()),
+                   'elapsed_seconds': self.session.elapsed(now),
+                   'active_seconds': self.session.active_elapsed(now),
+                   'idle_seconds': self.session.idle(now),
+                   'gap_seconds': self.session.gap_seconds(now),
+                   'gap_gain': self.session.gap_gain,
                    'samples': len(self.session.rows), 'blocked': self.session.blocked,
                    'ended': self.session.ended is not None, 'stop_reason':self.session.stop_reason,
                    'level': self.session.level, 'required_exp': self.session.total,
                    'required_exp_screenshot_verified': str(self.session.level) in EXP_METADATA.get('screenshot_verified', {}),
                    'minute_snapshot':self.session.minute_result()}
+        if self.session.rate_anchor is not None:
+            anchor_time, anchor_exp = self.session.rate_anchor
+            summary['rate_anchor'] = [round((anchor_time-self.session.started)*1000),
+                                      anchor_exp-self.session.first[0]]
         temp = folder/(self.session.session_id+'.json.tmp')
         temp.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding='utf-8')
         temp.replace(folder/(self.session.session_id+'.json'))
@@ -999,6 +1123,8 @@ class MeasurementCore:
                   'ocr_engine':details.get('ocr_engine'),
                   'cached':details.get('cached',False),'covered':details.get('covered',False),'backend':details.get('backend','unknown'),
                   'reason':self.status.get(),'capture_interval':self.scan_seconds,'target':self.target_seconds,
+                  'work_seconds':details.get('work_seconds'),'cpu_seconds':details.get('cpu_seconds'),
+                  'hud_capture':details.get('hud_capture'),
                   'variants':details.get('variants',[]),'ui_kind':details.get('ui_kind'),
                   'game_image_size':details.get('game_image_size'),'temporal':details.get('temporal'),'verification_save_error':details.get('verification_save_error')}
         record.update(baseline=self.session.first, last=self.session.last,

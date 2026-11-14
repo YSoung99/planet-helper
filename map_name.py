@@ -28,6 +28,7 @@ HANGUL = re.compile('[가-힣]')
 
 _engine = None
 _engine_lock = threading.Lock()
+_recognition_lock = threading.Lock()
 
 
 def available(resources=None):
@@ -63,16 +64,28 @@ def lines_to_name(lines):
 
 def title_area(image):
     width, height = image.size
-    return image.convert('RGB').crop((0, 0, int(width*REGION[0]), int(height*REGION[1])))
+    return image.crop((0, 0, int(width*REGION[0]), int(height*REGION[1]))).convert('RGB')
+
+
+def recognize_lines(image, *, detect=True):
+    import numpy as np
+    with _recognition_lock:
+        result = _get_engine()(np.asarray(image.convert('RGB')), use_det=detect)
+    return list(zip(result.txts, result.scores)) if result.txts is not None else []
 
 
 def read(image):
     """Return the raw minimap name from a full game frame (PIL image), or None."""
+    return read_title(title_area(image))
+
+
+def read_title(crop):
+    """Read an already cropped minimap title."""
     import numpy as np
     from PIL import Image
-    crop = title_area(image)
     crop = crop.resize((crop.width*2, crop.height*2), Image.Resampling.LANCZOS)
-    result = _get_engine()(np.asarray(crop))
+    with _recognition_lock:
+        result = _get_engine()(np.asarray(crop), use_det=True)
     if result.txts is None:
         return None
     lines = [(min(point[1] for point in box), text, float(score))
@@ -206,11 +219,15 @@ def parse_pick(reply, names):
     return names[int(value)]
 
 
-def jev_pick(picture, names):
-    """Ask JEV which known name the minimap title shows; None when unsure, offline or without a key."""
+def jev_pick(picture, names, *, on_request=None):
+    """Ask JEV. The callback receives key availability and can veto the request."""
     from PIL import Image
+    if not names:
+        return None
     key = gateway_key()
-    if not key or not names:
+    if not key:
+        if on_request is not None:
+            on_request(False)
         return None
     scale = JEV_SIDE / max(picture.size)
     picture = picture.resize((max(1, round(picture.width*scale)), max(1, round(picture.height*scale))),
@@ -232,6 +249,8 @@ def jev_pick(picture, names):
     try:
         import certifi  # the frozen app cannot see the system certificate store
         context = ssl.create_default_context(cafile=certifi.where())
+        if on_request is not None and on_request(True) is False:
+            return None
         with urllib.request.urlopen(request, timeout=60, context=context) as response:
             return parse_pick(json.loads(response.read()), names[:254])
     except (OSError, ValueError) as exc:
@@ -239,7 +258,7 @@ def jev_pick(picture, names):
         return None
 
 
-def choose(raw, picture, base=None, ask=jev_pick):
+def choose(raw, picture, base=None, ask=None, *, on_request=None):
     """Return a known name JEV recognised, or None to keep the OCR reading.
 
     JEV is only asked when the OCR reading is not already a confirmed name, so each
@@ -248,4 +267,6 @@ def choose(raw, picture, base=None, ask=jev_pick):
     names = known_names(base)
     if not names or (raw and resolve(raw, base) in names):
         return None
-    return ask(picture, names)
+    if ask is not None:
+        return ask(picture, names)
+    return jev_pick(picture, names, on_request=on_request)

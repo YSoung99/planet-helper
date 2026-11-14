@@ -21,7 +21,10 @@ from PySide6.QtCore import Qt, QRect, QTimer, QObject, Signal
 from PySide6.QtGui import QAction, QColor, QImage, QPainter, QPen, QPixmap, QShortcut, QKeySequence
 from PySide6.QtWidgets import (QApplication, QWidget, QLabel, QPushButton, QSpinBox,
     QVBoxLayout, QHBoxLayout, QGridLayout, QFrame, QFileDialog, QMessageBox, QMenu, QMenuBar, QDialog, QComboBox)
+import hunt_activity
+import map_name
 import tracker
+from recent_exp import RecentExp
 
 
 def level_mismatch(details, level, total):
@@ -254,6 +257,9 @@ class SharedController(tracker.MeasurementCore):
     def check_permission(self):
         return True
 
+    def has_background_capture_permission(self):
+        return True
+
     def capture_module(self):
         import importlib
         return importlib.import_module(self.CAPTURE_MODULE)
@@ -294,8 +300,19 @@ class SharedController(tracker.MeasurementCore):
         self.start_captures = StartCaptures(tracker.BASE/'records'/'start-captures')
         self.capture_failures = {}
         self.map_results = queue.Queue()
+        self.jev_status_session = None
+        self.jev_revision = 0
+        self.hunt_activity = hunt_activity.Activity()
+        self.hunt_activity_results = queue.SimpleQueue()
+        self.hunt_activity_lock = threading.Lock()
         config, warning = tracker.load_settings(tracker.BASE/'settings.json') if restore else ({}, None)
         self.auto_hud = config.get('auto_hud', True)
+        self.recent_recording = config.get('recent_recording', True)
+        self.burning = config.get('burning', False)
+        self.jev_enabled = config.get('jev_enabled', False)
+        self.recent_permission = start_worker and self.has_background_capture_permission()
+        self.recent_exp = RecentExp()
+        self.recent_start_source = None
         if not self.auto_hud:
             self.status.set('수동 인식 · 영역과 레벨을 확인해 주세요')
         self.region = config.get('region')
@@ -317,17 +334,24 @@ class SharedController(tracker.MeasurementCore):
         quit_action.setMenuRole(QAction.MenuRole.QuitRole)
         quit_action.triggered.connect(self.close)
         app_menu.addAction(quit_action)
+        resume_repeat = False
         if restore:
             self.restore_latest_record()
             checkpoint = tracker.BASE/'pending-update.json'
             if checkpoint.exists():
-                self.resume_handoff(checkpoint)
+                if self.resume_handoff(checkpoint):
+                    try:
+                        resume_repeat = json.loads(checkpoint.read_text(encoding='utf-8')).get('repeat_enabled') is True
+                    except (OSError, ValueError) as exc:
+                        tracker.log_error('업데이트 연타 상태 확인', exc)
                 checkpoint.unlink(missing_ok=True)
         if warning: self.status.set(warning)
         self.timer = QTimer(); self.timer.timeout.connect(self.poll); self.timer.start(200)
         repeat_requested = start_worker if start_repeat is None else start_repeat
         if repeat_requested:
             QTimer.singleShot(0, self.key_repeat.start)
+            if resume_repeat:
+                QTimer.singleShot(0, lambda: self.key_repeat.set_enabled(True))
         if start_worker: threading.Thread(target=self.worker, daemon=True).start()
 
     def show_information(self):
@@ -379,15 +403,26 @@ class SharedController(tracker.MeasurementCore):
         self.save_config()
 
     def update_rate_display(self, now):
-        rate = self.session.rate_estimate(now)
-        key = (self.session.session_id, int(rate['duration']//10), rate['status'], rate['recent_status'],
-               self.session.ended is not None, rate['age'] > 6, self.session.level)
+        session = self.session
+        gap = int(session.gap_seconds(now))
+        last = session.samples[-1] if session.samples else None
+        age = (session.ended if session.ended is not None else now) - last[0] if last else 0
+        inputs = (session.session_id, last, session.ended, age > 6, session.level, gap, session.blocked)
+        if inputs == self.rate_inputs_key:
+            return
+        self.rate_inputs_key = inputs
+        rate = session.rate_estimate(now)
+        key = (session.session_id, int(rate['duration']//10), rate['status'], rate['recent_status'],
+               session.ended is not None, rate['age'] > 6, session.level, gap, rate['gap_gain'], session.blocked)
         if key == self.rate_display_key:
             return
         self.rate_display_key = key
         if rate['status'] == 'ready':
             average = f"{rate['cumulative']:,.0f}"
-            recent = f"{rate['recent']:,.0f}" if rate['recent'] is not None else '관측 공백'
+            if rate['recent'] is not None:
+                recent = f"{rate['recent']:,.0f}"
+            else:
+                recent = '관측 공백' if rate['recent_status'] == 'gap' else '관측 부족'
             observed = max(0, int(rate['asof']-self.session.started))
             info = f'평균 {observed//60}:{observed%60:02d} 관측 기준 · 10초마다 갱신'
             if self.session.ended is not None:
@@ -408,6 +443,8 @@ class SharedController(tracker.MeasurementCore):
         else:
             average = recent = '—'
             info = '평균은 60초 관측 후 표시 · 10초마다 갱신'
+        if gap:
+            info += f" · 공백 {gap//60}:{gap%60:02d} / {rate['gap_gain']:,.0f} EXP 제외"
         if self.session.blocked:
             info = '감소 충돌로 정지 · 총량/평균 확인 필요 · '+info
         self.minute_label.setText(average); self.six_label.setText(recent)
@@ -504,6 +541,14 @@ class SharedController(tracker.MeasurementCore):
         menu = QMenu(self.window)
         menu.addAction('정보', self.show_information)
         menu.addAction('사냥 기록 비교', self.show_history)
+        collect = menu.addAction('대기 중 최근 경험치 모으기')
+        collect.setCheckable(True)
+        collect.setChecked(self.recent_recording)
+        collect.toggled.connect(self.set_recent_recording)
+        burning = menu.addAction('플래닛 버닝 적용')
+        burning.setCheckable(True)
+        burning.setChecked(self.burning)
+        burning.toggled.connect(self.set_burning)
         menu.addAction('이번 사냥터 메모', self.edit_memo)
         menu.addAction('JEV API 키 설정', self.api_key_settings)
         menu.addAction('배경 투명도', self.opacity_settings)
@@ -541,6 +586,21 @@ class SharedController(tracker.MeasurementCore):
             return
         saved = map_name.gateway_key() is not None
         self.status.set('JEV API 키 저장됨' if saved else 'JEV API 키 삭제됨')
+
+    def update_jev_button(self):
+        self.jev_button.setChecked(self.jev_enabled)
+        self.jev_button.setText('JEV 켬' if self.jev_enabled else 'JEV 끔')
+        self.jev_button.setToolTip(
+            '다음 측정부터 필요할 때 미니맵 이름 부분을 JEV에 보내 확인 · 우클릭 메뉴에서 API 키 설정'
+            if self.jev_enabled else 'JEV를 켜면 다음 측정부터 사냥터 이름 확인에 사용')
+
+    def toggle_jev(self, enabled):
+        self.jev_enabled = enabled
+        self.jev_revision += 1
+        self.jev_status_session = None
+        self.set_jev_status('')
+        self.update_jev_button()
+        self.save_config()
 
     def edit_memo(self):
         from PySide6.QtWidgets import QInputDialog
@@ -610,8 +670,61 @@ class SharedController(tracker.MeasurementCore):
             self.finish_measurement('사용자 정지')
             self.status.set('정지 · 시작 시 새 측정'); return
         if not self.check_permission() or not self.reset(): return
+        self.recent_permission = True
         self.running = True
         self.status.set('레벨·경험치 위치 자동 탐색 중' if self.auto_hud else '게임 창 연결 · 인식기 준비 중')
+
+    def collect_recent(self):
+        return self.recent_recording and self.recent_permission and self.auto_hud
+
+    def set_recent_recording(self, enabled):
+        self.recent_recording = enabled
+        if enabled:
+            self.recent_permission = self.has_background_capture_permission()
+        self.recent_exp.clear()
+        if not self.running:
+            self.generation += 1
+        self.save_config()
+
+    def finish_measurement(self, reason):
+        if not super().finish_measurement(reason):
+            return False
+        self.recent_start_source = None
+        self.recent_exp.clear()
+        return True
+
+    def start_with_recent(self):
+        now = time.monotonic()
+        buffer = self.recent_exp
+        if (self.running or not self.collect_recent() or not buffer.available(now)
+                or buffer.source[0] != self.generation):
+            self.status.set('최근 경험치 증가가 확인되면 포함할 수 있어요')
+            return
+        source = buffer.source[1:]
+        level = source[1]
+        session = tracker.Session(level=level)
+        for stamp, value in buffer.points:
+            session.accept(value, stamp, corroborated=True, baseline_verified=True)
+        if session.started is None or session.blocked or session.last != buffer.points[-1][1]:
+            self.status.set('최근 경험치 증가분 재확인 중')
+            return
+        if not self.finish_measurement('최근 5분 포함하여 새 측정'):
+            return
+        buffer.clear()
+        self.session = session
+        self.recent_start_source = source
+        self.level_var.set(level)
+        exp, pct = session.last
+        self.value.set(f'{exp:,}  [{pct:.2f}%]')
+        gain = exp-session.first[0]
+        self.status.set(f'최근 경험치 {gain:,} EXP 포함 · 측정 중')
+        try:
+            self.save_observation()
+        except OSError as exc:
+            tracker.log_error('최근 경험치 저장', exc)
+            self.save_warning = '자동 저장 실패 · CSV로 별도 보관'
+        self.running = True
+        self.save_config()
 
     def worker(self):
         try:
@@ -620,9 +733,15 @@ class SharedController(tracker.MeasurementCore):
             client = getattr(self.capture_clients, 'client', None)
             if client is not None and hasattr(client, 'close'): client.close()
 
-    def capture_frame(self,legacy_region):
+    def capture_frame(self, legacy_region, *, recent=False):
         if not hasattr(self.capture_clients,'client'):
             self.capture_clients.client = self.capture_module().WindowCapture(**self.CAPTURE_OPTIONS)
+        stamp = time.monotonic()
+        generation = self.generation
+        probe = (not recent and map_name.available() and not self.hunt_activity_lock.locked()
+                 and stamp >= getattr(self.capture_clients, 'next_activity_scan', 0))
+        starting = not recent and (self.session.started is None or self.recent_start_source is not None)
+        include_full = starting or probe
         if self.auto_hud:
             from auto_hud import AutomaticCapture, HudLocator
             if not hasattr(self.capture_clients,'automatic'):
@@ -631,11 +750,35 @@ class SharedController(tracker.MeasurementCore):
             if self.auto_rescan.is_set():
                 self.auto_rescan.clear()
                 automatic.reset()
-            return automatic.read(self.generation, self.session.level, self.session.first is not None,
-                                  self.session.started is None)
-        roi = dict(self.window_region) if self.window_region is not None else None
-        return self.capture_clients.client.snapshot(roi=roi,legacy_region=legacy_region if roi is None else None,
-                                                   include_full=self.session.started is None)
+            image = automatic.read(generation, self.session.level,
+                                   not recent and self.session.first is not None, include_full)
+        else:
+            roi = dict(self.window_region) if self.window_region is not None else None
+            image = self.capture_clients.client.snapshot(roi=roi, legacy_region=legacy_region if roi is None else None,
+                                                         include_full=include_full)
+        if probe:
+            self.capture_clients.next_activity_scan = stamp + hunt_activity.SCAN_INTERVAL
+            full = image.info.get('full_game_image')
+            if full is not None and self.hunt_activity_lock.acquire(blocking=False):
+                observed_at = (stamp + time.monotonic()) / 2
+                try:
+                    threading.Thread(target=self.read_hunt_activity, args=(generation, observed_at, full),
+                                     name='hunt-activity', daemon=True).start()
+                except RuntimeError as exc:
+                    self.hunt_activity_lock.release()
+                    tracker.log_error('사냥 신호 판독 시작', exc)
+        if not starting:
+            image.info.pop('full_game_image', None)
+        return image
+
+    def read_hunt_activity(self, generation, stamp, frame):
+        try:
+            observation = hunt_activity.read(frame)
+            self.hunt_activity_results.put((generation, stamp, observation))
+        except Exception as exc:
+            tracker.log_error('사냥 신호 판독', exc)
+        finally:
+            self.hunt_activity_lock.release()
 
     DISCOVERY_PERIOD = 1.0
 
@@ -685,26 +828,62 @@ class SharedController(tracker.MeasurementCore):
 
     def start_map_reading(self, session_id, full):
         """Read the minimap name once per measurement, off the UI thread."""
-        import map_name
         if getattr(self, 'map_read_for', None) == session_id or not map_name.available():
             return
         self.map_read_for = session_id
+        revision = self.jev_revision if self.jev_enabled else None
+
+        def can_request():
+            return (revision is not None and revision == self.jev_revision
+                    and session_id == self.session.session_id and not self.stop.is_set())
+
+        def on_request(has_key):
+            if not can_request():
+                return False
+            status = 'JEV 확인 중…' if has_key else 'JEV API 키 필요 · 우클릭 메뉴에서 설정'
+            self.map_results.put((session_id, revision, status))
+            return True
+
         def work():
             raw = picked = None
             try:
-                raw = map_name.read(full)
-                picked = map_name.choose(raw, map_name.title_area(full))
+                title = map_name.title_area(full)
+                raw = map_name.read_title(title)
+                if can_request():
+                    picked = map_name.choose(raw, title, on_request=on_request)
             except Exception as exc:
                 tracker.log_error('사냥터 이름 인식', exc)
-            self.map_results.put((session_id, raw, picked))
+            self.map_results.put((session_id, revision, (raw, picked)))
         threading.Thread(target=work, name='map-name', daemon=True).start()
 
+    def set_jev_status(self, text):
+        if self.jev_status.text() != text:
+            self.jev_status.setText(text)
+            self.jev_status.setVisible(bool(text))
+            from display_panel import resize
+            resize(self)
+
     def apply_map_results(self):
-        import map_name
         from record_history import load_memos, save_memo
+        current_session = self.session.session_id
+        if self.jev_status_session is not None and self.jev_status_session != current_session:
+            self.jev_status_session = None
+            self.set_jev_status('')
         while True:
-            try: session_id, raw, picked = self.map_results.get_nowait()
+            try: session_id, revision, result = self.map_results.get_nowait()
             except queue.Empty: return
+            current_request = self.jev_enabled and revision == self.jev_revision
+            if isinstance(result, str):
+                if current_request and session_id == current_session:
+                    self.jev_status_session = session_id
+                    self.set_jev_status(result)
+                continue
+            raw, picked = result
+            if not current_request:
+                picked = None
+            if (current_request and session_id == self.jev_status_session
+                    and self.jev_status.text() == 'JEV 확인 중…'):
+                self.set_jev_status(f'JEV로 확인 · {picked}' if picked else 'JEV 결과 없음')
             if not (raw or picked) or load_memos().get(session_id):
                 continue  # never overwrite a memo the user already wrote
             try:
@@ -712,8 +891,8 @@ class SharedController(tracker.MeasurementCore):
                 if raw:
                     if picked: map_name.learn_alias(raw, picked)  # same misread next time needs no JEV call
                     map_name.remember_auto(session_id, raw)
-                if session_id == self.session.session_id:
-                    self.status.set(f'사냥터 자동 인식 · {name}' + (' (JEV 확인)' if picked else ''))
+                if session_id == current_session:
+                    self.status.set(f'사냥터 자동 인식 · {name}')
             except OSError as exc:
                 tracker.log_error('사냥터 자동 메모 저장', exc)
 
@@ -766,13 +945,17 @@ class SharedController(tracker.MeasurementCore):
     def continue_level_up(self, new_level):
         """Keep the running measurement when the HUD shows a higher level."""
         old = self.session.level
-        if not self.session.level_up(new_level):
+        if not self.session.level_up(new_level, burning=self.burning):
             return False
         self.level_var.set(new_level)
         self.status.set(f'레벨업 Lv.{old} → {new_level} · 측정 계속')
         try: self.save_config()
         except OSError as exc: tracker.log_error('레벨업 설정 저장', exc)
         return True
+
+    def set_burning(self, enabled):
+        self.burning = enabled
+        self.save_config()
 
     def cancel_selection(self):
         self.selection_generation += 1
@@ -790,8 +973,27 @@ class SharedController(tracker.MeasurementCore):
             details = event[6] if len(event)>6 else {}
             if generation != self.generation: continue
             if details.get('initialization_error'):
+                self.recent_exp.clear()
                 self.status.set('인식기 준비 실패 · 2초 후 재시도'); continue
+            if details.get('recent'):
+                if not self.running and self.collect_recent():
+                    if details.get('source_changed'):
+                        self.recent_exp.clear()
+                    elif value is None:
+                        self.recent_exp.readable = False
+                    else:
+                        self.recent_exp.observe(details['source'], observed_at, value)
+                continue
             if not self.running: continue
+            if self.recent_start_source is not None and (value is not None or details.get('level_changed')):
+                source = (details.get('window_id'), details.get('detected_level'),
+                          details.get('content_points'), details.get('ui_kind'))
+                if source != self.recent_start_source:
+                    reason = '게임 화면 변경 · 포함한 최근 기록 저장'
+                    if self.finish_measurement(reason):
+                        self.status.set(reason)
+                    continue
+                self.recent_start_source = None
             self.hud_information.observe(details, self.generation, value, error, time.monotonic())
             if details.get('level_changed'):
                 target = details.get('level_to')
@@ -826,6 +1028,8 @@ class SharedController(tracker.MeasurementCore):
                 state = self.session.accept(value, observed_at, corroborated=corroborated,
                                             baseline_verified=verified_baseline)
                 if len(self.session.rows)>before:
+                    if previous_value is not None and self.session.last[0] > previous_value[0]:
+                        self.hunt_activity.update(generation, observed_at, gained=True)
                     self.remember_accepted_capture(previous_value, details)
                     try: self.save_observation(); self.save_warning = ''
                     except OSError as exc:
@@ -860,49 +1064,58 @@ class SharedController(tracker.MeasurementCore):
             else:
                 self.capture_failures.pop(key, None)
         now = time.monotonic()
-        gained, hourly, _, _ = self.session.stats(now)
+        gained = self.session.last[0]-self.session.first[0] if self.session.first is not None else 0
         self.total_label.setText(f'{gained:,.0f}')
         self.compact_total.setText(self.total_label.text())
-        elapsed = int(self.session.elapsed(now))
         self.update_rate_display(now)
         if self.session.started is None:
             timer = '기준 확인 중' if self.session.first is None else '첫 증가 대기'
         else:
             active, idle = int(self.session.active_elapsed(now)), int(self.session.idle(now))
+            gap = int(self.session.gap_seconds(now))
             timer = f'사냥 {active//3600:02d}:{active%3600//60:02d}:{active%60:02d}'
             if idle:
                 timer += f' · {"휴식 중" if self.session.resting(now) else "휴식"} {idle//60}:{idle%60:02d}'
                 total = active+idle
-                if total >= 60: timer += f' · 사냥 {active*100//total}%'
+                if total >= 60 and not gap: timer += f' · 사냥 {active*100//total}%'
+            if gap:
+                timer += f' · 공백 {gap//60}:{gap%60:02d}'
         self.timer_label.setText(timer)
+        while not self.hunt_activity_results.empty():
+            generation, stamp, observation = self.hunt_activity_results.get_nowait()
+            if self.running and generation == self.generation:
+                self.hunt_activity.update(generation, stamp, observation)
+        self.activity_label.setText(self.hunt_activity.text(self.generation, now) if self.running
+                                    else '사냥 신호 · 측정 대기')
         self.check_efficiency_change()
         self.apply_map_results()
         snapshot = self.session.minute_result()
         if snapshot:
-            one, six = self.session.valid_minute['one'], self.session.valid_minute['six']
-            self.recent_minute.setText(f'{one["one"]:,.0f}' if one else '미확정')
+            one, six = snapshot['one'], snapshot['six']
+            index = snapshot['index']
+            self.recent_minute.setText(f'{one:,.0f}' if one is not None else '미확정')
             # Before 6 full minutes exist, project the partial total to 6 minutes.
-            projected = six is not None and 0 < six['index'] < 6
+            projected = six is not None and 0 < index < 6
             if six is None: six_text = '미확정'
             elif projected:
                 # The timer starts on the first gain, so that packet has no hunting time
                 # of its own; scale only the timed gains (a real 6-minute total excludes it).
-                timed = max(0.0, six['six']-self.session.first_gain)
-                six_text = f'{timed*6/six["index"]:,.0f} 예상'
-            else: six_text = f'{six["six"]:,.0f}'
+                timed = max(0.0, six-self.session.first_gain)
+                six_text = f'{timed*6/index:,.0f} 예상'
+            else: six_text = f'{six:,.0f}'
             self.recent_six.setText(six_text)
-            self.recent_six.setToolTip(f'{six["index"]}분 실제 {six["six"]:,.0f} − 첫 증가 {self.session.first_gain:,.0f}, × 6/{six["index"]} · 6분 예상치' if projected else '')
+            self.recent_six.setToolTip(f'{index}분 실제 {six:,.0f} − 첫 증가 {self.session.first_gain:,.0f}, × 6/{index} · 6분 예상치' if projected else '')
             remaining = max(0, math.ceil((snapshot['index']+1)*60-self.session.elapsed(now)))
             quality = '관측 공백 추정' if snapshot['estimated'] else '분별 집계'
             if snapshot['one'] is None or snapshot['six'] is None:
-                info = f'공백 미확정 · 1분 {one["index"] if one else "—"}:00 / 6분 {six["index"] if six else "—"}:00'
+                info = f'{index}:00 집계 · 공백 포함 구간 미확정'
             else:
                 info = f'{quality} {snapshot["index"]}:00 · 다음 {remaining}초' if self.running else f'{snapshot["index"]}:00 집계 · 측정 정지'
             if (self.running and snapshot['one'] is not None and snapshot['six'] is not None
                     and self.session.elapsed(now) >= (snapshot['index']+1)*60):
                 info = f'집계 {snapshot["index"]}:00 유지 · 새 관측 대기'
             if projected:
-                info += f' · 6분은 {six["index"]}분 기준 예상'
+                info += f' · 6분은 {index}분 기준 예상'
             self.minute_info.setText(info)
         else:
             text = '첫 1분 대기' if self.session.started is not None else '집계 대기'
@@ -933,7 +1146,9 @@ class SharedController(tracker.MeasurementCore):
         self.footer.setToolTip(' · '.join(filter(None,[self.session.stop_reason,self.save_warning,self.audit_warning]))
                                if self.session.blocked else warning)
         self.compact_total.setToolTip('확인 필요 · '+self.session.stop_reason if self.session.blocked else '현재 확정 경험치 − 시작 기준 경험치')
-        self.footer.setStyleSheet('color: '+('#e7b86e' if self.session.blocked or (self.running and delayed) else '#a8edbb' if self.running else '#7c8c9d')+';')
+        footer_style = 'color: '+('#e7b86e' if self.session.blocked or (self.running and delayed) else '#a8edbb' if self.running else '#7c8c9d')+';'
+        if footer_style != self.footer.styleSheet():
+            self.footer.setStyleSheet(footer_style)
         self.current_label.setText(self.value.get())
         self.baseline_label.setText(f'시작 기준 {self.session.first[0]:,}' if self.session.first else '시작 기준 —')
         checked = str(self.session.level) in tracker.EXP_METADATA.get('screenshot_verified',{})
@@ -948,16 +1163,41 @@ class SharedController(tracker.MeasurementCore):
         self.ui_label.setText(ui_text)
         self.title_label.setToolTip(ui_text)
         self.toggle_button.setText('측정 정지' if self.running else '측정 시작')
+        self.update_recent_button(now)
         if self.preview_frame is not None and self.preview_frame[1] != self.preview_stamp:
             frame, self.preview_stamp = self.preview_frame
             frame = frame.convert('RGB')
             qimage = QImage(frame.tobytes(), frame.width, frame.height, frame.width*3, QImage.Format.Format_RGB888).copy()
             self.preview.setPixmap(QPixmap.fromImage(qimage).scaled(self.preview.size(), Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.FastTransformation))
 
+    def update_recent_button(self, now):
+        available = (not self.running and self.collect_recent() and self.recent_exp.available(now)
+                     and self.recent_exp.source[0] == self.generation)
+        self.recent_button.setEnabled(available)
+        visible = not self.running and self.auto_hud and self.recent_recording
+        if self.recent_button.isHidden() == visible:
+            self.recent_button.setVisible(visible)
+            from display_panel import resize
+            resize(self)
+        if available:
+            first, last = self.recent_exp.points[0], self.recent_exp.points[-1]
+            self.recent_button.setToolTip(f'최근 {int(last[0]-first[0])}초 · {last[1][0]-first[1][0]:,} EXP로 측정을 시작해요')
+        elif not self.recent_permission:
+            self.recent_button.setToolTip('측정 시작으로 화면 기록 권한을 확인해 주세요')
+        else:
+            self.recent_button.setToolTip('같은 창과 레벨에서 경험치 증가를 확인하면 포함할 수 있어요')
+
     def save_config(self):
         try:
             temporary = tracker.BASE/'settings.json.tmp'
-            temporary.write_text(json.dumps({'region': self.region, 'window_region':self.window_region, 'position': [self.window.x(),self.window.y()], 'level': self.session.level, 'compact':self.compact, 'always_on_top':self.always_on_top, 'window_opacity':self.window_opacity, 'auto_hud':self.auto_hud}), encoding='utf-8')
+            temporary.write_text(json.dumps({
+                'region': self.region, 'window_region': self.window_region,
+                'position': [self.window.x(), self.window.y()], 'level': self.session.level,
+                'compact': self.compact, 'always_on_top': self.always_on_top,
+                'window_opacity': self.window_opacity, 'auto_hud': self.auto_hud,
+                'recent_recording': self.recent_recording, 'burning': self.burning,
+                'jev_enabled': self.jev_enabled,
+            }), encoding='utf-8')
             temporary.replace(tracker.BASE/'settings.json')
         except OSError as exc:
             tracker.log_error('설정 저장', exc); self.status.set('창 위치/영역 저장 실패')

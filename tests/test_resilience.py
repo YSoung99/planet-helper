@@ -71,6 +71,9 @@ class ResilienceTests(unittest.TestCase):
             app.region = {'left': 683, 'top': 1370, 'width': 185, 'height': 23}
             app.window_region, app.compact, app.always_on_top = None, True, True
             app.window_opacity, app.auto_hud = .9, True
+            app.recent_recording = True
+            app.burning = True
+            app.jev_enabled = True
             app.session = tracker.Session(level=169)
             app.status = SimpleNamespace(set=messages.append)
             with patch.object(Path, 'replace', side_effect=PermissionError('read only destination')):
@@ -82,6 +85,8 @@ class ResilienceTests(unittest.TestCase):
             self.assertIsNone(warning)
             self.assertEqual(config['region'], app.region)
             self.assertEqual(config['position'], [3, 542])
+            self.assertTrue(config['burning'])
+            self.assertTrue(config['jev_enabled'])
 
 
 if __name__ == '__main__':

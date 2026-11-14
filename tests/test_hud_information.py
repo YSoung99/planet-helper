@@ -9,7 +9,7 @@ from unittest.mock import patch
 from PySide6.QtWidgets import QApplication
 from auto_hud import Confirmation, AutomaticCapture, HudNotFound
 from hud_information import HudInformation
-from test_auto_hud import hud
+from test_auto_hud import hud, snapshot
 import tracker
 from mac_app import Controller
 
@@ -55,7 +55,7 @@ class InformationTests(unittest.TestCase):
         from PIL import Image
         from unittest.mock import Mock
         image = Image.new('RGB', (1600, 1000)); image.info['window_id'] = 100
-        client = Mock(); client.snapshot.return_value = image
+        client = Mock(); client.snapshot.side_effect = lambda **kwargs: snapshot(image, **kwargs)
         locator = Mock(); locator.locate.return_value = hud(ui_kind='new')
         now = [1]
         capture = AutomaticCapture(client, locator, lambda: now[0])
@@ -64,11 +64,14 @@ class InformationTests(unittest.TestCase):
             with self.assertRaises(HudNotFound): capture.read(7, 170, False, True)
         now[0] = 3; first = capture.read(7, 170, False, True)
         self.assertEqual(first.info['ui_kind'], 'new')
+        for stamp in (8, 13, 18, 23, 28, 32):
+            now[0] = stamp
+            self.assertEqual(capture.read(7, 170, True, False).info['ui_kind'], 'new')
         locator.locate.return_value = hud(ui_kind='classic', exp_roi=dict(hud().exp_roi, top=.90))
-        for stamp in (8, 9):
+        for stamp in (33, 34):
             now[0] = stamp
             with self.assertRaises(HudNotFound): capture.read(7, 170, True, False)
-        now[0] = 10; second = capture.read(7, 170, True, False)
+        now[0] = 35; second = capture.read(7, 170, True, False)
         self.assertEqual(second.info['ui_kind'], 'classic')
         self.assertEqual(capture.generation, 7)
         self.assertNotIn('full_game_image', second.info)

@@ -3,11 +3,7 @@ import random
 import unittest
 from decimal import Decimal
 
-from unittest.mock import patch
-
 import tracker
-
-NO_BREAKS = patch.object(tracker, 'IDLE_AFTER', float('inf'))  # arithmetic checks with sparse samples
 
 
 def seed(session, baseline):
@@ -34,8 +30,8 @@ class FormulaTests(unittest.TestCase):
         gained, hourly, _, _ = s.stats(480)
         self.assertEqual(gained, 222000)
         self.assertEqual(s.elapsed(480), 480)
-        self.assertEqual(hourly/60, 27750)
-        self.assertEqual(hourly/10, 166500)
+        self.assertAlmostEqual(hourly/60, 222000*60/481)
+        self.assertAlmostEqual(hourly/10, 222000*360/481)
         self.assertEqual(s.minute_result()['one'], 48000)
         self.assertEqual(s.minute_result()['six'], 198000)
 
@@ -60,43 +56,49 @@ class FormulaTests(unittest.TestCase):
                 self.assertAlmostEqual(s.minute_result()['six'], expected_six, delta=1e-6)
                 self.assertEqual(s.stats(stamp)[0], first_gain+rate*stamp)
 
-    @NO_BREAKS
     def test_fractional_seconds_match_decimal_average_and_eta(self):
         s = tracker.Session(level=169)
         seed(s, 172680132)
         s.accept((172692477, round(172692477/s.total*100, 2)), 0)
         last = 172746798
-        s.accept((last, round(last/s.total*100, 2)), 125.75)
+        for stamp in [*range(5, 126, 5), 125.75]:
+            exp = 172692477+round((last-172692477)*stamp/125.75)
+            s.accept((exp, round(exp/s.total*100, 2)), stamp)
         gained, hourly, _, eta = s.stats(125.75)
-        expected_minute = Decimal(66666)*60/Decimal('125.75')
-        expected_six = Decimal(66666)*360/Decimal('125.75')
+        expected_minute = Decimal(66666)*60/Decimal('126.75')
+        expected_six = Decimal(66666)*360/Decimal('126.75')
         self.assertEqual(gained, 66666)
         self.assertAlmostEqual(hourly/60, float(expected_minute), places=7)
         self.assertAlmostEqual(hourly/10, float(expected_six), places=7)
-        expected_eta = Decimal(s.total-last)*Decimal('125.75')/Decimal(66666)
+        expected_eta = Decimal(s.total-last)*Decimal('126.75')/Decimal(66666)
         self.assertAlmostEqual(eta, float(expected_eta), places=7)
 
     def test_first_gain_is_intentionally_included_in_first_minute(self):
         s = tracker.Session(level=169)
         seed(s, 172680132)
         s.accept((172680232, 42.55), 0)
+        for t in range(5, 60, 5):
+            s.accept((172680232, 42.55), t)
         s.accept((172680332, 42.55), 60)
         self.assertEqual(s.stats(60)[0], 200)
-        self.assertEqual(s.stats(60)[1]/60, 200)
+        self.assertAlmostEqual(s.stats(60)[1]/60, 200*60/61)
         self.assertEqual(s.minute_result()['one'], 200)
-        s.accept((172680332, 42.55), 120)
+        for t in range(65, 121, 5):
+            s.accept((172680332, 42.55), t)
         self.assertEqual(s.minute_result()['one'], 0)
         self.assertEqual(s.minute_result()['six'], 200)
 
-    @NO_BREAKS
     def test_six_minute_average_uses_unrounded_rate_not_rounded_display(self):
         s = tracker.Session(level=169)
         seed(s, 172680132)
         s.accept((172680233, 42.55), 0)
-        per_minute = s.stats(120)[1]/60
+        for t in range(5, 120, 5):
+            s.accept((172680233+t//10, 42.55), t)
+        s.accept((172680333, 42.55), 119)
+        per_minute = s.stats(119)[1]/60
         per_six = per_minute*6
-        self.assertEqual(per_minute, 50.5)
-        self.assertEqual(per_six, 303)
+        self.assertEqual(per_minute, 100.5)
+        self.assertEqual(per_six, 603)
         shown_minute, shown_six = int(f'{per_minute:.0f}'), int(f'{per_six:.0f}')
         self.assertEqual(abs(shown_six-shown_minute*6), 3)
 

@@ -10,6 +10,7 @@ def build(c, config, application, level_value, repeat_bridge=KeyRepeatBridge):
     c.always_on_top = config.get('always_on_top', True)
     c.window_opacity = config.get('window_opacity', .90)
     c.rate_display_key = None
+    c.rate_inputs_key = None
     c.window.setWindowTitle('플래닛 도우미 자동인식 시험용')
     c.window.setObjectName('panel')
     c.window.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
@@ -45,6 +46,12 @@ def build(c, config, application, level_value, repeat_bridge=KeyRepeatBridge):
     c.level_picker.setValue(c.session.level);c.level_picker.setFixedWidth(52)
     c.level_picker.setAccessibleName('캐릭터 레벨');c.level_var=level_value(c.level_picker)
     c.level_picker.valueChanged.connect(c.change_level);header.addWidget(c.level_picker)
+    c.jev_button = QPushButton()
+    c.jev_button.setCheckable(True)
+    c.jev_button.setAccessibleName('JEV 사냥터 이름 확인')
+    c.update_jev_button()
+    c.jev_button.toggled.connect(c.toggle_jev)
+    header.addWidget(c.jev_button)
     c.mode_button=QPushButton();c.mode_button.setAccessibleName('간단 화면 전환')
     c.mode_button.clicked.connect(c.toggle_display);header.addWidget(c.mode_button)
     c.pin_button=QPushButton();c.pin_button.setCheckable(True)
@@ -103,6 +110,12 @@ def build(c, config, application, level_value, repeat_bridge=KeyRepeatBridge):
     c.level_eta=c.label('레벨업 예상 · 평균 집계 후 표시');c.level_eta.setWordWrap(True)
     c.level_eta.setStyleSheet('color:#e8d9a8;');c.level_eta.setAccessibleName('시간당 경험치와 레벨업 예상 시간')
     layout.addWidget(c.level_eta)
+    c.activity_label = c.label('사냥 신호 · 측정 대기')
+    layout.addWidget(c.activity_label)
+    c.jev_status = c.label('')
+    c.jev_status.setWordWrap(True)
+    c.jev_status.hide()
+    layout.addWidget(c.jev_status)
     c.change_prompt=QPushButton();c.change_prompt.setVisible(False)
     c.change_prompt.setStyleSheet('QPushButton{background:#3a3322;color:#f0d98c;text-align:left;padding:4px 6px;}')
     c.change_prompt.setAccessibleName('효율 변화 태그 달기')
@@ -114,7 +127,11 @@ def build(c, config, application, level_value, repeat_bridge=KeyRepeatBridge):
     c.reset_button=QPushButton('새 측정');c.reset_button.clicked.connect(c.reset)
     c.export_button=QPushButton('CSV 저장');c.export_button.clicked.connect(c.export)
     c.toggle_button=QPushButton('측정 시작');c.toggle_button.setObjectName('toggle');c.toggle_button.clicked.connect(c.toggle)
-    for button in (c.region_button,c.reset_button,c.export_button,c.toggle_button):buttons.addWidget(button)
+    c.recent_button = QPushButton('최근 5분 포함')
+    c.recent_button.clicked.connect(c.start_with_recent)
+    c.recent_button.setEnabled(False)
+    c.recent_button.setVisible(c.auto_hud and c.recent_recording)
+    for button in (c.region_button,c.reset_button,c.export_button,c.toggle_button,c.recent_button):buttons.addWidget(button)
     controls=QHBoxLayout();controls.setSpacing(14);controls.addLayout(buttons);layout.addLayout(controls)
     c.key_repeat=repeat_bridge(__import__('tracker').BASE,parent=c.window)
     repeat=QHBoxLayout();c.repeat_controls=repeat;c.repeat_title=c.label('A·Enter 연타');repeat.addWidget(c.repeat_title)
@@ -151,12 +168,14 @@ def resize(c):
     c.compact_six_average.setToolTip('누적 분당 평균 × 6 · 같은 관측 기준의 6분 환산값')
     c.window.layout().setContentsMargins(8 if c.compact else 12,8,8 if c.compact else 12,8)
     c.window.layout().setSpacing(4 if c.compact else 6)
-    for button in (c.mode_button,c.pin_button,c.close_button,c.toggle_button,c.repeat_button,c.repeat_settings_button):
+    for button in (c.jev_button,c.mode_button,c.pin_button,c.close_button,c.toggle_button,c.recent_button,c.repeat_button,c.repeat_settings_button):
         button.setStyleSheet('padding:3px 5px;font-size:10px;' if c.compact else '')
     if c.compact:
         c.repeat_controls.insertWidget(0,c.toggle_button)
+        c.repeat_controls.insertWidget(1,c.recent_button)
     else:
         c.measurement_controls.addWidget(c.toggle_button)
+        c.measurement_controls.addWidget(c.recent_button)
 
     c.compact_body.setVisible(c.compact);c.full_body.setVisible(not c.compact)
     c.window.setMinimumSize(0,0);c.window.setMaximumSize(16777215,16777215)
