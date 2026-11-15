@@ -53,7 +53,7 @@ jobs:
           git archive HEAD | tar -x -C "$root"
           python -m venv --system-site-packages "$root/.venv"
           HOME="$root/test-home" "$root/install-linux.sh"
-          app="$root/.planet-helper-versions/v1.4.4-smoke"
+          app="$root/.planet-helper-versions/v1.4.5-smoke"
           mkdir -p "$app"
           git archive HEAD | tar -x -C "$app"
           python -m venv --system-site-packages "$app/.venv"
@@ -77,9 +77,9 @@ jobs:
           import sys
           import linux_updates as updates
           root = Path(sys.argv[1])
-          updates.switch(root, '.', 'v1.4.4-smoke')
-          assert updates.state(root) == {'current': 'v1.4.4-smoke', 'previous': '.'}
-          updates.switch(root, 'v1.4.4-smoke', '.')
-          assert updates.state(root) == {'current': '.', 'previous': 'v1.4.4-smoke'}
+          updates.switch(root, '.', 'v1.4.5-smoke')
+          assert updates.state(root) == {'current': 'v1.4.5-smoke', 'previous': '.'}
+          updates.switch(root, 'v1.4.5-smoke', '.')
+          assert updates.state(root) == {'current': '.', 'previous': 'v1.4.5-smoke'}
           assert (root / 'settings.json').is_file()
           PYTEST

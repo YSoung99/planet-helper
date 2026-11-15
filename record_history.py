@@ -3,6 +3,7 @@ import json
 from datetime import datetime
 from pathlib import Path
 
+import exp_buffs
 import tracker
 
 MEMO_FILE = 'memos.json'
@@ -58,7 +59,7 @@ def summarize(csv_path):
         started = None
     import segments
     return dict(session_id=csv_path.stem, started=started, level=level, active=active, idle=idle,
-                character_name=session.character_name,
+                character_name=session.character_name, exp_buff_intervals=session.exp_buff_intervals,
                 gained=gained, per_minute=rate['cumulative'], rate_gain=rate['rate_gain'],
                 rate_seconds=rate['duration'], gap=session.gap_seconds(0.0), gap_gain=session.gap_gain,
                 blocked=session.blocked, stop_reason=session.stop_reason,
@@ -217,6 +218,23 @@ def clock(seconds):
     return f'{seconds//60}:{seconds%60:02d}'
 
 
+def buff_cell(intervals):
+    lines = []
+    labels = []
+    for key, label in exp_buffs.LABELS.items():
+        spans = intervals.get(key)
+        if not isinstance(spans, list):
+            continue
+        times = [f'{clock(start)}–{clock(end)}' for span in spans
+                 if isinstance(span, list) and len(span) == 2
+                 for start, end in (span,)
+                 if all(isinstance(t, (int, float)) and 0 <= t < 10**8 for t in span) and start <= end]
+        if times:
+            labels.append(label)
+            lines.append(f'{label} ' + ', '.join(times))
+    return ' · '.join(labels) or '—', '\n'.join(lines)
+
+
 def build_dialog(controller):
     from PySide6.QtCore import Qt
     from PySide6.QtGui import QColor
@@ -252,7 +270,7 @@ def build_dialog(controller):
     layout.addLayout(chart_layout)
     levels = QLabel()
     levels.setWordWrap(True); levels.setStyleSheet('color:#9aa8b6;'); layout.addWidget(levels)
-    headers = ['날짜', '캐릭터', 'Lv', '순수 사냥', '휴식', '인식 공백', '관측 중 사냥', '획득', '분당', '시간당', '효율 변화', '사냥터 메모']
+    headers = ['날짜', '캐릭터', 'Lv', '순수 사냥', '휴식', '인식 공백', '관측 중 사냥', '획득', '분당', '시간당', '효율 변화', '경험치 버프', '사냥터 메모']
     memo_column = len(headers)-1
     table = QTableWidget(0, len(headers))
     table.setHorizontalHeaderLabels(headers)
@@ -307,12 +325,13 @@ def build_dialog(controller):
         for index, row in enumerate(rows):
             rate = row['per_minute']
             warning = '확인 필요' if row['blocked'] else '관측 부족' if rate is None else ''
+            buffs, buff_times = buff_cell(row['exp_buff_intervals'])
             cells = [row['started'].strftime('%m/%d %H:%M') if row['started'] else row['session_id'],
                      row['character_name'] or '—', str(row['level'] or '—'), clock(row['active']), clock(row['idle']) if row['idle'] else '—',
                      clock(row['gap']) if row['gap'] else '—',
                      f"{ratio(row):.0f}%",
                      short_exp(row['gained']), warning or f"{rate:,.0f}", '—' if warning else short_exp(rate*60),
-                     '—' if row['blocked'] else change_text(row['changes']), row['memo']]
+                     '—' if row['blocked'] else change_text(row['changes']), buffs, row['memo']]
             for column, text in enumerate(cells):
                 item = QTableWidgetItem(text)
                 if column < memo_column:
@@ -320,6 +339,8 @@ def build_dialog(controller):
                     if column >= 5: item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
                 else:
                     item.setData(Qt.ItemDataRole.UserRole, row['session_id'])
+                if column == memo_column - 1:
+                    item.setToolTip(buff_times or '확인된 버프 구간 없음')
                 if column == 5 and row['gap']:
                     observed = row['active']+row['idle']
                     coverage = observed/(observed+row['gap'])*100

@@ -22,6 +22,7 @@ from PySide6.QtGui import QAction, QColor, QImage, QPainter, QPen, QPixmap, QSho
 from PySide6.QtWidgets import (QApplication, QWidget, QLabel, QPushButton, QSpinBox,
     QVBoxLayout, QHBoxLayout, QGridLayout, QFrame, QFileDialog, QMessageBox, QMenu, QMenuBar, QDialog, QComboBox)
 import character_hud
+import exp_buffs
 import hunt_activity
 import map_name
 import tracker
@@ -307,6 +308,13 @@ class SharedController(tracker.MeasurementCore):
         self.jev_revision = 0
         self.hunt_activity = hunt_activity.Activity()
         self.hunt_activity_results = queue.SimpleQueue()
+        self.buff_results = queue.SimpleQueue()
+        self.buff_confirmation = exp_buffs.Confirmation()
+        self.buff_window = None
+        self.buff_detector = exp_buffs.Detector()
+        self.buff_has_templates = exp_buffs.available(tracker.BASE)
+        self.buff_revision = 0
+        self.buff_last_flush = float('-inf')
         self.hunt_activity_lock = threading.Lock()
         self.hunt_activity_cache = {}
         self.character_results = queue.SimpleQueue()
@@ -559,6 +567,10 @@ class SharedController(tracker.MeasurementCore):
         pinned.setChecked(self.always_on_top)
         pinned.toggled.connect(self.toggle_pin)
         menu.addAction('연타 설정', self.repeat_settings)
+        buff_menu = menu.addMenu('경험치 버프 아이콘 등록')
+        for kind, label in exp_buffs.LABELS.items():
+            buff_menu.addAction(f'{label} 아이콘 등록',
+                                lambda checked=False, key=kind: self.register_buff_icon(key))
         collect = menu.addAction('대기 중 최근 경험치 모으기')
         collect.setCheckable(True)
         collect.setChecked(self.recent_recording)
@@ -579,6 +591,22 @@ class SharedController(tracker.MeasurementCore):
         self.extra_menu_actions(menu)
         menu.addSeparator(); menu.addAction('종료', self.close)
         menu.exec(self.window.mapToGlobal(point))
+
+    def register_buff_icon(self, kind):
+        label = exp_buffs.LABELS[kind]
+        path, _ = QFileDialog.getOpenFileName(
+            self.window, f'{label} 아이콘 한 칸을 자른 이미지 선택', '', '이미지 (*.png *.jpg *.jpeg *.webp)')
+        if not path:
+            return
+        try:
+            exp_buffs.register(tracker.BASE, kind, path)
+        except (OSError, ValueError) as exc:
+            QMessageBox.warning(self.window, '버프 아이콘 등록', str(exc))
+            return
+        self.buff_has_templates = True
+        self.buff_revision += 1
+        self.buff_confirmation = exp_buffs.Confirmation()
+        self.buff_label.setText(f'{label} 등록 완료 · 측정 중 확인')
 
     def show_history(self):
         from record_history import build_dialog
@@ -811,7 +839,8 @@ class SharedController(tracker.MeasurementCore):
             self.capture_clients.client = self.capture_module().WindowCapture(**self.CAPTURE_OPTIONS)
         stamp = time.monotonic()
         generation = self.generation
-        probe = (not recent and map_name.available() and not self.hunt_activity_lock.locked()
+        probe = (not recent and (self.buff_has_templates or map_name.available())
+                 and not self.hunt_activity_lock.locked()
                  and stamp >= getattr(self.capture_clients, 'next_activity_scan', 0))
         starting = not recent and (self.session.started is None or self.recent_start_source is not None)
         include_full = starting or probe
@@ -852,8 +881,16 @@ class SharedController(tracker.MeasurementCore):
 
     def read_hunt_activity(self, generation, stamp, frame, window, level_roi, style):
         try:
-            observation = hunt_activity.read(frame, self.hunt_activity_cache)
-            self.hunt_activity_results.put((generation, stamp, observation))
+            if window is not None and self.buff_has_templates:
+                revision = self.buff_revision
+                readings = self.buff_detector.read(frame, tracker.BASE)
+                self.buff_results.put((generation, window, revision, stamp, readings))
+        except Exception as exc:
+            tracker.log_error('경험치 버프 판독', exc)
+        try:
+            if map_name.available():
+                observation = hunt_activity.read(frame, self.hunt_activity_cache)
+                self.hunt_activity_results.put((generation, stamp, observation))
         except Exception as exc:
             tracker.log_error('사냥 신호 판독', exc)
         try:
@@ -1062,6 +1099,33 @@ class SharedController(tracker.MeasurementCore):
         identity = [text for text in reversed(self.character_identity) if text]
         self.source_label.setText(' · '.join([f'Lv. {self.session.level}', *identity]))
 
+    def apply_buff_results(self, now):
+        session = self.session
+        while not self.buff_results.empty():
+            generation, window, revision, stamp, readings = self.buff_results.get_nowait()
+            if (not self.running or (generation, window) != self.buff_window
+                    or generation != self.generation or revision != self.buff_revision):
+                continue
+            start = self.buff_confirmation.observe((generation, window), stamp, readings)
+            if session.started is not None and start is not None:
+                session.exp_buffs_dirty |= exp_buffs.record(
+                    session.exp_buff_intervals, self.buff_confirmation.current,
+                    start - session.started, stamp - session.started)
+        if (self.running and session.exp_buffs_dirty and session.rows and not session.ledger_dirty
+                and now - self.buff_last_flush >= 10):
+            self.buff_last_flush = now
+            try:
+                self.save_summary()
+            except OSError as exc:
+                tracker.log_error('경험치 버프 구간 저장', exc)
+        if not self.buff_has_templates:
+            text = '경험치 버프 · 아이콘 미등록'
+        elif self.running:
+            text = self.buff_confirmation.text(self.generation, now)
+        else:
+            text = '경험치 버프 · 측정 대기'
+        self.buff_label.setText(text)
+
     def poll(self):
         if self.worker_ready and self.status.get().startswith('인식기 준비 실패'):
             self.status.set('인식기 준비 완료 · 시작으로 새 측정' if not self.running else '인식기 복구 · 화면 확인 중')
@@ -1116,6 +1180,8 @@ class SharedController(tracker.MeasurementCore):
             if not details.get('auto_detected') and details.get('window_region') is not None and self.window_region is None:
                 self.window_region = details['window_region']
                 self.save_config()
+            if not error and details.get('backend') in self.CAPTURE_BACKENDS:
+                self.buff_window = (generation, details.get('window_id'))
             if details.get('backend') in self.CAPTURE_BACKENDS:
                 source = (generation, details.get('window_id'))
                 if source != self.character_source:
@@ -1217,6 +1283,7 @@ class SharedController(tracker.MeasurementCore):
                         self.save_summary()
                     except OSError as exc:
                         tracker.log_error('사냥 기록 캐릭터 저장', exc)
+        self.apply_buff_results(now)
         self.check_efficiency_change()
         self.apply_map_results()
         snapshot = self.session.minute_result()
