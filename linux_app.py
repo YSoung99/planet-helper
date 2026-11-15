@@ -3,6 +3,8 @@
 Shared behaviour is in qt_controller.py so the macOS app gets the same changes.
 """
 import os
+from pathlib import Path
+from tempfile import NamedTemporaryFile
 
 import tracker
 from qt_controller import (SharedController, Value, LevelValue, TrackerWindow, Selection,  # noqa: F401
@@ -76,11 +78,51 @@ class Controller(SharedController):
         return lambda: None
 
 
+def refresh_desktop_icon(home, source):
+    """Migrate the desktop shortcut from installs created before the custom icon."""
+    desktop = home / '.local/share/applications/planet-helper.desktop'
+    if not desktop.is_file():
+        return
+    lines = desktop.read_text(encoding='utf-8').splitlines(keepends=True)
+    launcher = home / '.local/bin/planet-helper'
+    if not any(line.rstrip() == f'Exec={launcher}' for line in lines):
+        return
+    icon = home / '.local/share/icons/planet-helper.png'
+    updated_line = f'Icon={icon}'
+    old_line = 'Icon=utilities-system-monitor'
+    existing = next((line.rstrip() for line in lines if line.startswith('Icon=')), '')
+    if existing not in (old_line, updated_line):
+        return
+
+    def write_atomic(path, data):
+        with NamedTemporaryFile(dir=path.parent, delete=False) as file:
+            tmp = Path(file.name)
+        try:
+            tmp.write_bytes(data)
+            tmp.chmod(0o644)
+            tmp.replace(path)
+        finally:
+            tmp.unlink(missing_ok=True)
+
+    payload = source.read_bytes()
+    if not icon.is_file() or icon.read_bytes() != payload:
+        icon.parent.mkdir(parents=True, exist_ok=True)
+        write_atomic(icon, payload)
+    if existing == old_line:
+        updated = ''.join(f'{updated_line}\n' if line.rstrip() == old_line else line for line in lines)
+        write_atomic(desktop, updated.encode('utf-8'))
+
+
 def main():
     # Qt's native Wayland window does not apply the keep-above hint on KWin.
     # XWayland exposes the stacking hint for this overlay.
     if os.environ.get('XDG_SESSION_TYPE') == 'wayland' and os.environ.get('DISPLAY'):
         os.environ.setdefault('QT_QPA_PLATFORM', 'xcb')
+    if os.environ.get('PLANET_HELPER_INSTALL_ROOT'):
+        try:
+            refresh_desktop_icon(Path.home(), tracker.RESOURCES / 'planet-helper-icon.png')
+        except OSError as exc:
+            tracker.log_error('앱 메뉴 아이콘 변경', exc)
     run_app(Controller)
 
 

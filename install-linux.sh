@@ -14,7 +14,8 @@ if [ "${1:-}" = --prepare ]; then
     QT_QPA_PLATFORM=offscreen "$app_dir/.venv/bin/python" -c 'import sys; sys.path.insert(0, sys.argv[1]); import linux_app' "$app_dir"
     exit 0
 fi
-mkdir -p "$HOME/.local/bin" "$HOME/.local/share/applications"
+mkdir -p "$HOME/.local/bin" "$HOME/.local/share/applications" "$HOME/.local/share/icons"
+install -m 644 "$app_dir/planet-helper-icon.png" "$HOME/.local/share/icons/planet-helper.png"
 cat > "$HOME/.local/bin/planet-helper" <<EOF
 #!/bin/bash
 set -eu
@@ -31,7 +32,7 @@ Type=Application
 Name=플래닛 도우미
 Comment=Maple Planet EXP 측정기
 Exec=$HOME/.local/bin/planet-helper
-Icon=utilities-system-monitor
+Icon=$HOME/.local/share/icons/planet-helper.png
 Terminal=false
 Categories=Game;Utility;
 X-KDE-DBUS-Restricted-Interfaces=org.kde.KWin.ScreenShot2

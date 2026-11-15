@@ -53,7 +53,11 @@ jobs:
           git archive HEAD | tar -x -C "$root"
           python -m venv --system-site-packages "$root/.venv"
           HOME="$root/test-home" "$root/install-linux.sh"
-          app="$root/.planet-helper-versions/v1.4.5-smoke"
+          desktop="$root/test-home/.local/share/applications/planet-helper.desktop"
+          cmp "$root/planet-helper-icon.png" "$root/test-home/.local/share/icons/planet-helper.png"
+          grep -Fx "Icon=$root/test-home/.local/share/icons/planet-helper.png" "$desktop"
+          sed -i 's@^Icon=.*@Icon=utilities-system-monitor@' "$desktop"
+          app="$root/.planet-helper-versions/v1.4.6-smoke"
           mkdir -p "$app"
           git archive HEAD | tar -x -C "$app"
           python -m venv --system-site-packages "$app/.venv"
@@ -69,6 +73,7 @@ jobs:
           done
           test -s "$root/.app.lock"
           kill -0 "$parent"
+          grep -Fx "Icon=$root/test-home/.local/share/icons/planet-helper.png" "$desktop"
           kill -KILL "$parent"
           wait "$parent" || true
           trap - EXIT
@@ -77,9 +82,9 @@ jobs:
           import sys
           import linux_updates as updates
           root = Path(sys.argv[1])
-          updates.switch(root, '.', 'v1.4.5-smoke')
-          assert updates.state(root) == {'current': 'v1.4.5-smoke', 'previous': '.'}
-          updates.switch(root, 'v1.4.5-smoke', '.')
-          assert updates.state(root) == {'current': '.', 'previous': 'v1.4.5-smoke'}
+          updates.switch(root, '.', 'v1.4.6-smoke')
+          assert updates.state(root) == {'current': 'v1.4.6-smoke', 'previous': '.'}
+          updates.switch(root, 'v1.4.6-smoke', '.')
+          assert updates.state(root) == {'current': '.', 'previous': 'v1.4.6-smoke'}
           assert (root / 'settings.json').is_file()
           PYTEST

@@ -18,7 +18,7 @@ import time
 from pathlib import Path
 
 from PySide6.QtCore import Qt, QRect, QTimer, QObject, Signal
-from PySide6.QtGui import QAction, QColor, QImage, QPainter, QPen, QPixmap, QShortcut, QKeySequence
+from PySide6.QtGui import QAction, QColor, QImage, QPainter, QPen, QPixmap, QShortcut, QKeySequence, QIcon
 from PySide6.QtWidgets import (QApplication, QWidget, QLabel, QPushButton, QSpinBox,
     QVBoxLayout, QHBoxLayout, QGridLayout, QFrame, QFileDialog, QMessageBox, QMenu, QMenuBar, QDialog, QComboBox)
 import character_hud
@@ -1442,6 +1442,9 @@ def run_app(controller_class):
     args = parser.parse_args()
     application = QApplication([sys.argv[0]])
     application.setApplicationName(controller_class.APP_TITLE)
+    icon = tracker.RESOURCES/'planet-helper-icon.png'
+    if sys.platform.startswith('linux') and icon.is_file():
+        application.setWindowIcon(QIcon(str(icon)))
     application.setDesktopFileName('planet-helper')
     application.setQuitOnLastWindowClosed(False)
     from unified_data import DataLock
