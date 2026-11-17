@@ -1,8 +1,23 @@
 """Compact and detailed views share one controller, session and input engine."""
 from PySide6.QtCore import Qt
+from PySide6.QtGui import QFont
 from PySide6.QtWidgets import (QWidget, QLabel, QPushButton, QSpinBox, QVBoxLayout,
                               QHBoxLayout, QGridLayout, QCheckBox)
 from key_repeat import KeyRepeatBridge
+
+
+def add_stat(c, grid, row, column, title, value):
+    cell = QVBoxLayout()
+    cell.setSpacing(1)
+    heading = c.label(title, 'statCaption')
+    value.setAccessibleName(title)
+    font = value.font()
+    font.setFeature(QFont.Tag('tnum'), 1)
+    value.setFont(font)
+    cell.addWidget(heading)
+    cell.addWidget(value)
+    grid.addLayout(cell, row, column)
+    return heading
 
 
 def build(c, config, application, level_value, repeat_bridge=KeyRepeatBridge):
@@ -23,8 +38,10 @@ def build(c, config, application, level_value, repeat_bridge=KeyRepeatBridge):
         }
         QLabel { background:transparent; border:none; }
         QLabel#muted { color:#a5b7ca; }
+        QLabel#statCaption { color:#b0c2d3; font-size:11px; font-weight:600; }
         QLabel#metric { color:#e4ecf4; font-size:19px; font-weight:600; }
-        QLabel#total { color:#e1fcef; font-size:40px; font-weight:700; }
+        QLabel#primaryStat { color:#baf5dd; font-size:23px; font-weight:700; }
+        QLabel#statValue { color:#f1f6fa; font-size:20px; font-weight:650; }
         QPushButton {
             background:#25364a; color:#e0eaf5; border:none;
             border-radius:6px; padding:5px 9px;
@@ -76,16 +93,19 @@ def build(c, config, application, level_value, repeat_bridge=KeyRepeatBridge):
     close.clicked.connect(c.close);header.addWidget(close);layout.addLayout(header)
 
     c.compact_body=QWidget();c.compact_body.setObjectName('metricsCard')
-    grid=QGridLayout(c.compact_body);grid.setContentsMargins(11,6,11,6);grid.setHorizontalSpacing(18)
-    c.compact_total=c.label('0','metric');c.compact_total.setStyleSheet('color:#f4f8fc;font-size:26px;font-weight:600;')
-    c.compact_average=c.label('—','metric');c.compact_six_average=c.label('—','metric')
-    c.compact_headings=[]
-    for col,(label,value) in enumerate((('총 획득 경험치',c.compact_total),('누적 분당 평균',c.compact_average),('최근 3분 · 분당',c.compact_six_average))):
-        heading=c.label(label);c.compact_headings.append(heading);grid.addWidget(heading,0,col);grid.addWidget(value,1,col);grid.setColumnStretch(col,1)
+    grid=QGridLayout(c.compact_body);grid.setContentsMargins(12,7,12,7)
+    grid.setHorizontalSpacing(12);grid.setVerticalSpacing(5)
+    grid.setColumnStretch(0,1);grid.setColumnStretch(1,1)
+    c.compact_time=c.label('00:00:00','primaryStat')
+    c.compact_total=c.label('0','primaryStat')
+    c.compact_average=c.label('—','statValue');c.compact_recent_six=c.label('—','statValue')
+    add_stat(c,grid,0,0,'순수 사냥 시간',c.compact_time)
+    add_stat(c,grid,0,1,'총 획득 EXP',c.compact_total)
+    add_stat(c,grid,1,0,'누적 분당 평균',c.compact_average)
+    c.compact_six_heading=add_stat(c,grid,1,1,'최근 6분 획득',c.compact_recent_six)
     c.compact_level_eta = c.label('레벨업 예상 —')
     c.compact_level_eta.setAccessibleName('레벨업 예상 시간')
     c.compact_level_eta.setStyleSheet('color:#e8d9a8;font-size:10px;')
-    grid.addWidget(c.compact_level_eta, 2, 2)
     layout.addWidget(c.compact_body)
     c.full_body=QWidget();c.full_body.setObjectName('body')
     # Detailed view: measurements on the left, recognition status on the right.
@@ -102,15 +122,19 @@ def build(c, config, application, level_value, repeat_bridge=KeyRepeatBridge):
     side.setContentsMargins(13,12,13,12)
     side.setSpacing(6)
     columns.addWidget(recognition_card, 5)
-    body.addWidget(c.label('총 획득 경험치'))
-    c.total_label=c.label('0','total');body.addWidget(c.total_label);body.addWidget(c.line())
-    grid=QGridLayout();grid.setHorizontalSpacing(15);grid.setVerticalSpacing(7)
-    grid.addWidget(c.label('누적 분당 평균'),0,0);grid.addWidget(c.label('최근 3분 · 분당'),0,1)
-    c.minute_label=c.label('—','metric');c.six_label=c.label('—','metric')
-    grid.addWidget(c.minute_label,1,0);grid.addWidget(c.six_label,1,1)
-    grid.addWidget(c.label('직전 1분 획득 ≈'),2,0);grid.addWidget(c.label('최근 6분 획득 ≈'),2,1)
-    c.recent_minute=c.label('집계 대기','metric');c.recent_six=c.label('집계 대기','metric')
-    grid.addWidget(c.recent_minute,3,0);grid.addWidget(c.recent_six,3,1);body.addLayout(grid)
+    grid=QGridLayout();grid.setHorizontalSpacing(14);grid.setVerticalSpacing(8)
+    grid.setColumnStretch(0,1);grid.setColumnStretch(1,1)
+    c.timer_label=c.label('00:00:00','primaryStat');c.total_label=c.label('0','primaryStat')
+    c.minute_label=c.label('—','statValue');c.recent_six=c.label('—','statValue')
+    add_stat(c,grid,0,0,'순수 사냥 시간',c.timer_label)
+    add_stat(c,grid,0,1,'총 획득 EXP',c.total_label)
+    add_stat(c,grid,1,0,'누적 분당 평균',c.minute_label)
+    c.six_heading=add_stat(c,grid,1,1,'최근 6분 획득',c.recent_six)
+    grid.addWidget(c.line(),2,0,1,2)
+    c.recent_minute=c.label('—','metric');c.six_label=c.label('—','metric')
+    add_stat(c,grid,3,0,'직전 1분 획득',c.recent_minute)
+    add_stat(c,grid,3,1,'최근 3분 분당 평균',c.six_label)
+    body.addLayout(grid)
     c.minute_info=c.label('첫 증가 후 1분마다 집계');body.addWidget(c.minute_info)
     c.rate_info=c.label('평균은 60초 관측 후 표시 · 10초마다 갱신');c.rate_info.setWordWrap(True);body.addWidget(c.rate_info)
     body.addStretch()
@@ -164,9 +188,8 @@ def build(c, config, application, level_value, repeat_bridge=KeyRepeatBridge):
     c.buff_label.setToolTip('설정 → 경험치 버프 아이콘 등록에서 우상단 아이콘 한 칸을 등록할 수 있습니다.')
     layout.addWidget(c.buff_label)
     status=QHBoxLayout()
-    c.timer_label=c.label('사냥 00:00:00')
-    c.timer_label.setAccessibleName('순수 사냥 시간')
-    status.addWidget(c.timer_label)
+    status.addWidget(c.compact_level_eta)
+    c.time_info=c.label('');status.addWidget(c.time_info)
     status.addStretch();c.footer=c.label('● 측정 대기');status.addWidget(c.footer);layout.addLayout(status)
     buttons=QHBoxLayout();c.measurement_controls=buttons;buttons.setSpacing(5)
     c.region_button=QPushButton('영역 지정');c.region_button.clicked.connect(c.select)
@@ -203,15 +226,6 @@ def resize(c):
     c.rate_info.setVisible(not c.compact);c.repeat_status.setVisible(not c.compact)
     c.repeat_title.setVisible(not c.compact)
     for button in (c.region_button,c.reset_button,c.export_button):button.setVisible(not c.compact)
-    c.compact_headings[2].setVisible(True);c.compact_six_average.setVisible(True)
-    c.compact_headings[2].setText('6분 환산')
-    c.compact_headings[0].setText('총 획득 경험치');c.compact_headings[1].setText('누적 분당 평균')
-    c.compact_body.layout().setColumnStretch(2,1)
-    c.compact_body.layout().setHorizontalSpacing(10)
-    c.compact_total.setStyleSheet('color:#b9f7d9;font-size:22px;font-weight:700;')
-    c.compact_average.setStyleSheet('color:#b4e9c6;font-size:16px;font-weight:600;')
-    c.compact_six_average.setStyleSheet('color:#b4e9c6;font-size:16px;font-weight:600;')
-    c.compact_six_average.setToolTip('누적 분당 평균 × 6 · 같은 관측 기준의 6분 환산값')
     c.window.layout().setContentsMargins(8 if c.compact else 12,8,8 if c.compact else 12,8)
     c.window.layout().setSpacing(5 if c.compact else 8)
     for button in (c.jev_button,c.mode_button,c.pin_button,c.close_button,c.toggle_button,c.recent_button,c.repeat_button,c.repeat_settings_button,c.history_button,c.options_button):
@@ -226,7 +240,8 @@ def resize(c):
 
     c.compact_body.setVisible(c.compact);c.full_body.setVisible(not c.compact)
     c.level_eta.setVisible(not c.compact)
-    c.timer_label.setStyleSheet('color:#c7e9de;font-size:12px;font-weight:600;' if c.compact else '')
+    c.compact_level_eta.setVisible(c.compact)
+    c.time_info.setVisible(not c.compact)
     c.activity_label.setVisible(not c.compact)
     c.repeat_settings_button.setVisible(not c.compact)
     c.repeat_button.setToolTip('A·Enter 반복 입력. 자세한 설정은 상세 화면에서 열 수 있습니다.')

@@ -56,11 +56,12 @@ def run_offline_diagnostics(application, report_path):
 
         window = controller.window
         application.processEvents()
-        controls = (controller.toggle_button, controller.repeat_button, controller.repeat_settings_button)
+        controls = (controller.toggle_button, controller.repeat_button)
         report['ui'] = dict(title=window.windowTitle(), width=window.width(), height=window.height(),
                             measurement_label=controller.toggle_button.text(),
                             repeat_label=controller.repeat_button.text())
         for widget in controls:
+            assert widget.isVisibleTo(window), widget.text()
             assert window.rect().contains(widget.geometry()), (widget.text(), widget.geometry(), report)
             assert widget.width() >= widget.fontMetrics().horizontalAdvance(widget.text())+6, report
         assert controller.toggle_button.text() == '측정 시작', report
@@ -77,7 +78,10 @@ def run_offline_diagnostics(application, report_path):
         report['display']={'compact_size':[window.width(),window.height()],
                            'background_alpha':window.grab().toImage().pixelColor(5,45).alpha(),
                            'text_opacity':window.windowOpacity()}
-        assert window.width()==360 and window.height()<180, report
+        assert window.width()==360 and window.height()<210, report
+        compact_stats = (controller.compact_time, controller.compact_total,
+                         controller.compact_average, controller.compact_recent_six)
+        assert all(widget.isVisibleTo(window) for widget in compact_stats), report
         assert 220 <= report['display']['background_alpha'] <= 235, report
         assert window.windowOpacity()==1.0, report
         controller.toggle_pin(False);application.processEvents()
@@ -86,7 +90,10 @@ def run_offline_diagnostics(application, report_path):
         controller.toggle_display();application.processEvents()
         report['display']['full_size']=[window.width(),window.height()]
         window.grab().save(str(report_path.with_name(report_path.stem+'-full.png')))
-        assert window.width()==374 and window.height()>400, report
+        assert window.width()==640 and window.height()<480, report
+        full_stats = (controller.timer_label, controller.total_label,
+                      controller.minute_label, controller.recent_six)
+        assert all(widget.isVisibleTo(window) for widget in (*full_stats, controller.repeat_settings_button)), report
         assert controller.session is original_session and bridge.process.processId()==original_helper, report
         clean,_=tracker.load_settings(tracker.BASE/'settings.json')
         assert clean['compact'] is False and clean['always_on_top'] is False, report
@@ -102,7 +109,11 @@ def run_offline_diagnostics(application, report_path):
                         ('new-ui-exp.png', (34514347, 8.06)),
                         ('new-ui-label-dot.png', (40148011, 9.38))]
             for filename, expected in fixtures:
-                with Image.open(tracker.RESOURCES/'verification'/filename) as image:
+                path = tracker.RESOURCES/'verification'/filename
+                if not path.is_file():
+                    report['ocr'].append(dict(fixture=filename, skipped='fixture not bundled'))
+                    continue
+                with Image.open(path) as image:
                     reader = tracker.LineReader(engine)
                     value, score, raw, _ = reader.read(image.convert('RGB'), time.monotonic())
                 report['ocr'].append(dict(fixture=filename, value=value, expected=expected,
@@ -119,6 +130,7 @@ def run_offline_diagnostics(application, report_path):
                                 label=controller.total_label.text(),
                                 csv_exists=(tracker.BASE/'records'/(controller.session.session_id+'.csv')).is_file())
         assert report['ledger'] == dict(gained=3100,label='3,100',csv_exists=True), report
+        assert [widget.text() for widget in compact_stats] == [widget.text() for widget in full_stats], report
         assert bridge.state['enabled'] is False and bridge.state['active'] is False, report
         report['measurement_does_not_enable_repeat'] = True
         report['shutdown_succeeded'] = controller.shutdown()

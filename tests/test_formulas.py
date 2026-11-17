@@ -19,6 +19,7 @@ class FormulaTests(unittest.TestCase):
         exp = 1006000
         s.accept((exp, round(exp/s.total*100, 2)), 0)
         expected_minutes = [12000, 12000, 18000, 24000, 30000, 36000, 42000, 48000]
+        six_window_minutes = [6000, *expected_minutes[1:]]
         for second in range(1, 481):
             exp += ((second-1)//60+1)*100
             s.accept((exp, round(exp/s.total*100, 2)), second)
@@ -26,7 +27,7 @@ class FormulaTests(unittest.TestCase):
                 completed = second//60
                 snapshot = s.minute_result()
                 self.assertEqual(snapshot['one'], expected_minutes[completed-1])
-                self.assertEqual(snapshot['six'], sum(expected_minutes[max(0, completed-6):completed]))
+                self.assertEqual(snapshot['six'], sum(six_window_minutes[max(0, completed-6):completed]))
         gained, hourly, _, _ = s.stats(480)
         self.assertEqual(gained, 222000)
         self.assertEqual(s.elapsed(480), 480)
@@ -51,7 +52,7 @@ class FormulaTests(unittest.TestCase):
                     s.accept((exp, round(exp/s.total*100, 2)), stamp)
                 completed = stamp//60
                 expected_one = 60*rate
-                expected_six = (first_gain+60*completed*rate) if completed <= 6 else 360*rate
+                expected_six = min(6, completed)*60*rate
                 self.assertAlmostEqual(s.minute_result()['one'], expected_one, delta=1e-6)
                 self.assertAlmostEqual(s.minute_result()['six'], expected_six, delta=1e-6)
                 self.assertEqual(s.stats(stamp)[0], first_gain+rate*stamp)
@@ -86,7 +87,7 @@ class FormulaTests(unittest.TestCase):
         for t in range(65, 121, 5):
             s.accept((172680332, 42.55), t)
         self.assertEqual(s.minute_result()['one'], 0)
-        self.assertEqual(s.minute_result()['six'], 200)
+        self.assertEqual(s.minute_result()['six'], 100)
 
     def test_six_minute_average_uses_unrounded_rate_not_rounded_display(self):
         s = tracker.Session(level=169)

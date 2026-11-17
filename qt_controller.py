@@ -62,6 +62,15 @@ def short_exp(value):
     return f'{value/1e8:.2f}억' if value >= 1e8 else f'{value/1e4:,.0f}만' if value >= 1e4 else f'{value:,.0f}'
 
 
+def set_exp_stat(label, text, explanation):
+    if len(text) > len('999,999,999') and text.replace(',', '').isdigit():
+        label.setText(short_exp(int(text.replace(',', ''))))
+        label.setToolTip(f'{text} EXP · {explanation}')
+    else:
+        label.setText(text)
+        label.setToolTip(explanation)
+
+
 def level_eta_text(rate, session, *, compact=False):
     """Hourly EXP and time to the next level from the cumulative per-minute average."""
     level = f'Lv.{session.level} ' if session.level else ''
@@ -466,11 +475,10 @@ class SharedController(tracker.MeasurementCore):
             info += f" · 공백 {gap//60}:{gap%60:02d} / {rate['gap_gain']:,.0f} EXP 제외"
         if self.session.blocked:
             info = '감소 충돌로 정지 · 총량/평균 확인 필요 · '+info
-        self.minute_label.setText(average); self.six_label.setText(recent)
-        self.compact_average.setText(average); self.compact_six_average.setText(f"{rate['cumulative']*6:,.0f}" if rate['status']=='ready' else average)
+        set_exp_stat(self.minute_label, average, info)
+        set_exp_stat(self.compact_average, average, info)
+        set_exp_stat(self.six_label, recent, '최근 3분 관측 기준의 분당 평균 경험치')
         self.rate_info.setText(info)
-        self.compact_average.setToolTip(info)
-        self.compact_six_average.setToolTip(info)
         self.level_eta.setText(level_eta_text(rate, self.session))
         self.compact_level_eta.setText(level_eta_text(rate, self.session, compact=True))
         self.compact_level_eta.setToolTip(self.level_eta.text())
@@ -1237,25 +1245,29 @@ class SharedController(tracker.MeasurementCore):
                 self.capture_failures.pop(key, None)
         now = time.monotonic()
         gained = self.session.last[0]-self.session.first[0] if self.session.first is not None else 0
-        self.total_label.setText(f'{gained:,.0f}')
-        self.compact_total.setText(self.total_label.text())
+        total_tip = ('확인 필요 · '+self.session.stop_reason if self.session.blocked
+                     else '현재 확정 경험치 − 시작 기준 경험치')
+        for widget in (self.total_label, self.compact_total):
+            set_exp_stat(widget, f'{gained:,.0f}', total_tip)
         self.update_rate_display(now)
-        hunt_time = '사냥 00:00:00'
+        hunt_time = '00:00:00'
         if self.session.started is None:
             timer = '기준 확인 중' if self.session.first is None else '첫 증가 대기'
         else:
             active, idle = int(self.session.active_elapsed(now)), int(self.session.idle(now))
             gap = int(self.session.gap_seconds(now))
-            hunt_time = f'사냥 {active//3600:02d}:{active%3600//60:02d}:{active%60:02d}'
-            timer = hunt_time
+            hunt_time = f'{active//3600:02d}:{active%3600//60:02d}:{active%60:02d}'
+            timer = ''
             if idle:
-                timer += f' · {"휴식 중" if self.session.resting(now) else "휴식"} {idle//60}:{idle%60:02d}'
+                timer = f'{"휴식 중" if self.session.resting(now) else "휴식"} {idle//60}:{idle%60:02d}'
                 total = active+idle
                 if total >= 60 and not gap: timer += f' · 사냥 {active*100//total}%'
             if gap:
-                timer += f' · 공백 {gap//60}:{gap%60:02d}'
-        self.timer_label.setText(hunt_time if self.compact else timer)
-        self.timer_label.setToolTip(timer)
+                timer = ' · '.join(filter(None,(timer,f'공백 {gap//60}:{gap%60:02d}')))
+        for widget in (self.timer_label, self.compact_time):
+            widget.setText(hunt_time)
+            widget.setToolTip('순수 사냥 ' + ' · '.join(filter(None,(hunt_time,timer))))
+        self.time_info.setText(timer)
         while not self.hunt_activity_results.empty():
             generation, stamp, observation = self.hunt_activity_results.get_nowait()
             if self.running and generation == self.generation:
@@ -1287,21 +1299,24 @@ class SharedController(tracker.MeasurementCore):
         self.check_efficiency_change()
         self.apply_map_results()
         snapshot = self.session.minute_result()
+        six_heading = '최근 6분 획득'
+        six_tip = '경험치 관측값으로 1분마다 집계한 최근 6분 획득량'
+        projected = False
         if snapshot:
             one, six = snapshot['one'], snapshot['six']
             index = snapshot['index']
-            self.recent_minute.setText(f'{one:,.0f}' if one is not None else '미확정')
+            set_exp_stat(self.recent_minute, f'{one:,.0f}' if one is not None else '미확정',
+                         '마지막으로 집계를 끝낸 1분의 획득량')
             # Before 6 full minutes exist, project the partial total to 6 minutes.
             projected = six is not None and 0 < index < 6
-            if six is None: six_text = '미확정'
+            if six is None:
+                six_text = '미확정'
+                six_tip = '6분 집계 구간의 관측 공백이 지나면 다시 표시됩니다.'
             elif projected:
-                # The timer starts on the first gain, so that packet has no hunting time
-                # of its own; scale only the timed gains (a real 6-minute total excludes it).
-                timed = max(0.0, six-self.session.first_gain)
-                six_text = f'{timed*6/index:,.0f} 예상'
+                six_text = f'{six*6/index:,.0f}'
+                six_heading = f'6분 예상 · {index}/6분'
+                six_tip = f'사냥 시작 이후 {index}분 동안 얻은 경험치를 6분으로 환산한 예상치'
             else: six_text = f'{six:,.0f}'
-            self.recent_six.setText(six_text)
-            self.recent_six.setToolTip(f'{index}분 실제 {six:,.0f} − 첫 증가 {self.session.first_gain:,.0f}, × 6/{index} · 6분 예상치' if projected else '')
             remaining = max(0, math.ceil((snapshot['index']+1)*60-self.session.elapsed(now)))
             quality = '관측 공백 추정' if snapshot['estimated'] else '분별 집계'
             if snapshot['one'] is None or snapshot['six'] is None:
@@ -1315,10 +1330,18 @@ class SharedController(tracker.MeasurementCore):
                 info += f' · 6분은 {index}분 기준 예상'
             self.minute_info.setText(info)
         else:
-            text = '첫 1분 대기' if self.session.started is not None else '집계 대기'
-            self.recent_minute.setText(text); self.recent_six.setText(text)
+            six_text = '첫 1분 대기' if self.session.started is not None else '—'
+            self.recent_minute.setText(six_text)
             remaining = max(0,60-int(self.session.elapsed(now)))
             self.minute_info.setText(f'첫 집계까지 {remaining}초 · 1분마다 갱신' if self.session.started is not None else '첫 증가 후 1분마다 집계')
+        for heading, widget in ((self.six_heading,self.recent_six),
+                                (self.compact_six_heading,self.compact_recent_six)):
+            heading.setText(six_heading)
+            widget.setAccessibleName(six_heading)
+            set_exp_stat(widget, six_text, six_tip)
+            style = 'color:#9fb5c8;' if projected else ''
+            if widget.styleSheet() != style:
+                widget.setStyleSheet(style)
         warning = self.status.get()
         if self.running and warning.startswith('레벨 설정 확인'):
             footer = f'레벨 설정 확인 · Lv.{self.session.level}'
@@ -1342,7 +1365,6 @@ class SharedController(tracker.MeasurementCore):
         self.footer.setText('● '+footer)
         self.footer.setToolTip(' · '.join(filter(None,[self.session.stop_reason,self.save_warning,self.audit_warning]))
                                if self.session.blocked else warning)
-        self.compact_total.setToolTip('확인 필요 · '+self.session.stop_reason if self.session.blocked else '현재 확정 경험치 − 시작 기준 경험치')
         footer_style = 'color: '+('#e7b86e' if self.session.blocked or (self.running and delayed) else '#a8edbb' if self.running else '#7c8c9d')+';'
         if footer_style != self.footer.styleSheet():
             self.footer.setStyleSheet(footer_style)

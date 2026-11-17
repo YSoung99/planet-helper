@@ -277,7 +277,8 @@ class AutomaticCapture:
         ex, ey, ew, eh = pixel_rect(hud.exp_roi, *full.size)
         # Include the LV label as well as the digits. Use one capture so the
         # level and EXP always come from the same game frame.
-        guard_left = max(0, lx-round(lh*3.2))
+        # The outermost window column can flicker independently of the HUD.
+        guard_left = min(lx, max(1, lx-round(lh*3.2)))
         level_box = (guard_left, ly, lx+lw, ly+lh)
         track_box = (min(guard_left, ex), min(ly, ey), max(lx+lw, ex+ew), max(ly+lh, ey+eh))
         self.tracking_roi = normalized(track_box, full.size)
@@ -287,15 +288,25 @@ class AutomaticCapture:
         self.exp_box = (ex-x, ey-y, ex+ew-x, ey+eh-y)
         self.level_pixels = full.crop(level_box).convert('RGB').tobytes()
 
-    def _rediscover(self, now, expected_level, baseline_set, include_full):
+    def _rediscover(self, now, expected_level, baseline_set, include_full, full=None):
         try:
-            full = self.client.snapshot()
-            hud = self.locator.locate(full)
+            if full is None:
+                full = self.client.snapshot()
         except Exception:
             self.reset()
             raise
-        # Once re-confirmation starts, do not fall back to a stale ROI.
         self.hud = None
+        try:
+            hud = self.locator.locate(full)
+        except HudNotFound:
+            # Withhold this frame. An already confirmed, recent HUD can recover
+            # on the next matching frame without starting a new confirmation.
+            if self.gate.count < 3 or self.verified_at is None or now-self.verified_at > 8:
+                self.reset()
+            raise
+        except Exception:
+            self.reset()
+            raise
         if not self.gate.accept(hud, now):
             raise HudNotFound(f'레벨 {hud.level} · 경험치 위치 재확인 {self.gate.count}/3')
         if baseline_set and hud.level != expected_level:
@@ -333,8 +344,12 @@ class AutomaticCapture:
             self.reset()
             raise HudNotFound('게임 창 크기 변경 · 표시 위치 다시 찾는 중')
         if band.crop(self.level_box).convert('RGB').tobytes() != self.level_pixels:
-            self.reset()
-            raise HudNotFound('레벨 표시 변경 · 위치 다시 확인 중')
+            # Pixel differences alone do not establish a new level. Re-read the
+            # LV label, level and EXP before accepting another observation.
+            image = self._rediscover(now, expected_level, baseline_set, include_full,
+                                     band.info.get('full_game_image'))
+            image.info['hud_capture'] = 'recheck'
+            return image
         self.verified_at = now
         self.gate.at = now
         image = band.crop(self.exp_box)

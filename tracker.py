@@ -22,7 +22,7 @@ RESOURCES = Path(getattr(sys, '_MEIPASS', Path(__file__).resolve().parent))
 BASE = Path(os.environ.get('PLANET_EXP_DATA_DIR') or (
     Path.home()/'Library'/'Application Support'/'Maple Planet Helper Auto Trial'
     if sys.platform == 'darwin' else Path(__file__).resolve().parent))
-APP_VERSION = '1.4.6'
+APP_VERSION = '1.4.7'
 MAX_BOUNDARY_GAP = 10.0
 BURNING_MAX_LEVEL = 120  # Planet Up & Up grants one bonus level, capped at 120.
 IDLE_AFTER = 60.0  # no EXP gain for longer than this counts as a break
@@ -625,7 +625,9 @@ class Session:
             exp, gap = self._boundary_exp(self.started+index*60)
             cumulative = max(0.0,exp-self.first[0]) if exp is not None and gap <= MAX_BOUNDARY_GAP else None
             previous = self.minute_snapshots[-1] if self.minute_snapshots else {'cumulative':0,'gap':0}
-            oldest = self.minute_snapshots[index-7] if index > 6 else {'cumulative':0,'gap':0}
+            # The hunt timer starts at the first gain. The six-minute window
+            # uses that observation as its starting EXP until it slides forward.
+            oldest = self.minute_snapshots[index-7] if index > 6 else {'cumulative':self.first_gain,'gap':0}
             snapshot = {'index':index,'cumulative':cumulative,
                 'one':max(0.0,cumulative-previous['cumulative']) if cumulative is not None and previous['cumulative'] is not None else None,
                 'six':max(0.0,cumulative-oldest['cumulative']) if cumulative is not None and oldest['cumulative'] is not None else None,

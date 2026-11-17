@@ -115,22 +115,69 @@ class CaptureTests(unittest.TestCase):
         self.now = 17
         self.assertIs(self.capture.read(1, 170, True, True).info['full_game_image'], self.image)
 
+    def test_window_border_changes_do_not_reset_level_confirmation(self):
+        self.confirmed()
+        for y in range(950, 980):
+            self.image.putpixel((0, y), (255, 255, 255))
+        self.now = 4
+        image = self.capture.read(1, 170, True, False)
+        self.assertEqual(image.info['hud_capture'], 'tracking')
+        self.assertEqual(image.info['detected_level'], 170)
+        self.assertEqual(self.locator.locate.call_count, 3)
+
+    def test_changed_pixels_with_same_level_and_layout_continue_on_the_same_frame(self):
+        self.confirmed()
+        self.image.putpixel((80, 960), (255, 255, 255))
+        self.client.snapshot.reset_mock()
+        self.now = 4
+        image = self.capture.read(1, 170, True, True)
+        self.client.snapshot.assert_called_once_with(roi=self.capture.tracking_roi, include_full=True)
+        self.locator.locate.assert_called_with(self.image)
+        self.assertEqual(image.info['hud_capture'], 'recheck')
+        self.assertEqual(image.info['detected_level'], 170)
+        self.now = 5
+        self.assertEqual(self.capture.read(1, 170, True, False).info['hud_capture'], 'tracking')
+
+    def test_hidden_frame_is_withheld_without_discarding_recent_confirmation(self):
+        self.confirmed()
+        self.image.putpixel((80, 960), (255, 255, 255))
+        self.locator.locate.side_effect = HudNotFound('covered')
+        self.now = 4
+        with self.assertRaisesRegex(HudNotFound, 'covered'):
+            self.capture.read(1, 170, True, True)
+        self.assertIsNone(self.capture.hud)
+        self.locator.locate.side_effect = None
+        self.now = 5
+        self.assertEqual(self.capture.read(1, 170, True, False).info['detected_level'], 170)
+
+    def test_hidden_hud_for_more_than_eight_seconds_requires_fresh_confirmation(self):
+        self.confirmed()
+        self.image.putpixel((80, 960), (255, 255, 255))
+        self.locator.locate.side_effect = HudNotFound('covered')
+        for stamp in (4, 8, 12):
+            self.now = stamp
+            with self.assertRaisesRegex(HudNotFound, 'covered'):
+                self.capture.read(1, 170, True, False)
+        self.locator.locate.side_effect = None
+        self.now = 13
+        with self.assertRaisesRegex(HudNotFound, '1/3'):
+            self.capture.read(1, 170, True, False)
+
     def test_changed_level_pixels_immediately_invalidate_tracking(self):
         self.confirmed()
         self.image.putpixel((80, 960), (255, 255, 255))
         self.locator.locate.return_value = hud(level=171)
         self.now = 4
-        with self.assertRaises(HudNotFound):
+        with self.assertRaisesRegex(HudNotFound, '1/3'):
             self.capture.read(1, 170, True, False)
         self.assertIsNone(self.capture.hud)
-        for stamp in (5, 6):
-            self.now = stamp
-            with self.assertRaises(HudNotFound):
-                self.capture.read(1, 170, True, False)
-        self.now = 7
+        self.now = 5
+        with self.assertRaisesRegex(HudNotFound, '2/3'):
+            self.capture.read(1, 170, True, False)
+        self.now = 6
         with self.assertRaises(HudLevelChanged):
             self.capture.read(1, 170, True, False)
-        self.now = 8
+        self.now = 7
         self.assertEqual(self.capture.read(1, 171, True, False).info['detected_level'], 171)
 
     def test_confirmed_level_change_stops_existing_session(self):

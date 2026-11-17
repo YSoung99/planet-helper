@@ -21,14 +21,14 @@ class ViewTests(unittest.TestCase):
     def test_compact_full_transition_preserves_current_measurement_and_settings(self):
         session=self.c.session;helper=self.c.key_repeat
         self.assertTrue(self.c.compact);self.assertEqual(self.c.window.width(),360)
-        self.assertLess(self.c.window.height(),180)
+        self.assertLess(self.c.window.height(),205)
         self.c.toggle_display();self.assertFalse(self.c.compact);self.assertEqual(self.c.window.width(),640)
         self.assertLess(self.c.window.height(),480)  # two-column detailed view stays short
         self.assertIs(self.c.session,session);self.assertIs(self.c.key_repeat,helper)
         self.c.toggle_pin(False)
         clean,warning=tracker.load_settings(tracker.BASE/'settings.json')
         self.assertFalse(clean['always_on_top']);self.assertFalse(clean['compact']);self.assertIsNone(warning)
-        self.c.toggle_display();self.assertLess(self.c.window.height(),180)
+        self.c.toggle_display();self.assertLess(self.c.window.height(),205)
 
     def test_jev_status_belongs_to_the_current_measurement_in_both_views(self):
         c = self.c
@@ -120,12 +120,12 @@ class ViewTests(unittest.TestCase):
         self.assertEqual(c.minute_label.text(),'집계 중')
         for stamp in range(4,62):s.accept((172680232,42.55),stamp)
         c.update_rate_display(61);self.assertEqual(c.minute_label.text(),'100')
-        self.assertEqual(c.compact_six_average.text(),'600')
+        self.assertEqual(c.compact_average.text(),'100')
         s.accept((172680332,42.55),62);c.update_rate_display(62)
         self.assertEqual(c.minute_label.text(),'100')
         for stamp in range(63,72):s.accept((172680332,42.55),stamp)
         c.update_rate_display(71);self.assertEqual(c.minute_label.text(),'171')
-        self.assertEqual(c.compact_six_average.text(),'1,029')
+        self.assertEqual(c.compact_average.text(),'171')
         c.update_rate_display(78);self.assertEqual(c.minute_label.text(),'인식 지연')
 
     def test_stopped_rate_reappears_with_asof_and_gap_even_in_same_display_bucket(self):
@@ -136,9 +136,36 @@ class ViewTests(unittest.TestCase):
         self.assertEqual(c.minute_label.text(),'인식 지연')
         s.finish(200,'사용자 정지');c.update_rate_display(200)
         self.assertEqual(c.minute_label.text(),'100')
-        self.assertEqual(c.compact_six_average.text(),'600')
+        self.assertEqual(c.compact_average.text(),'100')
         self.assertIn('마지막 확인 0:59',c.rate_info.text())
         self.assertIn('139초 관측 공백',c.rate_info.text())
+
+    def test_both_views_show_the_same_time_and_six_minute_statistics(self):
+        c = self.c
+        session = c.session
+        session.accept((172680132,42.55),0)
+        session.accept((172680132,42.55),1)
+        for stamp in range(2,68,5):
+            session.accept((172680132+(stamp-1)*100,42.55),stamp)
+        with patch('time.monotonic',return_value=67):
+            c.poll()
+        self.assertEqual(c.compact_time.text(), c.timer_label.text())
+        self.assertEqual(c.compact_six_heading.text(), '6분 예상 · 1/6분')
+        self.assertEqual(c.compact_recent_six.text(), '36,000')
+        self.assertEqual(c.compact_recent_six.text(), c.recent_six.text())
+        for stamp in range(72,368,5):
+            session.accept((172680132+(stamp-1)*100,42.55),stamp)
+        with patch('time.monotonic',return_value=367):
+            c.poll()
+        self.assertEqual(c.compact_six_heading.text(), '최근 6분 획득')
+        self.assertEqual(c.compact_recent_six.text(), c.recent_six.text())
+        self.assertEqual(c.compact_recent_six.text(), '36,000')
+        for stamp in range(387,428,5):
+            session.accept((172680132+(stamp-1)*100,42.55),stamp)
+        with patch('time.monotonic',return_value=427):
+            c.poll()
+        self.assertEqual(c.compact_recent_six.text(), '미확정')
+        self.assertEqual(c.recent_six.text(), '미확정')
 
     def test_worker_corroboration_reaches_small_decrease_safe_stop(self):
         c=self.c;s=c.session

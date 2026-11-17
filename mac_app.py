@@ -43,6 +43,17 @@ class Controller(SharedController):
             self.window.layout().itemAt(0).layout().insertWidget(1, self.update_button)
             self.menu_bar.actions()[0].menu().addAction('업데이트 및 롤백', self.updates.show)
 
+    def show(self):
+        super().show()
+        from AppKit import NSApplication, NSImage
+        from Foundation import NSBundle
+
+        path = NSBundle.mainBundle().pathForResource_ofType_('PlanetEXP', 'icns')
+        if path:
+            icon = NSImage.alloc().initWithContentsOfFile_(path)
+            if icon is not None:
+                NSApplication.sharedApplication().setApplicationIconImage_(icon)
+
     def native_overlay(self, widget, level=3):
         native_overlay(widget, level)
 

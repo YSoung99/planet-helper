@@ -32,7 +32,7 @@ class LevelUpTests(unittest.TestCase):
         self.assertEqual(s.total, tracker.EXP_TABLE[177])
         self.assertEqual(s.stats(240)[0], exp-start)
         self.assertEqual(s.minute_result()['one'], 150000)
-        self.assertEqual(s.minute_result()['six'], 2500+180*2500)  # started at first increase (t=1)
+        self.assertEqual(s.minute_result()['six'], 180*2500)  # started at first increase (t=1)
         self.assertFalse(s.blocked)
         self.assertEqual(s.level_ups, [(176, 177, tracker.EXP_TABLE[176])])
 
