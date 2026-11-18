@@ -7,39 +7,72 @@ import exp_buffs
 import tracker
 
 MEMO_FILE = 'memos.json'
+# Character names typed by the user. They override OCR without touching the record files.
+CHARACTER_FILE = 'character-names.json'
 
 
 def memo_path(base=None):
     return Path(base or tracker.BASE)/'records'/MEMO_FILE
 
 
-def load_memos(base=None):
+def character_path(base=None):
+    return Path(base or tracker.BASE)/'records'/CHARACTER_FILE
+
+
+def _load_map(path):
     try:
-        data = json.loads(memo_path(base).read_text(encoding='utf-8'))
+        data = json.loads(path.read_text(encoding='utf-8'))
         return {str(k): str(v) for k, v in data.items()} if isinstance(data, dict) else {}
     except (OSError, ValueError):
         return {}
 
 
-def save_memo(session_id, text, base=None):
-    memos = load_memos(base)
-    text = ' '.join(str(text).split())[:60]
-    if text: memos[session_id] = text
-    else: memos.pop(session_id, None)
-    path = memo_path(base)
+def _save_entries(path, entries, limit):
+    """Set or clear several session ids in one atomic write; returns the cleaned texts."""
+    data = _load_map(path)
+    cleaned = {}
+    for session_id, text in entries.items():
+        text = ' '.join(str(text).split())[:limit]
+        if text: data[session_id] = text
+        else: data.pop(session_id, None)
+        cleaned[session_id] = text
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix('.json.tmp')
-    temporary.write_text(json.dumps(memos, ensure_ascii=False, indent=2), encoding='utf-8')
+    temporary.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding='utf-8')
     temporary.replace(path)
-    return text
+    return cleaned
+
+
+def load_memos(base=None):
+    return _load_map(memo_path(base))
+
+
+def save_memo(session_id, text, base=None):
+    return _save_entries(memo_path(base), {session_id: text}, 60)[session_id]
+
+
+def save_memos(entries, base=None):
+    return _save_entries(memo_path(base), entries, 60)
+
+
+def load_character_names(base=None):
+    return _load_map(character_path(base))
+
+
+def save_character_names(entries, base=None):
+    """An empty name removes the override, so the detected name (if any) shows again."""
+    return _save_entries(character_path(base), entries, 24)
 
 
 def summarize(csv_path):
     """One row per record; None when it has no usable hunting time."""
     csv_path = Path(csv_path)
-    level = None
+    level = assigned = None
     try:
-        level = json.loads(csv_path.with_suffix('.json').read_text(encoding='utf-8')).get('level')
+        summary = json.loads(csv_path.with_suffix('.json').read_text(encoding='utf-8'))
+        level = summary.get('level')
+        assigned = summary.get('character_assigned')
+        assigned = assigned if isinstance(assigned, str) and assigned.strip() else None
     except (OSError, ValueError, AttributeError):
         pass
     try:
@@ -59,7 +92,8 @@ def summarize(csv_path):
         started = None
     import segments
     return dict(session_id=csv_path.stem, started=started, level=level, active=active, idle=idle,
-                character_name=session.character_name, exp_buff_intervals=session.exp_buff_intervals,
+                character_name=session.character_name or assigned, exp_buff_intervals=session.exp_buff_intervals,
+                level_ups=len(session.level_ups),
                 gained=gained, per_minute=rate['cumulative'], rate_gain=rate['rate_gain'],
                 rate_seconds=rate['duration'], gap=session.gap_seconds(0.0), gap_gain=session.gap_gain,
                 blocked=session.blocked, stop_reason=session.stop_reason,
@@ -73,24 +107,107 @@ def collect(base=None):
         row = summarize(path)
         if row: rows.append(row)
     memos = load_memos(base)
+    names = load_character_names(base)
     import segments
     tags = segments.load_tags(base)
     for row in rows:
         row['memo'] = memos.get(row['session_id'], '')
+        row['detected_character'] = row['character_name']
+        if row['session_id'] in names:
+            row['character_name'] = names[row['session_id']]
         for change in row['changes']:
             change['tag'] = tags.get(row['session_id'], {}).get(str(change['minute']), '')
     return rows
 
 
+def spot_key(memo):
+    """Same spot regardless of spacing: '사자왕의성 · 낮은 성벽2' == '사자왕의 성 · 낮은 성벽2'."""
+    return ''.join(str(memo).split()).replace('·', '').casefold()
+
+
+def spot_spellings(memos):
+    """For each spacing-insensitive key, the spelling used most often (latest wins ties)."""
+    counts, latest = {}, {}
+    for order, memo in enumerate(memos):
+        if not memo: continue
+        key = spot_key(memo)
+        counts.setdefault(key, {}).setdefault(memo, 0)
+        counts[key][memo] += 1
+        latest.setdefault(key, {})[memo] = -order
+    return {key: max(spellings, key=lambda memo: (spellings[memo], latest[key][memo]))
+            for key, spellings in counts.items()}
+
+
 def by_memo(rows):
     """Weighted per-minute average per hunting spot (total EXP / total hunting time)."""
+    rows = list(comparable(rows))
+    names = spot_spellings(row['memo'] for row in rows)
     groups = {}
-    for row in comparable(rows):
+    for row in rows:
         if not row['memo']: continue
-        gained, active, count = groups.get(row['memo'], (0, 0.0, 0))
-        groups[row['memo']] = (gained+row['rate_gain'], active+row['rate_seconds'], count+1)
+        name = names[spot_key(row['memo'])]
+        gained, active, count = groups.get(name, (0, 0.0, 0))
+        groups[name] = (gained+row['rate_gain'], active+row['rate_seconds'], count+1)
     return sorted(((memo, gained*60/active, active, count) for memo, (gained, active, count) in groups.items()),
                   key=lambda item: -item[1])
+
+
+def known_characters(base=None):
+    """Names seen in records: typed, assigned, or read by OCR."""
+    names = set(load_character_names(base).values())
+    for path in (Path(base or tracker.BASE)/'records').glob('[0-9]*.json'):
+        try:
+            summary = json.loads(path.read_text(encoding='utf-8'))
+        except (OSError, ValueError):
+            continue
+        if not isinstance(summary, dict): continue
+        for key in ('character_name', 'character_assigned'):
+            if isinstance(summary.get(key), str) and summary[key].strip():
+                names.add(summary[key])
+    return sorted(names)
+
+
+def period_summary(rows, since):
+    """Totals for records that started at or after `since` (a datetime)."""
+    chosen = [row for row in rows if row['started'] and row['started'] >= since]
+    rated = [row for row in comparable(chosen)]
+    active = sum(row['active'] for row in chosen)
+    rate_gain = sum(row['rate_gain'] for row in rated)
+    rate_seconds = sum(row['rate_seconds'] for row in rated)
+    spots = by_memo(chosen)
+    characters = {}
+    for row in chosen:
+        name = row['character_name'] or '캐릭터 미확인'
+        characters[name] = characters.get(name, 0) + row['gained']
+    return dict(count=len(chosen), active=active, gained=sum(row['gained'] for row in chosen),
+                level_ups=sum(row.get('level_ups', 0) for row in chosen),
+                per_minute=rate_gain*60/rate_seconds if rate_seconds else None,
+                best_spot=spots[0] if spots else None,
+                characters=sorted(characters.items(), key=lambda item: -item[1]))
+
+
+def period_text(rows, now=None):
+    from datetime import timedelta
+    now = now or datetime.now()
+    today = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    week = today - timedelta(days=today.weekday())
+    lines = []
+    for title, since in (('오늘', today), ('이번 주 (월요일부터)', week)):
+        summary = period_summary(rows, since)
+        if not summary['count']:
+            lines.append(f'{title} · 사냥 기록 없음'); continue
+        lines.append(f"{title} · {summary['count']}회 · 순수 사냥 {clock(summary['active'])} · "
+                     f"획득 {summary['gained']:,} EXP")
+        details = []
+        if summary['per_minute'] is not None: details.append(f"분당 평균 {summary['per_minute']:,.0f}")
+        if summary['level_ups']: details.append(f"레벨업 {summary['level_ups']}회")
+        if summary['best_spot']:
+            spot, rate, _, count = summary['best_spot']
+            details.append(f'최고 효율 {spot} (분당 {rate:,.0f}, {count}회)')
+        if details: lines.append('    ' + ' · '.join(details))
+        if len(summary['characters']) > 1 or summary['characters'][0][0] != '캐릭터 미확인':
+            lines.append('    ' + ' / '.join(f'{name} {gained:,}' for name, gained in summary['characters']))
+    return '\n'.join(lines)
 
 
 def by_level(rows):
@@ -236,10 +353,11 @@ def buff_cell(intervals):
 
 
 def build_dialog(controller):
-    from PySide6.QtCore import Qt
+    from PySide6.QtCore import Qt, QTimer
     from PySide6.QtGui import QColor
     from PySide6.QtWidgets import (QDialog, QVBoxLayout, QLabel, QTableWidget, QTableWidgetItem,
-                                   QHeaderView, QAbstractItemView, QComboBox, QHBoxLayout)
+                                   QHeaderView, QAbstractItemView, QComboBox, QHBoxLayout,
+                                   QInputDialog, QMenu)
     from qt_controller import short_exp
     dialog = QDialog(controller.window)
     dialog.setWindowTitle('사냥 기록 비교')
@@ -249,18 +367,35 @@ def build_dialog(controller):
                          'QTableWidget {background:#1b2330;color:#d5dee8;gridline-color:#2b3542;}'
                          'QHeaderView::section {background:#25303d;color:#b8c4d0;border:none;padding:4px;}')
     layout = QVBoxLayout(dialog)
-    hint = QLabel('분당 평균은 측정 화면과 같은 기준이에요. 인식 공백의 시간과 경험치는 효율에서 제외해요. 사냥터 메모는 두 번 눌러 편집할 수 있어요.')
+    hint = QLabel('분당 평균은 측정 화면과 같은 기준이에요. 인식 공백의 시간과 경험치는 효율에서 제외해요. '
+                  '캐릭터와 사냥터 메모는 두 번 눌러 고칠 수 있고, 여러 줄을 고른 뒤 오른쪽 클릭하면 한꺼번에 바꿀 수 있어요.')
     hint.setWordWrap(True); layout.addWidget(hint)
     spots = QLabel(); spots.setWordWrap(True); spots.setStyleSheet('color:#e8d9a8;')
     all_rows = collect()
-    character_names = sorted({row['character_name'] for row in all_rows if row['character_name']})
+    character_names = []
     character_picker = QComboBox()
     character_picker.setAccessibleName('사냥 기록 캐릭터')
-    character_picker.addItem('전체 캐릭터', None)
-    for name in character_names:
-        character_picker.addItem(name, name)
-    if any(row['character_name'] is None for row in all_rows):
-        character_picker.addItem('캐릭터 미확인', '')
+
+    def populate_picker(selected):
+        """Rebuild the filter after a rename; keep the chosen character if it still exists."""
+        nonlocal character_names
+        character_names = sorted({row['character_name'] for row in all_rows if row['character_name']})
+        character_picker.blockSignals(True)
+        character_picker.clear()
+        character_picker.addItem('전체 캐릭터', None)
+        for name in character_names:
+            character_picker.addItem(name, name)
+        if any(not row['character_name'] for row in all_rows):
+            character_picker.addItem('캐릭터 미확인', '')
+        index = character_picker.findData(selected)
+        character_picker.setCurrentIndex(index if index >= 0 else 0)
+        character_picker.blockSignals(False)
+
+    populate_picker(None)
+    period = QLabel(period_text(all_rows))
+    period.setStyleSheet('color:#a8d8b9;')
+    period.setAccessibleName('오늘·이번 주 요약')
+    layout.addWidget(period)
     filter_row = QHBoxLayout()
     filter_row.addWidget(QLabel('캐릭터'))
     filter_row.addWidget(character_picker, 1)
@@ -272,10 +407,13 @@ def build_dialog(controller):
     levels.setWordWrap(True); levels.setStyleSheet('color:#9aa8b6;'); layout.addWidget(levels)
     headers = ['날짜', '캐릭터', 'Lv', '순수 사냥', '휴식', '인식 공백', '관측 중 사냥', '획득', '분당', '시간당', '효율 변화', '경험치 버프', '사냥터 메모']
     memo_column = len(headers)-1
+    character_column = 1
+    editable_columns = (character_column, memo_column)
     table = QTableWidget(0, len(headers))
     table.setHorizontalHeaderLabels(headers)
     table.verticalHeader().setVisible(False)
     table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+    table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
     header = table.horizontalHeader()
     header.setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
     header.setSectionResizeMode(memo_column, QHeaderView.ResizeMode.Stretch)
@@ -286,25 +424,86 @@ def build_dialog(controller):
             f'{memo} {rate:,.0f} ({clock(active)}, {count}회)' for memo, rate, active, count in ranked)
             if ranked else '사냥터 메모를 적으면 사냥터별 평균을 비교해 드려요.')
 
-    def edited(item):
-        session_id = item.data(Qt.ItemDataRole.UserRole)
-        if item.column() != memo_column or not session_id: return
+    def rename_characters(session_ids, name):
         try:
-            text = save_memo(session_id, item.text())
+            save_character_names({session_id: name for session_id in session_ids})
+        except OSError as exc:
+            tracker.log_error('캐릭터 이름 저장', exc); return
+        overrides = load_character_names()
+        for row in all_rows:
+            if row['session_id'] in session_ids:
+                row['character_name'] = overrides.get(row['session_id'], row['detected_character'])
+        # A renamed record may leave the filtered view, so rebuild both.
+        populate_picker(character_picker.currentData())
+        render_records()
+
+    def rename_spots(session_ids, text):
+        try:
+            save_memos({session_id: text for session_id in session_ids})
             import map_name
-            if map_name.learn_correction(session_id, text):
-                memos = load_memos()
-                table.blockSignals(True)
-                for other in all_rows:
-                    other['memo'] = memos.get(other['session_id'], '')
-                for index, other in enumerate(rows):
-                    table.item(index, memo_column).setText(other['memo'])
-                table.blockSignals(False)
+            for session_id in session_ids:
+                map_name.learn_correction(session_id, ' '.join(str(text).split())[:60])
         except OSError as exc:
             tracker.log_error('사냥터 메모 저장', exc); return
-        for row in rows:
-            if row['session_id'] == session_id: row['memo'] = text
+        # learn_correction may also fix other records with the same OCR reading.
+        memos = load_memos()
+        for row in all_rows:
+            row['memo'] = memos.get(row['session_id'], '')
+        table.blockSignals(True)
+        for index, row in enumerate(rows):
+            table.item(index, memo_column).setText(row['memo'])
+        table.blockSignals(False)
         refresh_spots()
+
+    def edited(item):
+        session_id = item.data(Qt.ItemDataRole.UserRole)
+        if item.column() not in editable_columns or not session_id: return
+        if item.column() == character_column:
+            name = '' if item.text().strip() == '—' else item.text()
+            # Defer: rebuilding the table inside its own itemChanged signal is unsafe.
+            QTimer.singleShot(0, lambda: rename_characters({session_id}, name))
+        else:
+            rename_spots({session_id}, item.text())
+
+    def selected_ids():
+        indexes = {index.row() for index in table.selectionModel().selectedRows()}
+        return {rows[index]['session_id'] for index in sorted(indexes) if index < len(rows)}
+
+    def ask_name(title, label, choices, current):
+        options = [current] + [choice for choice in choices if choice != current] if current else list(choices)
+        text, accepted = QInputDialog.getItem(dialog, title, label, options or [''], 0, True)
+        return text if accepted else None
+
+    def context_menu(position):
+        clicked = table.indexAt(position)
+        if clicked.isValid() and not table.selectionModel().isRowSelected(clicked.row(), clicked.parent()):
+            table.selectRow(clicked.row())
+        session_ids = selected_ids()
+        if not session_ids: return
+        count = len(session_ids)
+        chosen = [row for row in rows if row['session_id'] in session_ids]
+        menu = QMenu(table)
+        character_action = menu.addAction(f'캐릭터 이름 바꾸기 ({count}개 기록)…')
+        spot_action = menu.addAction(f'사냥터 메모 바꾸기 ({count}개 기록)…')
+        reset_action = None
+        if any(row['character_name'] != row['detected_character'] for row in chosen):
+            reset_action = menu.addAction('캐릭터 이름을 자동 인식 값으로 되돌리기')
+        action = menu.exec(table.viewport().mapToGlobal(position))
+        if action is character_action:
+            current = chosen[0]['character_name'] or ''
+            name = ask_name('캐릭터 이름', f'{count}개 기록의 캐릭터 이름 (비우면 자동 인식 값)',
+                            character_names, current)
+            if name is not None: rename_characters(session_ids, name)
+        elif action is spot_action:
+            current = chosen[0]['memo']
+            spots_known = sorted({row['memo'] for row in all_rows if row['memo']})
+            text = ask_name('사냥터 메모', f'{count}개 기록의 사냥터', spots_known, current)
+            if text is not None: rename_spots(session_ids, text)
+        elif reset_action is not None and action is reset_action:
+            rename_characters(session_ids, '')
+
+    table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+    table.customContextMenuRequested.connect(context_menu)
 
     rows = []
     empty = QLabel('표시할 사냥 기록이 아직 없어요.')
@@ -334,11 +533,17 @@ def build_dialog(controller):
                      '—' if row['blocked'] else change_text(row['changes']), buffs, row['memo']]
             for column, text in enumerate(cells):
                 item = QTableWidgetItem(text)
-                if column < memo_column:
+                if column not in editable_columns:
                     item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
                     if column >= 5: item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
                 else:
                     item.setData(Qt.ItemDataRole.UserRole, row['session_id'])
+                if column == character_column:
+                    detected = row['detected_character']
+                    if row['character_name'] != detected:
+                        item.setToolTip(f"직접 고친 이름 · 자동 인식: {detected or '없음'}")
+                    else:
+                        item.setToolTip('두 번 눌러 고치기' if detected else '캐릭터 미확인 · 두 번 눌러 이름 적기')
                 if column == memo_column - 1:
                     item.setToolTip(buff_times or '확인된 버프 구간 없음')
                 if column == 5 and row['gap']:
@@ -362,7 +567,7 @@ def build_dialog(controller):
     character_picker.currentIndexChanged.connect(render_records)
     layout.addWidget(table)
     layout.addWidget(empty)
-    session_name = controller.session.character_name
+    session_name = controller.session.character_name or getattr(controller, 'current_character', None)
     if session_name in character_names:
         character_picker.setCurrentIndex(character_picker.findData(session_name))
     else:

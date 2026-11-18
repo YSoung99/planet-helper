@@ -22,7 +22,7 @@ RESOURCES = Path(getattr(sys, '_MEIPASS', Path(__file__).resolve().parent))
 BASE = Path(os.environ.get('PLANET_EXP_DATA_DIR') or (
     Path.home()/'Library'/'Application Support'/'Maple Planet Helper Auto Trial'
     if sys.platform == 'darwin' else Path(__file__).resolve().parent))
-APP_VERSION = '1.4.7'
+APP_VERSION = '1.4.8'
 MAX_BOUNDARY_GAP = 10.0
 BURNING_MAX_LEVEL = 120  # Planet Up & Up grants one bonus level, capped at 120.
 IDLE_AFTER = 60.0  # no EXP gain for longer than this counts as a break
@@ -129,6 +129,18 @@ def load_settings(path):
                 clean[key] = payload[key]
             else:
                 invalid.append(key)
+    if payload.get('current_character') is not None:
+        name = payload['current_character']
+        if isinstance(name, str) and ' '.join(name.split()) and len(name) <= 24:
+            clean['current_character'] = ' '.join(name.split())
+        else:
+            invalid.append('current_character')
+    if payload.get('cloud_remote') is not None:
+        from cloud_sync import valid_remote
+        if valid_remote(payload['cloud_remote']):
+            clean['cloud_remote'] = payload['cloud_remote']
+        else:
+            invalid.append('cloud_remote')
     if 'window_opacity' in payload:
         value = payload['window_opacity']
         if type(value) in (int, float) and math.isfinite(value) and .65 <= value <= 1.0:
@@ -1145,6 +1157,10 @@ class MeasurementCore:
             summary['character_name'] = self.session.character_name
         if self.session.character_conflict:
             summary['character_conflict'] = True
+        # The character the user said they are playing; OCR and record edits take precedence.
+        assigned = getattr(self, 'current_character', None)
+        if assigned:
+            summary['character_assigned'] = assigned
         if self.session.rate_anchor is not None:
             anchor_time, anchor_exp = self.session.rate_anchor
             summary['rate_anchor'] = [round((anchor_time-self.session.started)*1000),

@@ -168,6 +168,10 @@ class Selection(QWidget):
         self.controller.cancel_selection()
 
 
+class CloudSignals(QObject):
+    done = Signal(str)  # status text, delivered on the UI thread
+
+
 class SnapshotSignals(QObject):
     ready = Signal(int,object)
     failed = Signal(int,str)
@@ -338,6 +342,11 @@ class SharedController(tracker.MeasurementCore):
         self.auto_measure = config.get('auto_measure', False)
         self.auto_start_hold = None
         self.jev_enabled = config.get('jev_enabled', False)
+        self.current_character = config.get('current_character')
+        self.cloud_remote = config.get('cloud_remote')
+        self.cloud_lock = threading.Lock()
+        self.cloud_signals = CloudSignals()
+        self.cloud_signals.done.connect(self.cloud_finished)
         self.recent_permission = start_worker and self.has_background_capture_permission()
         self.recent_exp = RecentExp()
         self.recent_start_source = None
@@ -560,7 +569,123 @@ class SharedController(tracker.MeasurementCore):
         line = QFrame(); line.setFrameShape(QFrame.Shape.HLine)
         line.setStyleSheet('color: #2b3542;'); return line
 
+    def export_records(self):
+        import records_backup
+        from datetime import datetime
+        suggested = str(Path.home()/f"planet-helper-records-{datetime.now():%Y%m%d}.zip")
+        path, _ = QFileDialog.getSaveFileName(self.window, '사냥 기록 내보내기', suggested, '백업 (*.zip)')
+        if not path: return
+        if not path.endswith('.zip'): path += '.zip'
+        try:
+            count = records_backup.export_zip(path)
+        except OSError as exc:
+            tracker.log_error('기록 내보내기', exc)
+            QMessageBox.warning(self.window, '사냥 기록 내보내기', f'내보내지 못했어요.\n{exc}'); return
+        QMessageBox.information(self.window, '사냥 기록 내보내기',
+                                f'기록 {count}개를 저장했어요.\n{path}\n\n'
+                                '다른 컴퓨터의 플래닛 도우미에서 "백업 파일에서 가져오기"로 합칠 수 있어요.')
+
+    def import_records(self):
+        import records_backup, zipfile
+        path, _ = QFileDialog.getOpenFileName(self.window, '사냥 기록 가져오기', str(Path.home()), '백업 (*.zip)')
+        if not path: return
+        try:
+            added, skipped, names = records_backup.import_zip(path)
+        except (OSError, ValueError, zipfile.BadZipFile) as exc:
+            tracker.log_error('기록 가져오기', exc)
+            QMessageBox.warning(self.window, '사냥 기록 가져오기', f'가져오지 못했어요.\n{exc}'); return
+        QMessageBox.information(self.window, '사냥 기록 가져오기',
+                                f'새 기록 {added}개를 추가했어요.\n'
+                                f'이미 있는 기록 {skipped}개는 그대로 두었어요.\n'
+                                f'사냥터·캐릭터 이름 {names}개를 합쳤어요.')
+
+    def open_backups(self):
+        folder = tracker.BASE/'records-backups'
+        folder.mkdir(parents=True, exist_ok=True)
+        self.open_path(folder)
+
+    def run_auto_backup(self):
+        """Daily copy of the records, in the background so startup stays quick."""
+        def work():
+            try:
+                import records_backup
+                records_backup.auto_backup()
+            except Exception as exc:
+                tracker.log_error('자동 백업', exc)
+            if self.cloud_remote:
+                self.cloud_work(push_only=False, manual=False)
+        threading.Thread(target=work, name='records-backup', daemon=True).start()
+
+    def cloud_settings(self):
+        from PySide6.QtWidgets import QInputDialog
+        import cloud_sync
+        if cloud_sync.rclone() is None:
+            QMessageBox.information(self.window, '구글 드라이브 동기화',
+                'rclone이 필요해요.\n\n리눅스: 패키지 관리자에서 rclone 설치\n맥: brew install rclone\n\n'
+                '설치한 뒤 다시 열어 주세요.')
+            return
+        remotes = cloud_sync.remotes()
+        if not remotes:
+            QMessageBox.information(self.window, '구글 드라이브 동기화',
+                '먼저 rclone에 구글 드라이브를 한 번 연결해야 해요. 터미널에서 실행하세요:\n\n'
+                '    rclone config create gdrive drive scope=drive.file\n\n'
+                '브라우저가 열리면 구글 계정으로 로그인하고 허용을 누르면 돼요.\n'
+                '(drive.file 권한: 이 앱이 올린 파일만 볼 수 있어요.)\n\n'
+                '끝나면 이 메뉴를 다시 열어 주세요.')
+            return
+        off = '동기화 끄기'
+        current = (self.cloud_remote or '').split(':', 1)[0] + ':' if self.cloud_remote else None
+        options = ([current] if current in remotes else []) + [r for r in remotes if r != current] + [off]
+        choice, ok = QInputDialog.getItem(
+            self.window, '구글 드라이브 동기화',
+            '사용할 rclone 연결 (그 안의 planet-helper 폴더에 컴퓨터별 백업을 올려요)', options, 0, False)
+        if not ok: return
+        if choice == off:
+            self.cloud_remote = None
+            self.save_config(); self.status.set('구글 드라이브 동기화 꺼짐'); return
+        self.cloud_remote = choice + 'planet-helper'
+        self.save_config()
+        self.start_cloud_sync(manual=True)
+
+    def start_cloud_sync(self, manual=False, push_only=False):
+        if not self.cloud_remote: return
+        if manual: self.status.set('구글 드라이브 동기화 중…')
+        threading.Thread(target=self.cloud_work, args=(push_only, manual),
+                         name='cloud-sync', daemon=True).start()
+
+    def cloud_work(self, push_only, manual):
+        """Runs off the UI thread; reports through a queued signal."""
+        import cloud_sync
+        remote = self.cloud_remote
+        if not remote: return
+        if not self.cloud_lock.acquire(blocking=False):
+            if manual: self.cloud_signals.done.emit('이미 동기화 중이에요')
+            return
+        try:
+            if push_only:
+                cloud_sync.push(remote)
+                text = '구글 드라이브에 기록 올림'
+            else:
+                text = '구글 드라이브 ' + cloud_sync.describe(cloud_sync.sync(remote))
+        except Exception as exc:
+            tracker.log_error('구글 드라이브 동기화', exc)
+            try:
+                cloud_sync.save_state(dict(time=time.time(), ok=False, error=str(exc)[:120]))
+            except OSError:
+                pass
+            text = '구글 드라이브 동기화 실패 · last-error.log 확인'
+        finally:
+            self.cloud_lock.release()
+        if manual or not push_only:
+            self.cloud_signals.done.emit(text)
+
+    def cloud_finished(self, text):
+        self.status.set(text)
+
     def show(self):
+        if not getattr(self, 'auto_backup_started', False):
+            self.auto_backup_started = True
+            QTimer.singleShot(5000, self.run_auto_backup)
         self.window.show()
         self.native_overlay(self.window, 3 if self.always_on_top else 0)
         self.window.raise_()
@@ -570,6 +695,8 @@ class SharedController(tracker.MeasurementCore):
         menu = QMenu(self.window)
         menu.addAction('정보', self.show_information)
         menu.addAction('사냥 기록 비교', self.show_history)
+        menu.addAction('오늘·이번 주 요약', self.show_period_summary)
+        menu.addAction(f"현재 캐릭터: {self.current_character or '지정 안 함'}…", self.choose_character)
         pinned = menu.addAction('항상 맨 위')
         pinned.setCheckable(True)
         pinned.setChecked(self.always_on_top)
@@ -595,6 +722,17 @@ class SharedController(tracker.MeasurementCore):
         menu.addAction('JEV API 키 설정', self.api_key_settings)
         menu.addAction('배경 투명도', self.opacity_settings)
         menu.addAction('기록 폴더 열기', self.open_records)
+        backup_menu = menu.addMenu('기록 백업·옮기기')
+        backup_menu.addAction('백업 파일로 내보내기…', self.export_records)
+        backup_menu.addAction('백업 파일에서 가져오기 (합치기)…', self.import_records)
+        backup_menu.addAction('자동 백업 폴더 열기 (하루 1번 · 14일 보관)', self.open_backups)
+        backup_menu.addSeparator()
+        backup_menu.addAction('구글 드라이브 동기화 설정…', self.cloud_settings)
+        if self.cloud_remote:
+            backup_menu.addAction('지금 동기화', lambda: self.start_cloud_sync(manual=True))
+            import cloud_sync
+            info = backup_menu.addAction(cloud_sync.describe(cloud_sync.load_state()))
+            info.setEnabled(False)
         menu.addAction('시작 화면 폴더 열기', self.open_start_captures)
         self.extra_menu_actions(menu)
         menu.addSeparator(); menu.addAction('종료', self.close)
@@ -620,6 +758,36 @@ class SharedController(tracker.MeasurementCore):
         from record_history import build_dialog
         self.history_dialog = build_dialog(self)
         self.history_dialog.show(); self.history_dialog.raise_()
+
+    def choose_character(self):
+        """New records carry this name unless OCR reads one or the record is edited later."""
+        from PySide6.QtWidgets import QInputDialog
+        import record_history
+        known = record_history.known_characters()
+        current = self.current_character or ''
+        options = [current] + [name for name in known if name != current] if current else ([''] + known)
+        text, ok = QInputDialog.getItem(
+            self.window, '현재 캐릭터',
+            '지금 사냥하는 캐릭터 (새 기록에 붙어요 · 비우면 지정 해제)', options, 0, True)
+        if not ok: return
+        name = ' '.join(text.split())[:24] or None
+        self.current_character = name
+        self.save_config()
+        if self.session.rows:
+            try:
+                self.save_summary()  # the record being measured gets the name too
+            except OSError as exc:
+                tracker.log_error('현재 캐릭터 저장', exc)
+        self.status.set(f'현재 캐릭터 · {name}' if name else '현재 캐릭터 지정 해제')
+
+    def show_period_summary(self):
+        import record_history
+        try:
+            text = record_history.period_text(record_history.collect())
+        except Exception as exc:
+            tracker.log_error('사냥 요약', exc)
+            text = '요약을 만들지 못했어요. last-error.log를 확인해 주세요.'
+        QMessageBox.information(self.window, '오늘·이번 주 요약', text)
 
     def api_key_settings(self):
         """Enter the LLM Gateway key used by JEV; it is kept only in the OS key store."""
@@ -796,10 +964,14 @@ class SharedController(tracker.MeasurementCore):
         self.save_config()
 
     def finish_measurement(self, reason):
+        had_record = bool(self.session.rows) and not self.session.restored
         if not super().finish_measurement(reason):
             return False
         self.recent_start_source = None
         self.recent_exp.clear()
+        # Share a finished hunt right away; at app exit a daemon upload could be cut off.
+        if had_record and reason != '앱 종료' and getattr(self, 'cloud_remote', None):
+            self.start_cloud_sync(push_only=True)
         return True
 
     def start_with_recent(self):
@@ -1422,6 +1594,8 @@ class SharedController(tracker.MeasurementCore):
                 'window_opacity': self.window_opacity, 'auto_hud': self.auto_hud,
                 'recent_recording': self.recent_recording, 'burning': self.burning,
                 'jev_enabled': self.jev_enabled, 'auto_measure': self.auto_measure,
+                'current_character': getattr(self, 'current_character', None),
+                'cloud_remote': getattr(self, 'cloud_remote', None),
             }), encoding='utf-8')
             temporary.replace(tracker.BASE/'settings.json')
         except OSError as exc:

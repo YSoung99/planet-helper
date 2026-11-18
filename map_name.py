@@ -119,8 +119,19 @@ def _save(data, base=None):
 
 
 def resolve(raw, base=None):
-    """Apply a remembered correction to a raw OCR name."""
-    return load(base)['alias'].get(raw, raw)
+    """Apply a remembered correction, else reuse an existing spelling that differs only in spacing."""
+    aliases = load(base)['alias']
+    if raw in aliases:
+        return aliases[raw]
+    from record_history import load_memos, spot_key, spot_spellings
+    key = spot_key(raw)
+    if not key:
+        return raw
+    # Names the user confirmed win over spellings that only came from OCR.
+    for name in known_names(base):
+        if spot_key(name) == key:
+            return name
+    return spot_spellings(load_memos(base).values()).get(key, raw)
 
 
 def learn_alias(raw, name, base=None):
