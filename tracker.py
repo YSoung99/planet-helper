@@ -140,18 +140,42 @@ def load_settings(path):
     return clean, '설정 오류 · 일부 항목 초기화' if invalid else None
 
 
-def parse(text):
+def _agrees(value, total):
+    return bool(total) and value[0]<total and abs(value[0]/total*100-value[1])<=.02000001
+
+
+def parse(text, total=None):
+    value=_parse_line(text,total)
+    if value is not None or not total:return value
+    # Punctuation noise seen in real OCR output: a doubled opening bracket
+    # ("[(50.04%]") or a space before the decimal point ("[41 .59%]").
+    # Digits are never added or removed, and the level total must agree.
+    cleaned=re.sub(r'([\[({])\s*[\[({]+',r'\1',text)
+    cleaned=re.sub(r'([\[({]\s*\d{1,2})\s+([.,]\d{2})',r'\1\2',cleaned)
+    if cleaned==text:return None
+    value=_parse_line(cleaned,total)
+    return value if value is not None and _agrees(value,total) else None
+
+
+def _parse_line(text, total=None):
     # Spaces are allowed between fields, never inside EXP or percentage digits.
-    match=re.fullmatch(r'\s*(?:(EXP[.:]?)\s*)?((?:\d{1,3}(?:,\d{3})+)|\d{1,12})\s*'
-                      r'([\[({])\s*(\d{1,2}[.,]\d{2})\s*([%％xX×]?)\s*([\])}]{0,3})\s*',text,re.IGNORECASE)
+    match=re.fullmatch(r'\s*(?:(EXP[.:]?)\s*)?((?:\d{1,3}(?:,\d{3})+)|\d{1,12})(\s*)'
+                      r'([\[({]?)\s*(\d{1,2}[.,]\d{2})\s*([%％xX×]?)\s*([\])}]{0,3})\s*',text,re.IGNORECASE)
     if not match:return None
-    label,number,opening,pct,percent,closing=match.groups()
+    label,number,separator,opening,pct,percent,closing=match.groups()
     if not closing and not (label and percent in ('%','％')):return None
     if percent in ('x','X','×') and not closing:return None
     digits=number.replace(',','')
     if len(digits)>12:return None
     exp=int(digits);pct=float(pct.replace(',','.'))
-    return (exp,pct) if 0<=pct<100 else None
+    if not 0<=pct<100:return None
+    if not opening:
+        # OCR sometimes drops only the opening bracket ("EXP 3698597 11.19%]").
+        # A dropped "[" can also come back as a digit ("[8.98%" -> "18.98%"),
+        # so accept this shape only when the level's EXP total corroborates it.
+        if not (label and separator and percent in ('%','％') and closing):return None
+        if not _agrees((exp,pct),total):return None
+    return (exp,pct)
 
 
 class KWinRegionCapture:
@@ -331,7 +355,7 @@ class LineReader:
             texts = output.txts if output.txts is not None else ()
             scores = output.scores if output.scores is not None else ()
             raw = ''.join(texts)
-            readings.append((parse(raw),min(scores) if len(scores) else 0,raw))
+            readings.append((parse(raw,EXP_TABLE.get(level)),min(scores) if len(scores) else 0,raw))
         recognize(image)
         # Neutral RGB keeps white glyphs while suppressing the original green bar.
         # The EXP-labelled HUD has green brackets: grayscale preserves those.
