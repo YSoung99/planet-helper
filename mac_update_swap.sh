@@ -7,9 +7,11 @@ candidate=$3
 backup=$4
 stage=$5
 data=$6
+# Versioned bundle names: the new app may live at a different path than the running one.
+target=${7:-$app}
 
 restart() {
-    /usr/bin/open -n --env "PLANET_EXP_DATA_DIR=$data" "$app"
+    /usr/bin/open -n --env "PLANET_EXP_DATA_DIR=$data" "$1"
 }
 
 attempt=0
@@ -24,17 +26,18 @@ done
 
 restore() {
     if [ -d "$stage/current.app" ]; then
-        if [ -d "$app" ]; then /bin/mv "$app" "$stage/failed.app"; fi
+        if [ -d "$target" ]; then /bin/mv "$target" "$stage/failed.app"; fi
+        if [ -d "$app" ]; then /bin/mv "$app" "$stage/failed-current.app"; fi
         /bin/mv "$stage/current.app" "$app"
     fi
     if [ -d "$stage/previous.app" ]; then /bin/mv "$stage/previous.app" "$backup"; fi
-    restart
+    restart "$app"
 }
 trap restore EXIT
 if [ -d "$backup" ]; then /bin/mv "$backup" "$stage/previous.app"; fi
 /bin/mv "$app" "$stage/current.app"
-/bin/mv "$candidate" "$app"
-restart
+/bin/mv "$candidate" "$target"
+restart "$target"
 /bin/mv "$stage/current.app" "$backup"
 trap - EXIT
 /bin/rm -rf "$stage"

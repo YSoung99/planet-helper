@@ -15,7 +15,6 @@ import certifi
 
 REPO = 'YSoung99/planet-helper'
 ASSET = 'planet-helper-macos-arm64.zip'
-APP_NAME = '플래닛 도우미 자동인식 시험용.app'
 BUNDLE_ID = 'local.codex.planethelper.autotrial'
 
 
@@ -92,7 +91,10 @@ def download(release, stage):
     download_archive(release, archive)
     subprocess.run(['/usr/bin/ditto', '-x', '-k', str(archive), str(stage)],
                    check=True, capture_output=True, timeout=180)
-    candidate = stage / APP_NAME
+    apps = [path for path in stage.iterdir() if path.suffix == '.app']
+    if len(apps) != 1:
+        raise ValueError('설치 파일에서 앱을 하나만 찾아야 합니다.')
+    candidate = apps[0]
     verify(candidate, release.tag)
     archive.unlink()
     return candidate
@@ -102,5 +104,10 @@ def prepare(app):
     return tempfile.TemporaryDirectory(delete=False, prefix='.planet-helper-update-', dir=app.parent)
 
 
+def app_name(app_version):
+    return f'플래닛 도우미 {app_version}.app'
+
+
 def previous(app):
-    return app.with_name(f'.{app.stem}.previous.app')
+    # One backup slot, whatever the versioned name of the running app is.
+    return app.with_name('.플래닛 도우미.previous.app')

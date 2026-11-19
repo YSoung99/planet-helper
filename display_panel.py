@@ -26,7 +26,7 @@ def build(c, config, application, level_value, repeat_bridge=KeyRepeatBridge):
     c.window_opacity = config.get('window_opacity', .90)
     c.rate_display_key = None
     c.rate_inputs_key = None
-    c.window.setWindowTitle('플래닛 도우미 자동인식 시험용')
+    c.window.setWindowTitle(c.APP_TITLE)
     c.window.setObjectName('panel')
     c.window.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
     c.window.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, c.always_on_top)

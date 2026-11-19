@@ -142,8 +142,8 @@ class MacUpdateBackend:
         try:
             stage = Path(staging.name)
             if rollback:
-                candidate = stage / mac_updates.APP_NAME
                 backup = mac_updates.previous(self.app)
+                candidate = stage / mac_updates.app_name(mac_updates.app_version(backup))
                 mac_updates.verify(backup)
                 subprocess.run(['/usr/bin/ditto', str(backup), str(candidate)],
                                check=True, capture_output=True, timeout=180)
@@ -159,10 +159,13 @@ class MacUpdateBackend:
         staging, candidate = prepared
         stage = Path(staging.name)
         helper = stage / 'swap.sh'
+        target = self.app.with_name(candidate.name)
+        if target != self.app and target.exists():
+            raise ValueError(f'{target.name}이 이미 있습니다.')
         shutil.copyfile(tracker.RESOURCES / 'mac_update_swap.sh', helper)
         return subprocess.Popen(['/bin/sh', str(helper), str(os.getpid()), str(self.app),
                                  str(candidate), str(mac_updates.previous(self.app)),
-                                 str(stage), str(tracker.BASE)],
+                                 str(stage), str(tracker.BASE), str(target)],
                                 start_new_session=True, stdin=subprocess.DEVNULL,
                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 

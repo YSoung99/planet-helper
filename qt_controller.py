@@ -236,7 +236,7 @@ class WindowSelection(QDialog):
 
 class SharedController(tracker.MeasurementCore):
     # ---- Platform hooks (override in linux_app.py / mac_app.py) ----
-    APP_TITLE = '플래닛 도우미'
+    APP_TITLE = f'플래닛 도우미 {tracker.APP_VERSION}'
     NATIVE_MENU_BAR = False
     CAPTURE_MODULE = 'linux_capture'
     CAPTURE_OPTIONS = {}

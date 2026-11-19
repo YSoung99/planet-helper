@@ -25,7 +25,6 @@ def native_overlay(widget, level=3):
 
 
 class Controller(SharedController):
-    APP_TITLE = '플래닛 도우미 자동인식 시험용'  # matches the .app bundle name in PlanetEXP.spec
     NATIVE_MENU_BAR = True
     CAPTURE_MODULE = 'window_capture'
     CAPTURE_OPTIONS = {}
@@ -84,7 +83,7 @@ class Controller(SharedController):
         answer = QMessageBox.question(self.window, '화면 기록 권한',
             '경험치 숫자를 읽으려면 화면 기록 권한이 필요해요.\n\n'
             '시스템 설정 → 개인정보 보호 및 보안 → 화면 및 시스템 오디오 기록에서\n'
-            '플래닛 도우미 자동인식 시험용을 허용한 뒤 앱을 다시 실행해 주세요.\n\n설정 화면을 열까요?')
+            f'{self.APP_TITLE}을 허용한 뒤 앱을 다시 실행해 주세요.\n\n설정 화면을 열까요?')
         if answer == QMessageBox.StandardButton.Yes:
             subprocess.Popen(['open', 'x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture'])
         return False
