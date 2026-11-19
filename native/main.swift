@@ -56,6 +56,7 @@ func statusSnapshot() -> [String: Any] {
         "enabled": repeater.isRunning, "active": repeater.active,
         "accessibility": permissions.post, "inputMonitoring": permissions.listen,
         "postPermissionName": postPermissionName,
+        "postPreflight": CGPreflightPostEventAccess(), "axTrusted": AXIsProcessTrusted(),
         "legacyRunning": legacyRepeaterIsRunning(),
         "status": repeater.message, "error": protocolError,
         "settings": ["firstDelayMs": repeater.settings.initialDelay,

@@ -17,8 +17,11 @@ struct Permissions {
     var summary: String {
         "입력 모니터링: \(listen ? "허용" : "필요") · \(postPermissionName): \(post ? "허용" : "필요")"
     }
+    // macOS 27.3 beta can report a granted "System & App Protection Override" as missing
+    // through CGPreflightPostEventAccess; AXIsProcessTrusted reads the same grant.
     static func current() -> Permissions {
-        Permissions(listen: CGPreflightListenEventAccess(), post: CGPreflightPostEventAccess())
+        Permissions(listen: CGPreflightListenEventAccess(),
+                    post: CGPreflightPostEventAccess() || AXIsProcessTrusted())
     }
 }
 
