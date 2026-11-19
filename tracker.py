@@ -200,7 +200,7 @@ def _digit_reading(text, total):
     exp=int(match[1].replace(',',''))
     pct=match[2].replace(',','.')
     if len(pct)==6:candidates=[pct[1:]] if pct[0]=='1' else []
-    else:candidates=[pct,pct[1:]] if pct[0]=='1' else [pct]
+    else:candidates=[pct,pct[1:]] if pct[0]=='1' and len(pct)==5 else [pct]
     agreeing=[(exp,float(candidate)) for candidate in candidates if _agrees((exp,float(candidate)),total)]
     return agreeing[0] if len(agreeing)==1 else None
 

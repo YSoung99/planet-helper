@@ -264,6 +264,49 @@ fn cross_model(medium: &Reading, fast: &[Reading], total: u64) -> Option<(Value,
     None
 }
 
+// Last resort after the votes above: "%" may come back as "X"/"×", brackets may
+// vanish, and "[" may turn into "|" or a leading "1" ("154.47×"). Digits are
+// never added or removed, and the level total must agree with the result.
+static DIGITS: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)^\s*(?:EXP[.:]?\s*)?((?:[0-9]{1,3}(?:,[0-9]{3})+)|[0-9]{1,12})(?:\s+[\[({|]?|[\[({|])([0-9]{1,3})[.,]([0-9]{2})\s*[%％xX×]?\s*[\])}]{0,3}\s*$").unwrap()
+});
+
+fn digit_value(raw: &str, total: u64) -> Option<Value> {
+    let fields = DIGITS.captures(raw)?;
+    let exp = fields[1].replace(',', "").parse().ok()?;
+    let integer = &fields[2];
+    let decimal = fields[3].parse::<u16>().ok()?;
+    let candidates = match (integer.len(), integer.starts_with('1')) {
+        (3, true) => vec![&integer[1..]],
+        (3, false) => vec![],
+        (2, true) => vec![integer, &integer[1..]],
+        _ => vec![integer],
+    };
+    let agreeing: Vec<Value> = candidates
+        .into_iter()
+        .filter_map(|candidate| Some((exp, candidate.parse::<u16>().ok()? * 100 + decimal)))
+        .filter(|&value| consistent(value, total))
+        .collect();
+    (agreeing.len() == 1).then(|| agreeing[0])
+}
+
+fn digit_consensus(readings: &[Reading], total: u64) -> Option<(Value, f64, String)> {
+    let mut matching: Vec<(Value, &Reading)> = Vec::new();
+    for entry in readings.iter().filter(|entry| entry.confidence >= 0.85) {
+        if let Some(value) = digit_value(&entry.raw, total) {
+            if matching.first().is_some_and(|(found, _)| *found != value) {
+                return None;
+            }
+            matching.push((value, entry));
+        }
+    }
+    if matching.len() < 2 {
+        return None;
+    }
+    let confidence = matching.iter().map(|(_, entry)| entry.confidence).fold(1.0, f64::min);
+    Some((matching[0].0, confidence, matching[0].1.raw.clone()))
+}
+
 struct Models {
     medium: Model,
     fast: Option<Model>,
@@ -358,7 +401,8 @@ impl Models {
             }
         }
         readings.extend(fast_readings);
-        Ok(format_result(None, readings))
+        let accepted = total.and_then(|total| digit_consensus(&readings, total));
+        Ok(format_result(accepted, readings))
     }
 }
 
@@ -515,6 +559,44 @@ mod tests {
         assert!(cross_model(&strict, std::slice::from_ref(&weak), 12_340).is_some());
         assert!(cross_model(&strict, std::slice::from_ref(&weak), 11_000).is_none());
         assert_eq!(supporting_value("123410.00%"), None);
+    }
+
+    fn weak_reads(raws: &[&str], confidence: f64) -> Vec<Reading> {
+        raws.iter()
+            .map(|raw| Reading {
+                raw: (*raw).into(),
+                confidence,
+                value: parse(raw),
+            })
+            .collect()
+    }
+
+    // Real OCR triples from saved verification frames: digits agree, punctuation does not.
+    #[test]
+    fn matching_digits_survive_percent_and_bracket_noise() {
+        let cases: [(&[&str], u64, Value); 5] = [
+            (&["EXP 327024626 [68.67%]", "EXP 327024626 [68.67X", "EXP 327024626 68.67X"], 476_248_760, (327_024_626, 6867)),
+            (&["EXP 356500050 [74.86", "EXP 356500050 [74.86]", "EXP 356500050 74.86"], 476_248_760, (356_500_050, 7486)),
+            (&["EXP 338192007 [54.38X", "EXP 338192007 [54.38X", "EXP 338192007 54.38X"], 621_848_316, (338_192_007, 5438)),
+            (&["EXP 338720637 [54.47×", "EXP 338720637 [54.47×", "EXP 338720637 154.47×"], 621_848_316, (338_720_637, 5447)),
+            (&["EXP 347147565 [55.83×]", "EXP 347147565 [55.83×", "EXP 347147565 |55.83×"], 621_848_316, (347_147_565, 5583)),
+        ];
+        for (raws, total, value) in cases {
+            let accepted = digit_consensus(&weak_reads(raws, 0.93), total);
+            assert_eq!(accepted.map(|(found, _, _)| found), Some(value), "{raws:?}");
+        }
+    }
+
+    #[test]
+    fn digit_consensus_needs_total_two_reads_and_confidence() {
+        let noisy = ["EXP 338192007 [54.38X", "EXP 338192007 [54.38X", "EXP 338192007 54.38X"];
+        assert!(digit_consensus(&weak_reads(&noisy, 0.93), 29_715_818).is_none());
+        assert!(digit_consensus(&weak_reads(&noisy, 0.80), 621_848_316).is_none());
+        let single = ["EXP 338192007 [54.38X", "EXP 338192OO7 [54.38X", "garbage"];
+        assert!(digit_consensus(&weak_reads(&single, 0.93), 621_848_316).is_none());
+        let dropped = ["EXP 32881886 [94.29X", "EXP. 3288188 [94.29X", "EXP 3288188 94.29X"];
+        assert!(digit_consensus(&weak_reads(&dropped, 0.93), 34_873_700).is_none());
+        assert_eq!(digit_value("EXP 107541.94%1", 29_715_818), None);
     }
 
     #[test]

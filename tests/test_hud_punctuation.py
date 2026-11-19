@@ -128,6 +128,10 @@ class DigitConsensusTests(unittest.TestCase):
                 result=_reader(replies,score).read(Image.new('RGB',(332,30)),1,force=True,level=level)
                 self.assertIsNone(result[0])
 
+    def test_leading_one_is_a_bracket_only_before_two_digits(self):
+        # "1.94" must not become ".94" even when 0.94% would match the total.
+        self.assertIsNone(tracker._digit_reading('EXP 9400 1.94X',1_000_000))
+
     def test_strict_parser_rules_are_unchanged(self):
         total=tracker.EXP_TABLE[177]
         for text in ('EXP 338192007 [54.38X','EXP 338720637 154.47×','EXP 347147565 |55.83×'):
