@@ -37,7 +37,8 @@ def row(session_id, started, memo='', character=None, gained=6000, rate=600, lev
 
 class CurrentCharacterTests(unittest.TestCase):
     def test_setting_round_trip_and_invalid_values(self):
-        with tempfile.TemporaryDirectory() as base:
+        # log_error writes to the real data folder unless patched.
+        with tempfile.TemporaryDirectory() as base, patch.object(tracker, 'log_error'):
             path = Path(base)/'settings.json'
             path.write_text(json.dumps({'current_character': '  곰곰  스렁 '}), encoding='utf-8')
             self.assertEqual(tracker.load_settings(path)[0]['current_character'], '곰곰 스렁')

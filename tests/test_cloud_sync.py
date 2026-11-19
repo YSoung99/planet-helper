@@ -20,7 +20,7 @@ class RemoteValidationTests(unittest.TestCase):
             self.assertFalse(cloud_sync.valid_remote(bad), bad)
 
     def test_settings_keep_only_valid_remotes(self):
-        with tempfile.TemporaryDirectory() as base:
+        with tempfile.TemporaryDirectory() as base, patch.object(tracker, 'log_error'):
             path = Path(base)/'settings.json'
             path.write_text(json.dumps({'cloud_remote': 'gdrive:planet-helper'}), encoding='utf-8')
             self.assertEqual(tracker.load_settings(path)[0]['cloud_remote'], 'gdrive:planet-helper')

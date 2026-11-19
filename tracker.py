@@ -22,7 +22,7 @@ RESOURCES = Path(getattr(sys, '_MEIPASS', Path(__file__).resolve().parent))
 BASE = Path(os.environ.get('PLANET_EXP_DATA_DIR') or (
     Path.home()/'Library'/'Application Support'/'Maple Planet Helper Auto Trial'
     if sys.platform == 'darwin' else Path(__file__).resolve().parent))
-APP_VERSION = '1.4.14'
+APP_VERSION = '1.4.15'
 MAX_BOUNDARY_GAP = 10.0
 BURNING_MAX_LEVEL = 120  # Planet Up & Up grants one bonus level, capped at 120.
 IDLE_AFTER = 60.0  # no EXP gain for longer than this counts as a break
@@ -143,7 +143,7 @@ def load_settings(path):
             invalid.append('cloud_remote')
     if 'window_opacity' in payload:
         value = payload['window_opacity']
-        if type(value) in (int, float) and math.isfinite(value) and .65 <= value <= 1.0:
+        if type(value) in (int, float) and math.isfinite(value) and .2 <= value <= 1.0:
             clean['window_opacity'] = float(value)
         else:
             invalid.append('window_opacity')

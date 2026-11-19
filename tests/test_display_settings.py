@@ -17,6 +17,21 @@ class DisplaySettingsTests(unittest.TestCase):
             self.assertIsNone(warning)
             self.assertEqual(clean, expected)
 
+    def test_every_opacity_the_settings_dialog_offers_survives_relaunch(self):
+        # The dialog offers 20-100%; 30% used to be reset to 90% on every launch.
+        with tempfile.TemporaryDirectory() as folder, patch.object(tracker, 'log_error'):
+            path = Path(folder) / 'settings.json'
+            for opacity in (.2, .3, .65, 1.0):
+                with self.subTest(opacity=opacity):
+                    path.write_text(json.dumps(dict(window_opacity=opacity)))
+                    clean, warning = tracker.load_settings(path)
+                    self.assertIsNone(warning)
+                    self.assertEqual(clean['window_opacity'], opacity)
+        with tempfile.TemporaryDirectory() as folder, patch.object(tracker, 'log_error'):
+            path = Path(folder) / 'settings.json'
+            path.write_text(json.dumps(dict(window_opacity=.19)))
+            self.assertNotIn('window_opacity', tracker.load_settings(path)[0])
+
     def test_invalid_display_values_cannot_hide_window_or_destroy_other_settings(self):
         with tempfile.TemporaryDirectory() as folder, patch.object(tracker, 'log_error'):
             path = Path(folder) / 'settings.json'
