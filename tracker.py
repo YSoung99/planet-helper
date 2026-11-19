@@ -190,6 +190,21 @@ def _parse_line(text, total=None):
     return (exp,pct)
 
 
+def _digit_reading(text, total):
+    # Punctuation-blind read for voting only: "%" may come back as "X"/"×", brackets may
+    # vanish, and "[" may turn into "|" or a leading "1" ("154.47×"). Digits are never
+    # added or removed, and the level total must agree with the result.
+    match=re.fullmatch(r'\s*(?:EXP[.:]?\s*)?((?:\d{1,3}(?:,\d{3})+)|\d{1,12})(?:\s+[\[({|]?|[\[({|])'
+                       r'(\d{1,3}[.,]\d{2})\s*[%％xX×]?\s*[\])}]{0,3}\s*',text,re.IGNORECASE)
+    if not match or not total:return None
+    exp=int(match[1].replace(',',''))
+    pct=match[2].replace(',','.')
+    if len(pct)==6:candidates=[pct[1:]] if pct[0]=='1' else []
+    else:candidates=[pct,pct[1:]] if pct[0]=='1' else [pct]
+    agreeing=[(exp,float(candidate)) for candidate in candidates if _agrees((exp,float(candidate)),total)]
+    return agreeing[0] if len(agreeing)==1 else None
+
+
 class KWinRegionCapture:
     """KDE's public region API, with no desktop identity spoofing or permission changes."""
     def __init__(self):
@@ -388,7 +403,18 @@ class LineReader:
             self.key,self.result,self.cached_at = key,result,observed_at
             self.cached_readings = list(self.last_readings)
         else:
-            result = (None,readings[0][1],readings[0][2])
+            # Fallback: two confident reads with the same digits, checked against the level total.
+            total = EXP_TABLE.get(level)
+            confident = [(_digit_reading(raw,total),score,raw) for value,score,raw in readings if score>=.85]
+            digit_votes = Counter(value for value,score,raw in confident if value is not None)
+            if len(digit_votes)==1 and digit_votes.most_common(1)[0][1]>=2:
+                value = digit_votes.most_common(1)[0][0]
+                matching = [entry for entry in confident if entry[0]==value]
+                result = (value,min(entry[1] for entry in matching),matching[0][2])
+                self.key,self.result,self.cached_at = key,result,observed_at
+                self.cached_readings = list(self.last_readings)
+            else:
+                result = (None,readings[0][1],readings[0][2])
         return (*result,False)
 
 

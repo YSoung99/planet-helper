@@ -95,3 +95,40 @@ class HudPunctuationTests(unittest.TestCase):
         self.assertEqual(tracker.parse('123,456,789,012 [1.23%]'),(123456789012,1.23))
         for text in ('1,234,567,890,123 [1.23%]','218,65,1376 [51.08%]'):
             with self.subTest(text=text):self.assertIsNone(tracker.parse(text))
+
+
+def _reader(replies, score=.93):
+    replies=iter(replies)
+    return tracker.LineReader(lambda img:SimpleNamespace(txts=(next(replies),),scores=(score,)))
+
+
+class DigitConsensusTests(unittest.TestCase):
+    # Real OCR triples from saved verification frames: digits agree, punctuation does not.
+    def test_matching_digits_survive_percent_and_bracket_noise(self):
+        for level,replies,value in (
+                (172,('EXP 327024626 [68.67%]','EXP 327024626 [68.67X','EXP 327024626 68.67X'),(327024626,68.67)),
+                (172,('EXP 356500050 [74.86','EXP 356500050 [74.86]','EXP 356500050 74.86'),(356500050,74.86)),
+                (177,('EXP 338192007 [54.38X','EXP 338192007 [54.38X','EXP 338192007 54.38X'),(338192007,54.38)),
+                (177,('EXP 338720637 [54.47×','EXP 338720637 [54.47×','EXP 338720637 154.47×'),(338720637,54.47)),
+                (177,('EXP 347147565 [55.83×]','EXP 347147565 [55.83×','EXP 347147565 |55.83×'),(347147565,55.83))):
+            with self.subTest(replies=replies):
+                result=_reader(replies).read(Image.new('RGB',(332,30)),1,force=True,level=level)
+                self.assertEqual(result[0],value)
+
+    def test_consensus_still_needs_level_total_two_reads_and_confidence(self):
+        noisy=('EXP 338192007 [54.38X','EXP 338192007 [54.38X','EXP 338192007 54.38X')
+        cases=((None,noisy,.93),          # no level total to check against
+               (120,noisy,.93),           # total disagrees
+               (177,noisy,.80),           # low OCR confidence
+               (177,('EXP 338192007 [54.38X','EXP 338192OO7 [54.38X','garbage'),.93),   # one read only
+               (123,('EXP 32881886 [94.29X','EXP. 3288188 [94.29X','EXP 3288188 94.29X'),.93),  # dropped digit
+               (None,('EXP 107541.94%1','EXP 107541.94%]','EXP 107541.94%'),.93))   # digits run together
+        for level,replies,score in cases:
+            with self.subTest(level=level,replies=replies,score=score):
+                result=_reader(replies,score).read(Image.new('RGB',(332,30)),1,force=True,level=level)
+                self.assertIsNone(result[0])
+
+    def test_strict_parser_rules_are_unchanged(self):
+        total=tracker.EXP_TABLE[177]
+        for text in ('EXP 338192007 [54.38X','EXP 338720637 154.47×','EXP 347147565 |55.83×'):
+            with self.subTest(text=text):self.assertIsNone(tracker.parse(text,total))
