@@ -24,6 +24,10 @@ def native_overlay(widget, level=3):
                                   NSWindowCollectionBehaviorFullScreenAuxiliary)
 
 
+def open_privacy_settings(pane):
+    subprocess.Popen(['open', f'x-apple.systempreferences:com.apple.preference.security?{pane}'])
+
+
 class Controller(SharedController):
     NATIVE_MENU_BAR = True
     CAPTURE_MODULE = 'window_capture'
@@ -64,13 +68,31 @@ class Controller(SharedController):
         open_records(tracker.BASE/'records')
 
     def extra_menu_actions(self, menu):
-        menu.addAction('화면 기록 권한', self.check_permission)
+        menu.addAction('화면 기록 권한', self.show_capture_permission)
         if hasattr(self, 'updates'):
             menu.addAction('업데이트 및 롤백', self.updates.show)
 
     def has_background_capture_permission(self):
         from macos_support import has_capture_permission
         return has_capture_permission()
+
+    def show_capture_permission(self):
+        from PySide6.QtWidgets import QMessageBox
+        from macos_support import has_capture_permission
+        if has_capture_permission():
+            QMessageBox.information(self.window, '화면 기록 권한', '화면 기록 권한이 이미 허용돼 있어요.')
+        else:
+            self.check_permission()
+
+    def open_missing_repeat_permission(self, state):
+        # macOS prompts only once per app; afterwards the request is silent.
+        if not state.get('inputMonitoring'):
+            open_privacy_settings('Privacy_ListenEvent')
+        elif not state.get('accessibility'):
+            open_privacy_settings('Privacy_Accessibility')
+        else:
+            from PySide6.QtWidgets import QMessageBox
+            QMessageBox.information(self.window, '연타 권한', '연타 권한이 이미 모두 허용돼 있어요.')
 
     def check_permission(self):
         from PySide6.QtWidgets import QMessageBox
@@ -85,7 +107,7 @@ class Controller(SharedController):
             '시스템 설정 → 개인정보 보호 및 보안 → 화면 및 시스템 오디오 기록에서\n'
             f'{self.APP_TITLE}을 허용한 뒤 앱을 다시 실행해 주세요.\n\n설정 화면을 열까요?')
         if answer == QMessageBox.StandardButton.Yes:
-            subprocess.Popen(['open', 'x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture'])
+            open_privacy_settings('Privacy_ScreenCapture')
         return False
 
     def add_repeat_permission_widgets(self, layout):
@@ -98,7 +120,12 @@ class Controller(SharedController):
         self.key_repeat.changed.connect(update_permissions)
         layout.addWidget(permissions)
         connect = QPushButton('연타 권한 연결')
-        connect.clicked.connect(self.key_repeat.request_permissions)
+        def request_permissions():
+            from PySide6.QtCore import QTimer
+            self.key_repeat.request_permissions()
+            # Give the helper a moment to publish the refreshed permission state.
+            QTimer.singleShot(1000, lambda: self.open_missing_repeat_permission(self.key_repeat.state))
+        connect.clicked.connect(request_permissions)
         layout.addWidget(connect)
         layout.addWidget(QLabel('시스템 설정에서 플래닛 도우미를 허용해 주세요.\n권한을 바꾼 뒤 앱을 다시 실행해야 할 수 있어요.'))
         return lambda: self.key_repeat.changed.disconnect(update_permissions)
