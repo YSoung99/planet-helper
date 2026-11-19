@@ -31,9 +31,13 @@ class PermissionButtonTests(unittest.TestCase):
     def test_repeat_button_opens_the_missing_pane(self):
         for state, pane in (({'inputMonitoring': False, 'accessibility': False}, 'Privacy_ListenEvent'),
                             ({'inputMonitoring': True, 'accessibility': False}, 'Privacy_Accessibility')):
-            with self.subTest(state=state), patch.object(mac_app.subprocess, 'Popen') as popen:
-                controller().open_missing_repeat_permission(state)
+            app = controller()
+            app.window = None
+            with self.subTest(state=state), patch.object(mac_app.subprocess, 'Popen') as popen, \
+                    patch('PySide6.QtWidgets.QMessageBox.information') as info:
+                app.open_missing_repeat_permission(state)
                 self.assertTrue(popen.call_args[0][0][1].endswith(pane))
+                info.assert_called_once()  # visible feedback even if Settings opens behind the game
 
     def test_repeat_button_says_so_when_everything_is_granted(self):
         app = controller()

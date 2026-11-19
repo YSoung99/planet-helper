@@ -86,13 +86,20 @@ class Controller(SharedController):
 
     def open_missing_repeat_permission(self, state):
         # macOS prompts only once per app; afterwards the request is silent.
+        from PySide6.QtWidgets import QMessageBox
         if not state.get('inputMonitoring'):
-            open_privacy_settings('Privacy_ListenEvent')
+            pane, name = 'Privacy_ListenEvent', '입력 모니터링'
         elif not state.get('accessibility'):
-            open_privacy_settings('Privacy_Accessibility')
+            pane, name = 'Privacy_Accessibility', state.get('postPermissionName', '손쉬운 사용')
         else:
-            from PySide6.QtWidgets import QMessageBox
             QMessageBox.information(self.window, '연타 권한', '연타 권한이 이미 모두 허용돼 있어요.')
+            return
+        open_privacy_settings(pane)
+        # System Settings can open behind a full-screen game, so say where it went.
+        QMessageBox.information(self.window, '연타 권한',
+            f'시스템 설정의 {name} 화면을 열었어요.\n'
+            f'{self.APP_TITLE} 옆 ⓘ 또는 스위치를 눌러 허용해 주세요.\n\n'
+            '설정 창이 안 보이면 게임 전체 화면 뒤에 있어요. ⌘+Tab으로 시스템 설정을 골라 주세요.')
 
     def check_permission(self):
         from PySide6.QtWidgets import QMessageBox
