@@ -25,6 +25,7 @@ def build(c, config, application, level_value, repeat_bridge=KeyRepeatBridge):
     c.always_on_top = config.get('always_on_top', True)
     c.window_opacity = config.get('window_opacity', .90)
     c.rate_display_key = None
+    c.window_display_key = None
     c.rate_inputs_key = None
     c.window.setWindowTitle(c.APP_TITLE)
     c.window.setObjectName('panel')
@@ -59,7 +60,7 @@ def build(c, config, application, level_value, repeat_bridge=KeyRepeatBridge):
     """)
     layout = QVBoxLayout(c.window)
     layout.setContentsMargins(12,10,12,10); layout.setSpacing(6)
-    header = QHBoxLayout(); header.setSpacing(5)
+    header = QHBoxLayout(); header.setSpacing(5); c.header_layout = header
     title = c.label('플래닛 도우미');c.title_label=title;title.setStyleSheet('font-size:16px;font-weight:700;color:#f0f4f8;')
     title.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
     header.addWidget(title)
@@ -97,12 +98,12 @@ def build(c, config, application, level_value, repeat_bridge=KeyRepeatBridge):
     grid.setHorizontalSpacing(12);grid.setVerticalSpacing(5)
     grid.setColumnStretch(0,1);grid.setColumnStretch(1,1)
     c.compact_time=c.label('00:00:00','primaryStat')
-    c.compact_total=c.label('0','primaryStat')
-    c.compact_average=c.label('—','statValue');c.compact_recent_six=c.label('—','statValue')
+    c.compact_recent_six=c.label('—','primaryStat')
+    c.compact_average=c.label('—','statValue');c.compact_recent_minute=c.label('—','statValue')
     add_stat(c,grid,0,0,'순수 사냥 시간',c.compact_time)
-    add_stat(c,grid,0,1,'총 획득 EXP',c.compact_total)
+    c.compact_six_heading=add_stat(c,grid,0,1,'최근 6분 획득',c.compact_recent_six)
     add_stat(c,grid,1,0,'누적 분당 평균',c.compact_average)
-    c.compact_six_heading=add_stat(c,grid,1,1,'최근 6분 획득',c.compact_recent_six)
+    add_stat(c,grid,1,1,'직전 1분 획득',c.compact_recent_minute)
     c.compact_level_eta = c.label('레벨업 예상 —')
     c.compact_level_eta.setAccessibleName('레벨업 예상 시간')
     c.compact_level_eta.setStyleSheet('color:#e8d9a8;font-size:10px;')
@@ -152,7 +153,7 @@ def build(c, config, application, level_value, repeat_bridge=KeyRepeatBridge):
     c.auto_checkbox.setChecked(c.auto_hud)
     c.auto_checkbox.toggled.connect(c.toggle_auto_hud)
     side.addWidget(c.auto_checkbox)
-    character_controls = QHBoxLayout()
+    character_controls = QHBoxLayout(); c.character_controls = character_controls
     character_controls.addWidget(c.level_prefix)
     character_controls.addWidget(c.level_picker)
     character_controls.addStretch()
@@ -225,16 +226,20 @@ def resize(c):
     c.level_prefix.setVisible(not c.compact);c.level_picker.setVisible(not c.compact)
     c.rate_info.setVisible(not c.compact);c.repeat_status.setVisible(not c.compact)
     c.repeat_title.setVisible(not c.compact)
-    for button in (c.region_button,c.reset_button,c.export_button):button.setVisible(not c.compact)
+    for button in (c.region_button,c.export_button):button.setVisible(not c.compact)
     c.window.layout().setContentsMargins(8 if c.compact else 12,8,8 if c.compact else 12,8)
     c.window.layout().setSpacing(5 if c.compact else 8)
-    for button in (c.jev_button,c.mode_button,c.pin_button,c.close_button,c.toggle_button,c.recent_button,c.repeat_button,c.repeat_settings_button,c.history_button,c.options_button):
+    for button in (c.jev_button,c.mode_button,c.pin_button,c.close_button,c.toggle_button,c.reset_button,c.recent_button,c.repeat_button,c.repeat_settings_button,c.history_button,c.options_button):
         button.setStyleSheet('padding:3px 5px;font-size:10px;' if c.compact else '')
     c.toggle_button.setStyleSheet('padding:4px 11px;' if c.compact else 'padding:6px 14px;')
     if c.compact:
+        c.header_layout.insertWidget(c.header_layout.indexOf(c.mode_button),c.pin_button)
         c.repeat_controls.insertWidget(0,c.toggle_button)
-        c.repeat_controls.insertWidget(1,c.recent_button)
+        c.repeat_controls.insertWidget(1,c.reset_button)
+        c.repeat_controls.insertWidget(2,c.recent_button)
     else:
+        c.character_controls.insertWidget(3,c.pin_button)
+        c.measurement_controls.insertWidget(1,c.reset_button)
         c.measurement_controls.addWidget(c.toggle_button)
         c.measurement_controls.addWidget(c.recent_button)
 

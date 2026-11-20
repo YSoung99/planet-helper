@@ -79,7 +79,7 @@ def run_offline_diagnostics(application, report_path):
                            'background_alpha':window.grab().toImage().pixelColor(5,45).alpha(),
                            'text_opacity':window.windowOpacity()}
         assert window.width()==360 and window.height()<210, report
-        compact_stats = (controller.compact_time, controller.compact_total,
+        compact_stats = (controller.compact_time, controller.compact_recent_minute,
                          controller.compact_average, controller.compact_recent_six)
         assert all(widget.isVisibleTo(window) for widget in compact_stats), report
         assert 220 <= report['display']['background_alpha'] <= 235, report
@@ -91,7 +91,7 @@ def run_offline_diagnostics(application, report_path):
         report['display']['full_size']=[window.width(),window.height()]
         window.grab().save(str(report_path.with_name(report_path.stem+'-full.png')))
         assert window.width()==640 and window.height()<480, report
-        full_stats = (controller.timer_label, controller.total_label,
+        full_stats = (controller.timer_label, controller.recent_minute,
                       controller.minute_label, controller.recent_six)
         assert all(widget.isVisibleTo(window) for widget in (*full_stats, controller.repeat_settings_button)), report
         assert controller.session is original_session and bridge.process.processId()==original_helper, report

@@ -1,4 +1,5 @@
 """Planet EXP tracker: local screen capture, OCR and conservative session accounting."""
+import bisect
 import csv
 import ctypes
 import json
@@ -22,10 +23,16 @@ RESOURCES = Path(getattr(sys, '_MEIPASS', Path(__file__).resolve().parent))
 BASE = Path(os.environ.get('PLANET_EXP_DATA_DIR') or (
     Path.home()/'Library'/'Application Support'/'Maple Planet Helper Auto Trial'
     if sys.platform == 'darwin' else Path(__file__).resolve().parent))
-APP_VERSION = '1.4.15'
+APP_VERSION = '1.4.16'
 MAX_BOUNDARY_GAP = 10.0
 BURNING_MAX_LEVEL = 120  # Planet Up & Up grants one bonus level, capped at 120.
-IDLE_AFTER = 60.0  # no EXP gain for longer than this counts as a break
+REST_AFTER = 180.0  # EXP unchanged this long: rest counted from the last gain
+HUNT_WINDOW_KEEP = 420.0  # hunting seconds of gain points kept for the 1·6 minute windows
+
+
+def rest_seconds(stretch):
+    """A stretch without EXP is rest only once it reaches REST_AFTER, then all of it."""
+    return stretch if stretch >= REST_AFTER else 0.0
 try:
     EXP_METADATA = json.loads((RESOURCES/'exp_table.json').read_text(encoding='utf-8'))
     EXP_TABLE = {int(level): int(value) for level, value in EXP_METADATA['required'].items()}
@@ -459,7 +466,8 @@ class Session:
         self.valid_minute = {'one': None, 'six': None}
         self.level_ups = []
         self.first_gain = 0  # EXP of the packet that started the hunt timer
-        self.idle_closed = 0.0  # finished breaks (seconds beyond IDLE_AFTER)
+        self.idle_closed = 0.0  # finished rests (whole stretches of REST_AFTER or longer)
+        self.hunt_points = []  # (hunting seconds, counted EXP gain) at each gain
         self.last_gain_at = None
         self.gap_closed = 0.0
         self.gap_gain = 0
@@ -576,18 +584,41 @@ class Session:
             return
         if self.last_gain_at is None:
             self.last_gain_at = stamp
+            self.hunt_points.append((0.0, exp-self.first[0]))
         elif self.samples:
             previous_stamp, previous_exp = self.samples[-1]
             span = round(stamp-previous_stamp, 3)
             if span > MAX_BOUNDARY_GAP or boundary:
-                self.idle_closed += max(0.0, previous_stamp-self.last_gain_at-IDLE_AFTER)
+                self.idle_closed += rest_seconds(previous_stamp-self.last_gain_at)
                 self.gap_closed += span
                 self.gap_gain += max(0, exp-previous_exp)
                 self.last_gap = (previous_stamp, stamp)
                 self.last_gain_at = stamp
+                self._add_hunt_point(stamp, exp)
             elif exp > previous_exp:
-                self.idle_closed += max(0.0, stamp-self.last_gain_at-IDLE_AFTER)
+                self.idle_closed += rest_seconds(stamp-self.last_gain_at)
                 self.last_gain_at = stamp
+                self._add_hunt_point(stamp, exp)
+
+    def _add_hunt_point(self, stamp, exp):
+        # EXP missed during observation gaps is left out, like the cumulative average.
+        hunted = max(0.0, stamp-self.started-self.gap_closed-self.idle_closed)
+        self.hunt_points.append((hunted, exp-self.first[0]-self.gap_gain))
+        while len(self.hunt_points) > 2 and self.hunt_points[1][0] < hunted-HUNT_WINDOW_KEEP:
+            self.hunt_points.pop(0)
+
+    def hunt_gain(self, seconds, now):
+        """EXP gained over the last `seconds` of hunting time (rests skipped).
+
+        Returns (gain, covered seconds) or None before the first gain."""
+        if self.started is None or not self.hunt_points:
+            return None
+        hunted = self.active_elapsed(now)
+        times = [point[0] for point in self.hunt_points]
+        def gained_at(moment):
+            return self.hunt_points[max(0, bisect.bisect_right(times, moment)-1)][1]
+        start = max(0.0, hunted-seconds)
+        return max(0, gained_at(hunted)-gained_at(start)), hunted-start
 
     def gap_seconds(self, now):
         if self.started is None or not self.samples:
@@ -604,7 +635,7 @@ class Session:
         """Breaks are inferred only through the last normal observation."""
         if self.started is None or self.last_gain_at is None:
             return 0.0
-        return self.idle_closed+max(0.0, self.observation_end(stamp)-self.last_gain_at-IDLE_AFTER)
+        return self.idle_closed+rest_seconds(self.observation_end(stamp)-self.last_gain_at)
 
     def idle(self, now):
         return self.idle_until(now)
@@ -612,7 +643,7 @@ class Session:
     def resting(self, now):
         return (self.ended is None and self.last_gain_at is not None and self.samples
                 and now-self.samples[-1][0] <= MAX_BOUNDARY_GAP
-                and self.samples[-1][0]-self.last_gain_at > IDLE_AFTER)
+                and self.samples[-1][0]-self.last_gain_at >= REST_AFTER)
 
     def active_elapsed(self, now):
         if self.started is None:

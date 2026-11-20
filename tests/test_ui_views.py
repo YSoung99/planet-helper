@@ -30,6 +30,38 @@ class ViewTests(unittest.TestCase):
         self.assertFalse(clean['always_on_top']);self.assertFalse(clean['compact']);self.assertIsNone(warning)
         self.c.toggle_display();self.assertLess(self.c.window.height(),205)
 
+    def test_level_eta_shows_arrival_clock(self):
+        from datetime import datetime
+        from types import SimpleNamespace
+        from qt_controller import level_eta_text
+        session=SimpleNamespace(level=150,total=1_000_000,last=(400_000,0),level_ups=[])
+        rate={'status':'ready','cumulative':2_500}
+        now=datetime(2026,11,20,13,30)
+        self.assertEqual(level_eta_text(rate,session,compact=True,now=now),'Lv.150 시간당 15만 · 레벨업 4시간 0분 (17:30)')
+        self.assertIn('레벨업까지 4시간 0분 · 17:30쯤',level_eta_text(rate,session,now=now))
+        late=datetime(2026,11,20,22,0)
+        self.assertIn('(내일 02:00)',level_eta_text(rate,session,compact=True,now=late))
+        rate['cumulative']=100
+        self.assertIn('(11/24 17:30)',level_eta_text(rate,session,compact=True,now=now))
+
+    def test_pin_button_is_reachable_in_both_views(self):
+        c=self.c
+        self.assertTrue(c.compact);self.assertTrue(c.pin_button.isVisibleTo(c.window))
+        self.assertEqual(c.header_layout.indexOf(c.pin_button),c.header_layout.indexOf(c.mode_button)-1)
+        c.pin_button.click();self.assertFalse(c.always_on_top);self.assertEqual(c.pin_button.text(),'맨 위 끔')
+        c.toggle_display()
+        self.assertTrue(c.pin_button.isVisibleTo(c.window))
+        self.assertEqual(c.character_controls.indexOf(c.pin_button),3)
+
+    def test_compact_view_keeps_new_measurement_button(self):
+        c=self.c
+        self.assertTrue(c.compact);self.assertTrue(c.reset_button.isVisibleTo(c.window))
+        self.assertEqual(c.repeat_controls.indexOf(c.reset_button),1)
+        c.toggle_display()
+        self.assertEqual(c.measurement_controls.indexOf(c.reset_button),1)
+        c.toggle_display()
+        self.assertEqual(c.repeat_controls.indexOf(c.reset_button),1)
+
     def test_jev_status_belongs_to_the_current_measurement_in_both_views(self):
         c = self.c
         session_id = c.session.session_id
@@ -153,6 +185,8 @@ class ViewTests(unittest.TestCase):
         self.assertEqual(c.compact_six_heading.text(), '6분 예상 · 1/6분')
         self.assertEqual(c.compact_recent_six.text(), '36,000')
         self.assertEqual(c.compact_recent_six.text(), c.recent_six.text())
+        self.assertEqual(c.compact_recent_minute.text(), c.recent_minute.text())
+        self.assertNotIn(c.compact_recent_minute.text(), ('—', ''))
         for stamp in range(72,368,5):
             session.accept((172680132+(stamp-1)*100,42.55),stamp)
         with patch('time.monotonic',return_value=367):
@@ -164,8 +198,9 @@ class ViewTests(unittest.TestCase):
             session.accept((172680132+(stamp-1)*100,42.55),stamp)
         with patch('time.monotonic',return_value=427):
             c.poll()
-        self.assertEqual(c.compact_recent_six.text(), '미확정')
-        self.assertEqual(c.recent_six.text(), '미확정')
+        # A 20s observation gap: its time and its EXP are both left out of the window.
+        self.assertEqual(c.compact_recent_six.text(), c.recent_six.text())
+        self.assertEqual(c.compact_recent_six.text(), '36,000')
 
     def test_worker_corroboration_reaches_small_decrease_safe_stop(self):
         c=self.c;s=c.session
@@ -195,7 +230,7 @@ class ViewTests(unittest.TestCase):
         self.assertIsNotNone(s.ended)
         self.assertEqual(s.stats(6)[0],5000)
         self.assertIn('감소 충돌',c.footer.text())
-        self.assertIn('확인 필요',c.compact_total.toolTip())
+        self.assertIn('확인 필요',c.total_label.toolTip())
         c.save_warning='자동 저장 실패'
         c.audit_warning='진단 저장 실패'
         c.poll()
