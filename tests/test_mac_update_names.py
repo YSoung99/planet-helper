@@ -1,9 +1,11 @@
 import plistlib
 import subprocess
 import tempfile
+import unicodedata
 import unittest
 from pathlib import Path
 from unittest import mock
+from urllib.parse import unquote
 
 import mac_updates
 import tracker
@@ -15,7 +17,8 @@ def make_app(folder, name, version='1.4.10'):
     app = Path(folder) / name
     (app / 'Contents').mkdir(parents=True)
     with (app / 'Contents' / 'Info.plist').open('wb') as stream:
-        plistlib.dump({'CFBundleShortVersionString': version}, stream)
+        plistlib.dump({'CFBundleShortVersionString': version,
+                       'CFBundleIdentifier': mac_updates.BUNDLE_ID}, stream)
     return app
 
 
@@ -55,7 +58,7 @@ class VersionedNameTests(unittest.TestCase):
 
 
 class SwapScriptTests(unittest.TestCase):
-    def run_swap(self, root, target, candidate_ok=True):
+    def run_swap(self, root, target, candidate_ok=True, dock=None):
         app = make_app(root, '플래닛 도우미 자동인식 시험용.app', '1.4.9')
         stage = root / 'stage'
         stage.mkdir()
@@ -65,6 +68,9 @@ class SwapScriptTests(unittest.TestCase):
         log = root / 'opened.txt'
         script = SWAP.read_text().replace('/usr/bin/open -n --env "PLANET_EXP_DATA_DIR=$data"',
                                           f'echo >> "{log}"')
+        # The real Dock is never touched: a plist file stands in for its preferences.
+        dock = dock or root / 'dock.plist'
+        script = script.replace('com.apple.dock', f'"{dock}"').replace('/usr/bin/killall Dock', 'true')
         swap = root / 'swap.sh'
         swap.write_text(script)
         result = subprocess.run(['/bin/sh', str(swap), '999999', str(app), str(candidate), str(backup),
@@ -91,6 +97,28 @@ class SwapScriptTests(unittest.TestCase):
             self.assertEqual(mac_updates.app_version(app), '1.4.9')
             self.assertFalse(target.exists())
             self.assertEqual(log.read_text().split('\n')[0], str(app))
+
+    def test_pinned_icon_moves_to_the_new_version(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            dock = root / 'dock.plist'
+            old = {'bundle-identifier': mac_updates.BUNDLE_ID, 'file-label': '플래닛 도우미 1.4.9',
+                   'book': b'old', 'file-data': {'_CFURLString': 'file:///old/', '_CFURLStringType': 15}}
+            other = {'bundle-identifier': 'com.example.other', 'file-label': '다른 앱',
+                     'file-data': {'_CFURLString': 'file:///Applications/Other.app/', '_CFURLStringType': 15}}
+            with dock.open('wb') as stream:
+                plistlib.dump({'persistent-apps': [{'tile-data': other}, {'tile-data': old}]}, stream)
+            target = root / '플래닛 도우미 1.4.10.app'
+            result = self.run_swap(root, target, dock=dock)[3]
+            self.assertEqual(result.returncode, 0, result.stderr)
+            with dock.open('rb') as stream:
+                tiles = [tile['tile-data'] for tile in plistlib.load(stream)['persistent-apps']]
+            self.assertEqual(tiles[0], other)
+            self.assertEqual(tiles[1]['file-label'], '플래닛 도우미 1.4.10')
+            # macOS writes the decomposed (NFD) Hangul form, as the Dock itself does.
+            url = unquote(tiles[1]['file-data']['_CFURLString'])
+            self.assertEqual(unicodedata.normalize('NFC', url), unquote(target.as_uri()) + '/')
+            self.assertNotIn('book', tiles[1])
 
 
 if __name__ == '__main__':
