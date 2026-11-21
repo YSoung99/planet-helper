@@ -1,5 +1,6 @@
 import plistlib
 import subprocess
+import sys
 import tempfile
 import unicodedata
 import unittest
@@ -98,6 +99,7 @@ class SwapScriptTests(unittest.TestCase):
             self.assertFalse(target.exists())
             self.assertEqual(log.read_text().split('\n')[0], str(app))
 
+    @unittest.skipUnless(sys.platform == 'darwin', 'the Dock and its plist tools exist only on macOS')
     def test_pinned_icon_moves_to_the_new_version(self):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
