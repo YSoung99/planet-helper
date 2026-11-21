@@ -153,7 +153,7 @@ class RecordDialogRenameTests(unittest.TestCase):
         self.assertEqual(record_history.load_character_names(), {'20261118-200000-1': '곰곰스렁'})
 
     def test_memo_edit_still_saves(self):
-        self.table.item(1, 7).setText('사자왕의 성 · 낮은 성벽2')
+        self.table.item(1, 8).setText('사자왕의 성 · 낮은 성벽2')
         self.settle()
         self.assertEqual(record_history.load_memos(), {'20261118-200000-1': '사자왕의 성 · 낮은 성벽2'})
 

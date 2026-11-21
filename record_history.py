@@ -93,7 +93,7 @@ def summarize(csv_path):
     import segments
     return dict(session_id=csv_path.stem, started=started, level=level, active=active, idle=idle,
                 character_name=session.character_name or assigned, exp_buff_intervals=session.exp_buff_intervals,
-                level_ups=len(session.level_ups),
+                level_ups=len(session.level_ups), meso=session.meso.hunted(), meso_trade=session.meso.trade,
                 gained=gained, per_minute=rate['cumulative'], rate_gain=rate['rate_gain'],
                 rate_seconds=rate['duration'], gap=session.gap_seconds(0.0), gap_gain=session.gap_gain,
                 blocked=session.blocked, stop_reason=session.stop_reason,
@@ -466,6 +466,19 @@ def level_ranking(rows):
             for level, (gained, active, count) in sorted(groups.items(), reverse=True) if active]
 
 
+def meso_cell(row):
+    return '—' if row.get('meso') is None else f"{row['meso']:+,}"
+
+
+def meso_detail(row):
+    if row.get('meso') is None:
+        return '메소 · 측정 시작과 끝에 인벤토리를 열지 않아 확인 안 됨'
+    trade = row.get('meso_trade') or 0
+    per_minute = row['meso']*60/row['active'] if row['active'] else None
+    text = f"메소 {row['meso']:+,}" + (f' · 분당 {per_minute:,.0f}' if per_minute is not None else '')
+    return text + (f' (거래·구매 {trade:+,} 제외)' if trade else '')
+
+
 def row_details(row, buff_times):
     """Tooltip with the columns the table no longer shows."""
     from qt_controller import short_exp
@@ -482,6 +495,7 @@ def row_details(row, buff_times):
     else:
         lines.append(f"효율 변화 {change_text(row['changes'])}")
     lines.append(f"경험치 버프 {buff_times.replace(chr(10), ' / ') or '확인된 구간 없음'}")
+    lines.append(meso_detail(row))
     return '\n'.join(lines)
 
 
@@ -538,7 +552,7 @@ def build_dialog(controller):
     records_page = QWidget(); records_layout = QVBoxLayout(records_page)
     records_layout.setContentsMargins(0, 10, 0, 0); records_layout.setSpacing(8)
     chart_layout = QVBoxLayout(); records_layout.addLayout(chart_layout)
-    headers = ['날짜', '캐릭터', 'Lv', '순수 사냥', '획득', '분당', '관측 중 사냥', '사냥터 메모']
+    headers = ['날짜', '캐릭터', 'Lv', '순수 사냥', '획득', '분당', '관측 중 사냥', '메소', '사냥터 메모']
     memo_column = len(headers)-1
     character_column = 1
     rate_column, ratio_column = 5, 6
@@ -689,7 +703,8 @@ def build_dialog(controller):
             details = row_details(row, buff_times)
             cells = [row['started'].strftime('%m/%d %H:%M') if row['started'] else row['session_id'],
                      row['character_name'] or '—', str(row['level'] or '—'), clock(row['active']),
-                     short_exp(row['gained']), warning or f"{rate:,.0f}", f"{ratio(row):.0f}%", row['memo']]
+                     short_exp(row['gained']), warning or f"{rate:,.0f}", f"{ratio(row):.0f}%", meso_cell(row),
+                     row['memo']]
             for column, text in enumerate(cells):
                 item = QTableWidgetItem(text)
                 item.setToolTip(details)

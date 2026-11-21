@@ -19,11 +19,13 @@ from datetime import datetime
 from collections import deque, Counter
 from pathlib import Path
 
+import meso
+
 RESOURCES = Path(getattr(sys, '_MEIPASS', Path(__file__).resolve().parent))
 BASE = Path(os.environ.get('PLANET_EXP_DATA_DIR') or (
     Path.home()/'Library'/'Application Support'/'Maple Planet Helper Auto Trial'
     if sys.platform == 'darwin' else Path(__file__).resolve().parent))
-APP_VERSION = '1.4.17'
+APP_VERSION = '1.4.18'
 MAX_BOUNDARY_GAP = 10.0
 BURNING_MAX_LEVEL = 120  # Planet Up & Up grants one bonus level, capped at 120.
 REST_AFTER = 180.0  # EXP unchanged this long: rest counted from the last gain
@@ -148,6 +150,12 @@ def load_settings(path):
             clean['cloud_remote'] = payload['cloud_remote']
         else:
             invalid.append('cloud_remote')
+    if 'meso_trade_threshold' in payload:
+        value = payload['meso_trade_threshold']
+        if type(value) is int and 0 < value <= 10**12:
+            clean['meso_trade_threshold'] = value
+        else:
+            invalid.append('meso_trade_threshold')
     if 'window_opacity' in payload:
         value = payload['window_opacity']
         if type(value) in (int, float) and math.isfinite(value) and .2 <= value <= 1.0:
@@ -441,6 +449,8 @@ class Session:
         self.character_conflict = False
         self.exp_buff_intervals = {}
         self.exp_buffs_dirty = False
+        self.meso = meso.SessionMeso()
+        self.meso_dirty = False
         self.session_id = time.strftime('%Y%m%d-%H%M%S') + f'-{time.time_ns()%1000000000:09d}'
         self.started = None
         self.rate_anchor = None
@@ -812,6 +822,7 @@ def load_saved_session(path, level, now):
     buffs = state.get('exp_buff_intervals_seconds')
     if isinstance(buffs, dict):
         session.exp_buff_intervals = buffs
+    session.meso = meso.SessionMeso(state.get('meso'))
     nickname = state.get('character_name')
     session.character_conflict = state.get('character_conflict') is True
     if isinstance(nickname, str) and not session.character_conflict:
@@ -1210,6 +1221,8 @@ class MeasurementCore:
                    'minute_snapshot':self.session.minute_result()}
         if self.session.exp_buff_intervals:
             summary['exp_buff_intervals_seconds'] = self.session.exp_buff_intervals
+        if self.session.meso.as_dict():
+            summary['meso'] = self.session.meso.as_dict()
         if self.session.character_name:
             summary['character_name'] = self.session.character_name
         if self.session.character_conflict:
@@ -1226,6 +1239,7 @@ class MeasurementCore:
         temp.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding='utf-8')
         temp.replace(folder/(self.session.session_id+'.json'))
         self.session.exp_buffs_dirty = False
+        self.session.meso_dirty = False
 
     def remember_accepted_capture(self, previous_value, details):
         if previous_value != self.session.last:

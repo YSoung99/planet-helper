@@ -30,6 +30,27 @@ class ViewTests(unittest.TestCase):
         self.assertFalse(clean['always_on_top']);self.assertFalse(clean['compact']);self.assertIsNone(warning)
         self.c.toggle_display();self.assertLess(self.c.window.height(),205)
 
+    def test_meso_readings_reach_the_log_session_and_detail_line(self):
+        c=self.c;c.toggle_display()
+        self.assertTrue(c.meso_label.isVisibleTo(c.window))
+        self.assertEqual(c.meso_label.text(),'메소 · 측정 중 인벤토리를 열면 기록')
+        for value in (1_000_000,1_000_000):c.meso_results.put((c.generation,value))
+        c.apply_meso_results(100.0)
+        self.assertEqual(c.meso_label.text(),'메소 1,000,000')
+        c.running=True
+        c.apply_meso_results(200.0)  # the reading from before the start becomes the starting meso
+        self.assertEqual(c.meso_label.text(),'메소 · 측정 시작과 끝에 인벤토리를 한 번씩 열어 주세요')
+        for value in (None,1_250_000,1_250_000):c.meso_results.put((c.generation,value))
+        c.apply_meso_results(300.0)
+        self.assertEqual(c.meso_label.text(),'메소 1,250,000 · 이번 사냥 +250,000')
+        for value in (3_250_000,3_250_000):c.meso_results.put((c.generation,value))
+        c.apply_meso_results(310.0)
+        self.assertEqual(c.meso_label.text(),'메소 3,250,000 · 이번 사냥 +250,000 (거래·구매 +2,000,000 제외)')
+        c.meso_results.put((c.generation-1,9));c.apply_meso_results(320.0)
+        import meso
+        self.assertEqual([value for _,_,value in meso.load(tracker.BASE)],[1_000_000,1_250_000,3_250_000])
+        c.toggle_display();self.assertFalse(c.meso_label.isVisibleTo(c.window))
+
     def test_level_eta_shows_arrival_clock(self):
         from datetime import datetime
         from types import SimpleNamespace

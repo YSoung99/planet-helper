@@ -26,6 +26,7 @@ import character_hud
 import exp_buffs
 import hunt_activity
 import map_name
+import meso
 import tracker
 from recent_exp import RecentExp
 
@@ -343,6 +344,12 @@ class SharedController(tracker.MeasurementCore):
         self.hunt_activity_lock = threading.Lock()
         self.hunt_activity_cache = {}
         self.character_results = queue.SimpleQueue()
+        self.meso_reader = meso.Reader()
+        self.meso_results = queue.SimpleQueue()
+        self.meso_confirmation = meso.Confirmation()
+        self.meso_logged = {}
+        self.meso_last_flush = float('-inf')
+        self.meso_seen_at = None
         self.character_candidate = (None, None)
         self.character_identity = (None, None)
         self.character_source = None
@@ -355,6 +362,7 @@ class SharedController(tracker.MeasurementCore):
         self.auto_start_hold = None
         self.jev_enabled = config.get('jev_enabled', False)
         self.current_character = config.get('current_character')
+        self.meso_trade_threshold = config.get('meso_trade_threshold', meso.TRADE_THRESHOLD)
         self.cloud_remote = config.get('cloud_remote')
         self.cloud_lock = threading.Lock()
         self.cloud_signals = CloudSignals()
@@ -775,6 +783,7 @@ class SharedController(tracker.MeasurementCore):
         burning.toggled.connect(self.set_burning)
         menu.addAction('이번 사냥터 메모', self.edit_memo)
         menu.addAction('JEV API 키 설정', self.api_key_settings)
+        menu.addAction('메소 거래·구매 기준 금액', self.meso_threshold_settings)
         menu.addAction('배경 투명도', self.opacity_settings)
         menu.addAction('기록 폴더 열기', self.open_records)
         backup_menu = menu.addMenu('기록 백업·옮기기')
@@ -808,6 +817,69 @@ class SharedController(tracker.MeasurementCore):
         self.buff_revision += 1
         self.buff_confirmation = exp_buffs.Confirmation()
         self.buff_label.setText(f'{label} 등록 완료 · 측정 중 확인')
+
+    def meso_threshold_settings(self):
+        from PySide6.QtWidgets import QInputDialog
+        value, ok = QInputDialog.getInt(
+            self.window, '메소 거래·구매 기준',
+            '측정 중 메소가 한 번에 이 금액보다 크게 바뀌면\n상점·거래로 보고 사냥 수익에서 뺍니다.',
+            self.meso_trade_threshold, 10_000, 10**12, 100_000)
+        if not ok: return
+        self.meso_trade_threshold = value
+        self.save_config()
+
+    def meso_character(self):
+        return self.session.character_name or getattr(self, 'current_character', None) or ''
+
+    MESO_START_WINDOW = 600.0
+
+    def apply_meso_results(self, now):
+        session = self.session
+        # A reading from shortly before the start counts as the starting meso.
+        if (self.running and session.meso.start is None and self.meso_seen_at is not None
+                and now - self.meso_seen_at <= self.MESO_START_WINDOW):
+            session.meso.observe(self.meso_confirmation.current, self.meso_trade_threshold)
+        while not self.meso_results.empty():
+            generation, value = self.meso_results.get_nowait()
+            if generation != self.generation:
+                continue
+            confirmed = self.meso_confirmation.observe(value)
+            if confirmed is None:
+                continue
+            self.meso_seen_at = now
+            character = self.meso_character()
+            if self.meso_logged.get(character) != confirmed:
+                try:
+                    meso.append(tracker.BASE, character, confirmed)
+                    self.meso_logged[character] = confirmed
+                except OSError as exc:
+                    tracker.log_error('메소 기록 저장', exc)
+                self.meso_today = meso.day_change(meso.load(tracker.BASE), character, datetime.now().date())
+            if self.running:
+                session.meso.observe(confirmed, self.meso_trade_threshold)
+                session.meso_dirty = True
+        if (self.running and session.meso_dirty and session.rows and not session.ledger_dirty
+                and now - self.meso_last_flush >= 10):
+            self.meso_last_flush = now
+            try:
+                self.save_summary()
+            except OSError as exc:
+                tracker.log_error('메소 기록 저장', exc)
+        self.meso_label.setText(self.meso_text())
+
+    def meso_text(self):
+        current = self.meso_confirmation.current
+        if self.running:
+            hunted = self.session.meso.hunted()
+            if hunted is None:
+                return '메소 · 측정 시작과 끝에 인벤토리를 한 번씩 열어 주세요'
+            trade = self.session.meso.trade
+            extra = f' (거래·구매 {trade:+,} 제외)' if trade else ''
+            return f'메소 {current:,} · 이번 사냥 {hunted:+,}{extra}'
+        if current is None:
+            return '메소 · 측정 중 인벤토리를 열면 기록'
+        today = getattr(self, 'meso_today', None)
+        return f'메소 {current:,}' + (f' · 오늘 {today:+,}' if today else '')
 
     def show_history(self):
         from record_history import build_dialog
@@ -1129,6 +1201,11 @@ class SharedController(tracker.MeasurementCore):
                 self.hunt_activity_results.put((generation, stamp, observation))
         except Exception as exc:
             tracker.log_error('사냥 신호 판독', exc)
+        try:
+            if map_name.available():
+                self.meso_results.put((generation, self.meso_reader.read(frame)))
+        except Exception as exc:
+            tracker.log_error('메소 판독', exc)
         try:
             if level_roi is not None:
                 identity = character_hud.read(frame, level_roi, style)
@@ -1523,6 +1600,7 @@ class SharedController(tracker.MeasurementCore):
                     except OSError as exc:
                         tracker.log_error('사냥 기록 캐릭터 저장', exc)
         self.apply_buff_results(now)
+        self.apply_meso_results(now)
         self.check_efficiency_change()
         self.apply_map_results()
         hunted = self.session.active_elapsed(now)
@@ -1613,6 +1691,7 @@ class SharedController(tracker.MeasurementCore):
                 'jev_enabled': self.jev_enabled, 'auto_measure': self.auto_measure,
                 'current_character': getattr(self, 'current_character', None),
                 'cloud_remote': getattr(self, 'cloud_remote', None),
+                'meso_trade_threshold': getattr(self, 'meso_trade_threshold', meso.TRADE_THRESHOLD),
             }), encoding='utf-8')
             temporary.replace(tracker.BASE/'settings.json')
         except OSError as exc:
