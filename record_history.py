@@ -267,13 +267,15 @@ def build_chart(rows):
                 painter.drawText(QRectF(0, y-8, self.LEFT-6, 16), Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter, short_exp(value))
             if not self.points:
                 painter.drawText(area, Qt.AlignmentFlag.AlignCenter, '기록 없음'); return
-            previous = None
+            previous, last_label = None, -1e9
             for index, row in enumerate(self.points):  # level changes and date labels
                 x = self.position(index, 0).x()
-                if previous is not None and row['level'] != previous:
+                # Skip level markers that would overlap the last one drawn.
+                if previous is not None and row['level'] != previous and x-last_label >= 56:
                     painter.setPen(QPen(QColor('#3d4b5a'), 1, Qt.PenStyle.DotLine))
                     painter.drawLine(QPointF(x, area.top()), QPointF(x, area.bottom()))
                     painter.setPen(QColor('#9aa8b6')); painter.drawText(QPointF(x+3, area.top()+10), f'Lv.{row["level"]}')
+                    last_label = x
                 previous = row['level']
             labels = {0, len(self.points)-1, len(self.points)//2}
             painter.setPen(QColor('#84919f'))
@@ -352,25 +354,151 @@ def buff_cell(intervals):
     return ' · '.join(labels) or '—', '\n'.join(lines)
 
 
+STYLE = '''
+QDialog {background:#151b24;} QLabel {color:#d5dee8;}
+QFrame#card {background:#1b2330; border-radius:10px;}
+QLabel#cardTitle, QLabel#hint, QLabel#statName {color:#84919f;}
+QLabel#statMain {color:#8fe0a8; font-size:22px; font-weight:600;}
+QLabel#stat {font-size:16px; font-weight:600;}
+QLabel#statName {font-size:11px;}
+QLabel#best {color:#e8d9a8;}
+QLabel#title {font-size:17px; font-weight:600;}
+QTabWidget::pane {border:none; border-top:1px solid #2b3542;}
+QTabBar {background:transparent;} QTabBar::tab {background:transparent; color:#84919f; padding:7px 16px; border:none;}
+QTabBar::tab:selected {color:#e8f0f6; border-bottom:2px solid #8fe0a8;}
+QTableWidget {background:#1b2330; alternate-background-color:#18202b; color:#d5dee8;
+              gridline-color:#232c38; border:none; border-radius:10px;}
+QTableWidget::item {padding:4px 6px;}
+QTableWidget::item:selected {background:#2d4a63;}
+QHeaderView::section {background:#25303d; color:#b8c4d0; border:none; padding:6px;}
+'''
+
+
+def stat_card(title):
+    """A summary card; returns (frame, update(summary, label)) for the filtered rows."""
+    from PySide6.QtWidgets import QFrame, QGridLayout, QLabel, QVBoxLayout
+    from qt_controller import short_exp
+    frame = QFrame(); frame.setObjectName('card')
+    layout = QVBoxLayout(frame); layout.setContentsMargins(14, 10, 14, 10); layout.setSpacing(4)
+    heading = QLabel(); heading.setObjectName('cardTitle'); layout.addWidget(heading)
+    grid = QGridLayout(); grid.setHorizontalSpacing(24); grid.setVerticalSpacing(0)
+    values = []
+    for column, name in enumerate(('획득 EXP', '분당 평균', '순수 사냥', '레벨업')):
+        value = QLabel(); value.setObjectName('statMain' if column == 0 else 'stat')
+        caption = QLabel(name); caption.setObjectName('statName')
+        grid.addWidget(value, 0, column); grid.addWidget(caption, 1, column); values.append(value)
+    grid.setColumnStretch(4, 1)
+    layout.addLayout(grid)
+    best = QLabel(); best.setObjectName('best'); layout.addWidget(best)
+
+    def update(summary):
+        heading.setText(f"{title} · {summary['count']}회" if summary['count'] else f'{title} · 사냥 기록 없음')
+        rate = summary['per_minute']
+        texts = (short_exp(summary['gained']) if summary['count'] else '—',
+                 f'{rate:,.0f}' if rate is not None else '—',
+                 clock(summary['active']) if summary['count'] else '—',
+                 f"{summary['level_ups']}회" if summary['count'] else '—')
+        for label, text in zip(values, texts): label.setText(text)
+        values[0].setToolTip(f"{summary['gained']:,} EXP")
+        if summary['best_spot']:
+            spot, spot_rate, _, _ = summary['best_spot']
+            best.setText(f'🏆 최고 효율 · {spot} (분당 {spot_rate:,.0f})')
+        else:
+            best.setText('사냥터 메모를 적으면 최고 효율 사냥터를 알려 드려요.')
+        if len(summary['characters']) > 1:
+            best.setToolTip(' / '.join(f'{name} {gained:,}' for name, gained in summary['characters']))
+    return frame, update
+
+
+def ranking_table(first_header):
+    """Rank / name / per-minute bar / hunting time / count."""
+    from PySide6.QtCore import Qt, QRectF
+    from PySide6.QtGui import QColor
+    from PySide6.QtWidgets import (QTableWidget, QHeaderView, QAbstractItemView, QStyledItemDelegate)
+
+    class BarDelegate(QStyledItemDelegate):
+        def paint(self, painter, option, index):
+            share = index.data(Qt.ItemDataRole.UserRole) or 0
+            box = QRectF(option.rect).adjusted(4, 6, -8, -6)
+            painter.save()
+            painter.fillRect(QRectF(box.left(), box.top(), box.width()*share, box.height()), QColor('#2a4a38'))
+            painter.setPen(QColor('#d5dee8'))
+            painter.drawText(box.adjusted(6, 0, 0, 0), Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+                             index.data())
+            painter.restore()
+
+    table = QTableWidget(0, 5)
+    table.setHorizontalHeaderLabels(['#', first_header, '분당 평균', '순수 사냥', '횟수'])
+    table.verticalHeader().setVisible(False)
+    table.setAlternatingRowColors(True); table.setShowGrid(False)
+    table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+    table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+    table.setItemDelegateForColumn(2, BarDelegate(table))
+    header = table.horizontalHeader()
+    header.setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+    header.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+    return table
+
+
+def fill_ranking(table, entries):
+    """entries: (name, per_minute, active seconds, count), best first."""
+    from PySide6.QtCore import Qt
+    from PySide6.QtWidgets import QTableWidgetItem
+    top = max((rate for _, rate, _, _ in entries), default=0) or 1
+    table.setRowCount(len(entries))
+    for index, (name, rate, active, count) in enumerate(entries):
+        cells = [str(index+1), name, f'{rate:,.0f}', clock(active), str(count)]
+        for column, text in enumerate(cells):
+            item = QTableWidgetItem(text)
+            if column == 2: item.setData(Qt.ItemDataRole.UserRole, rate/top)
+            if column in (0, 3, 4): item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            table.setItem(index, column, item)
+
+
+def level_ranking(rows):
+    """Like by_memo, but per level, highest level first."""
+    groups = {}
+    for row in comparable(rows):
+        if row['level'] is None: continue
+        gained, active, count = groups.get(row['level'], (0, 0.0, 0))
+        groups[row['level']] = (gained+row['rate_gain'], active+row['rate_seconds'], count+1)
+    return [(f'Lv.{level}', gained*60/active, active, count)
+            for level, (gained, active, count) in sorted(groups.items(), reverse=True) if active]
+
+
+def row_details(row, buff_times):
+    """Tooltip with the columns the table no longer shows."""
+    from qt_controller import short_exp
+    rate = row['per_minute']
+    lines = [f"휴식 {clock(row['idle']) if row['idle'] else '없음'} · 인식 공백 {clock(row['gap']) if row['gap'] else '없음'}"]
+    if row['gap']:
+        observed = row['active']+row['idle']
+        lines.append(f"관측률 {observed/(observed+row['gap'])*100:.0f}% · 공백 사이 증가분 {row['gap_gain']:,.0f} EXP"
+                     ' (총 획득에 포함, 효율에서 제외)')
+    if rate is not None and not row['blocked']:
+        lines.append(f'시간당 {short_exp(rate*60)}')
+    if row['blocked']:
+        lines.append(f"확인 필요 · {row['stop_reason']}")
+    else:
+        lines.append(f"효율 변화 {change_text(row['changes'])}")
+    lines.append(f"경험치 버프 {buff_times.replace(chr(10), ' / ') or '확인된 구간 없음'}")
+    return '\n'.join(lines)
+
+
 def build_dialog(controller):
+    from datetime import timedelta
     from PySide6.QtCore import Qt, QTimer
     from PySide6.QtGui import QColor
     from PySide6.QtWidgets import (QDialog, QVBoxLayout, QLabel, QTableWidget, QTableWidgetItem,
                                    QHeaderView, QAbstractItemView, QComboBox, QHBoxLayout,
-                                   QInputDialog, QMenu)
+                                   QInputDialog, QMenu, QTabWidget, QWidget)
     from qt_controller import short_exp
     dialog = QDialog(controller.window)
     dialog.setWindowTitle('사냥 기록 비교')
     dialog.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
-    dialog.resize(900, 700)
-    dialog.setStyleSheet('QDialog {background:#151b24;} QLabel {color:#d5dee8;}'
-                         'QTableWidget {background:#1b2330;color:#d5dee8;gridline-color:#2b3542;}'
-                         'QHeaderView::section {background:#25303d;color:#b8c4d0;border:none;padding:4px;}')
-    layout = QVBoxLayout(dialog)
-    hint = QLabel('분당 평균은 측정 화면과 같은 기준이에요. 인식 공백의 시간과 경험치는 효율에서 제외해요. '
-                  '캐릭터와 사냥터 메모는 두 번 눌러 고칠 수 있고, 여러 줄을 고른 뒤 오른쪽 클릭하면 한꺼번에 바꿀 수 있어요.')
-    hint.setWordWrap(True); layout.addWidget(hint)
-    spots = QLabel(); spots.setWordWrap(True); spots.setStyleSheet('color:#e8d9a8;')
+    dialog.resize(1000, 760)
+    dialog.setStyleSheet(STYLE)
+    layout = QVBoxLayout(dialog); layout.setContentsMargins(16, 14, 16, 12); layout.setSpacing(10)
     all_rows = collect()
     character_names = []
     character_picker = QComboBox()
@@ -392,37 +520,69 @@ def build_dialog(controller):
         character_picker.blockSignals(False)
 
     populate_picker(None)
-    period = QLabel(period_text(all_rows))
-    period.setStyleSheet('color:#a8d8b9;')
-    period.setAccessibleName('오늘·이번 주 요약')
-    layout.addWidget(period)
-    filter_row = QHBoxLayout()
-    filter_row.addWidget(QLabel('캐릭터'))
-    filter_row.addWidget(character_picker, 1)
-    layout.addLayout(filter_row)
-    layout.addWidget(spots)
-    chart_layout = QVBoxLayout()
-    layout.addLayout(chart_layout)
-    levels = QLabel()
-    levels.setWordWrap(True); levels.setStyleSheet('color:#9aa8b6;'); layout.addWidget(levels)
-    headers = ['날짜', '캐릭터', 'Lv', '순수 사냥', '휴식', '인식 공백', '관측 중 사냥', '획득', '분당', '시간당', '효율 변화', '경험치 버프', '사냥터 메모']
+    top = QHBoxLayout()
+    title = QLabel('사냥 기록'); title.setObjectName('title'); top.addWidget(title)
+    top.addStretch(1)
+    caption = QLabel('캐릭터'); caption.setObjectName('hint'); top.addWidget(caption)
+    character_picker.setMinimumWidth(180); top.addWidget(character_picker)
+    layout.addLayout(top)
+
+    cards = QHBoxLayout(); cards.setSpacing(12)
+    today_card, update_today = stat_card('오늘')
+    week_card, update_week = stat_card('이번 주 (월요일부터)')
+    for card in (today_card, week_card): cards.addWidget(card, 1)
+    for card in (today_card, week_card): card.setAccessibleName('오늘·이번 주 요약')
+    layout.addLayout(cards)
+
+    tabs = QTabWidget(); tabs.setDocumentMode(True); tabs.tabBar().setDrawBase(False)
+    records_page = QWidget(); records_layout = QVBoxLayout(records_page)
+    records_layout.setContentsMargins(0, 10, 0, 0); records_layout.setSpacing(8)
+    chart_layout = QVBoxLayout(); records_layout.addLayout(chart_layout)
+    headers = ['날짜', '캐릭터', 'Lv', '순수 사냥', '획득', '분당', '관측 중 사냥', '사냥터 메모']
     memo_column = len(headers)-1
     character_column = 1
+    rate_column, ratio_column = 5, 6
     editable_columns = (character_column, memo_column)
-    table = QTableWidget(0, len(headers))
+    table = QTableWidget(0, len(headers)); table.setObjectName('records')
     table.setHorizontalHeaderLabels(headers)
     table.verticalHeader().setVisible(False)
+    table.setAlternatingRowColors(True); table.setShowGrid(False)
     table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
     table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
     header = table.horizontalHeader()
     header.setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
     header.setSectionResizeMode(memo_column, QHeaderView.ResizeMode.Stretch)
+    records_layout.addWidget(table, 1)
+    empty = QLabel('표시할 사냥 기록이 아직 없어요.'); empty.setObjectName('hint')
+    records_layout.addWidget(empty)
+    hint = QLabel('ⓘ 줄에 마우스를 올리면 휴식 · 인식 공백 · 시간당 · 효율 변화 · 경험치 버프가 보여요. '
+                  '캐릭터와 사냥터 메모는 두 번 눌러 고치고, 여러 줄을 고른 뒤 오른쪽 클릭하면 한꺼번에 바꿔요. '
+                  '인식 공백의 시간과 경험치는 효율에서 제외해요.')
+    hint.setObjectName('hint'); hint.setWordWrap(True); records_layout.addWidget(hint)
+    tabs.addTab(records_page, '기록')
+
+    spot_table = ranking_table('사냥터')
+    spot_page = QWidget(); spot_layout = QVBoxLayout(spot_page); spot_layout.setContentsMargins(0, 10, 0, 0)
+    spot_layout.addWidget(spot_table, 1)
+    spot_hint = QLabel('띄어쓰기만 다른 사냥터 이름은 하나로 묶어요. 사냥터 메모를 적은 기록만 나와요.')
+    spot_hint.setObjectName('hint'); spot_layout.addWidget(spot_hint)
+    tabs.addTab(spot_page, '사냥터별')
+    level_table = ranking_table('레벨'); level_table.setColumnHidden(0, True)
+    level_page = QWidget(); level_layout = QVBoxLayout(level_page); level_layout.setContentsMargins(0, 10, 0, 0)
+    level_layout.addWidget(level_table, 1)
+    tabs.addTab(level_page, '레벨별')
+    layout.addWidget(tabs, 1)
 
     def refresh_spots():
         ranked = by_memo(rows)
-        spots.setText('사냥터별 분당 평균 · ' + ' / '.join(
-            f'{memo} {rate:,.0f} ({clock(active)}, {count}회)' for memo, rate, active, count in ranked)
-            if ranked else '사냥터 메모를 적으면 사냥터별 평균을 비교해 드려요.')
+        fill_ranking(spot_table, ranked)
+        tabs.setTabText(1, f'사냥터별 {len(ranked)}')
+
+    def refresh_summary():
+        now = datetime.now()
+        today = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        update_today(period_summary(rows, today))
+        update_week(period_summary(rows, today-timedelta(days=today.weekday())))
 
     def rename_characters(session_ids, name):
         try:
@@ -453,7 +613,7 @@ def build_dialog(controller):
         for index, row in enumerate(rows):
             table.item(index, memo_column).setText(row['memo'])
         table.blockSignals(False)
-        refresh_spots()
+        refresh_spots(); refresh_summary()
 
     def edited(item):
         session_id = item.data(Qt.ItemDataRole.UserRole)
@@ -506,7 +666,6 @@ def build_dialog(controller):
     table.customContextMenuRequested.connect(context_menu)
 
     rows = []
-    empty = QLabel('표시할 사냥 기록이 아직 없어요.')
 
     def render_records():
         nonlocal rows
@@ -515,8 +674,10 @@ def build_dialog(controller):
         if chart_layout.count():
             chart_layout.takeAt(0).widget().deleteLater()
         chart_layout.addWidget(build_chart(rows))
-        levels.setText('레벨별 분당 평균 · ' + ' / '.join(
-            f'Lv.{level} {rate:,.0f}' for level, rate in by_level(rows)))
+        levels = level_ranking(rows)
+        fill_ranking(level_table, levels)
+        tabs.setTabText(0, f'기록 {len(rows)}')
+        tabs.setTabText(2, f'레벨별 {len(levels)}')
         table.blockSignals(True)
         table.clearContents()
         table.setRowCount(len(rows))
@@ -524,18 +685,17 @@ def build_dialog(controller):
         for index, row in enumerate(rows):
             rate = row['per_minute']
             warning = '확인 필요' if row['blocked'] else '관측 부족' if rate is None else ''
-            buffs, buff_times = buff_cell(row['exp_buff_intervals'])
+            _, buff_times = buff_cell(row['exp_buff_intervals'])
+            details = row_details(row, buff_times)
             cells = [row['started'].strftime('%m/%d %H:%M') if row['started'] else row['session_id'],
-                     row['character_name'] or '—', str(row['level'] or '—'), clock(row['active']), clock(row['idle']) if row['idle'] else '—',
-                     clock(row['gap']) if row['gap'] else '—',
-                     f"{ratio(row):.0f}%",
-                     short_exp(row['gained']), warning or f"{rate:,.0f}", '—' if warning else short_exp(rate*60),
-                     '—' if row['blocked'] else change_text(row['changes']), buffs, row['memo']]
+                     row['character_name'] or '—', str(row['level'] or '—'), clock(row['active']),
+                     short_exp(row['gained']), warning or f"{rate:,.0f}", f"{ratio(row):.0f}%", row['memo']]
             for column, text in enumerate(cells):
                 item = QTableWidgetItem(text)
+                item.setToolTip(details)
                 if column not in editable_columns:
                     item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
-                    if column >= 5: item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+                    if column >= 4: item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
                 else:
                     item.setData(Qt.ItemDataRole.UserRole, row['session_id'])
                 if column == character_column:
@@ -544,29 +704,22 @@ def build_dialog(controller):
                         item.setToolTip(f"직접 고친 이름 · 자동 인식: {detected or '없음'}")
                     else:
                         item.setToolTip('두 번 눌러 고치기' if detected else '캐릭터 미확인 · 두 번 눌러 이름 적기')
-                if column == memo_column - 1:
-                    item.setToolTip(buff_times or '확인된 버프 구간 없음')
-                if column == 5 and row['gap']:
-                    observed = row['active']+row['idle']
-                    coverage = observed/(observed+row['gap'])*100
-                    item.setToolTip(f"관측률 {coverage:.0f}% · 공백 사이 증가분 {row['gap_gain']:,.0f} EXP\n"
-                                    '총 획득에 포함, 효율에서 제외')
-                if column == 6 and ratio(row) < 50:
+                    if not row['character_name']: item.setForeground(QColor('#84919f'))
+                if column == memo_column:
+                    item.setToolTip('두 번 눌러 사냥터 적기' if not row['memo'] else details)
+                if column == ratio_column and ratio(row) < 50:
                     item.setForeground(QColor('#e7b86e'))
-                if column == 8 and row['blocked']:
+                if column == rate_column and row['blocked']:
                     item.setForeground(QColor('#e7b86e'))
-                    item.setToolTip(row['stop_reason'])
-                if column == 8 and not warning and rate == best:
+                if column == rate_column and not warning and rate == best:
                     item.setForeground(QColor('#8fe0a8'))
                 table.setItem(index, column, item)
         table.blockSignals(False)
         empty.setVisible(not rows)
-        refresh_spots()
+        refresh_spots(); refresh_summary()
 
     table.itemChanged.connect(edited)
     character_picker.currentIndexChanged.connect(render_records)
-    layout.addWidget(table)
-    layout.addWidget(empty)
     session_name = controller.session.character_name or getattr(controller, 'current_character', None)
     if session_name in character_names:
         character_picker.setCurrentIndex(character_picker.findData(session_name))

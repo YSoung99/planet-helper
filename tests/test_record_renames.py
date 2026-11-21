@@ -79,7 +79,7 @@ class RecordDialogRenameTests(unittest.TestCase):
         self.dialog = record_history.build_dialog(controller)
         self.addCleanup(self.dialog.close)
         from PySide6.QtWidgets import QTableWidget, QComboBox
-        self.table = self.dialog.findChild(QTableWidget)
+        self.table = self.dialog.findChild(QTableWidget, 'records')
         self.picker = self.dialog.findChild(QComboBox)
 
     def settle(self):
@@ -104,7 +104,7 @@ class RecordDialogRenameTests(unittest.TestCase):
         controller = SimpleNamespace(window=None, session=SimpleNamespace(character_name=None))
         self.dialog = record_history.build_dialog(controller)
         from PySide6.QtWidgets import QTableWidget
-        self.table = self.dialog.findChild(QTableWidget)
+        self.table = self.dialog.findChild(QTableWidget, 'records')
         self.table.item(2, 1).setText('')
         self.settle()
         self.assertEqual(record_history.load_character_names(), {})
@@ -132,7 +132,7 @@ class RecordDialogRenameTests(unittest.TestCase):
         with patch('PySide6.QtWidgets.QMenu', FakeMenu), patch('PySide6.QtWidgets.QInputDialog', FakeInput):
             self.dialog = record_history.build_dialog(controller)
         from PySide6.QtWidgets import QTableWidget, QComboBox
-        self.table = self.dialog.findChild(QTableWidget)
+        self.table = self.dialog.findChild(QTableWidget, 'records')
         self.picker = self.dialog.findChild(QComboBox)
         selection = self.table.selectionModel()
         for row in rows:
@@ -153,7 +153,7 @@ class RecordDialogRenameTests(unittest.TestCase):
         self.assertEqual(record_history.load_character_names(), {'20261118-200000-1': '곰곰스렁'})
 
     def test_memo_edit_still_saves(self):
-        self.table.item(1, 12).setText('사자왕의 성 · 낮은 성벽2')
+        self.table.item(1, 7).setText('사자왕의 성 · 낮은 성벽2')
         self.settle()
         self.assertEqual(record_history.load_memos(), {'20261118-200000-1': '사자왕의 성 · 낮은 성벽2'})
 
