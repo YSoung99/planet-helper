@@ -108,7 +108,18 @@ def has_label(frame, box):
     scale = max(1, round(40 / max(1, h)))
     crop = ImageOps.expand(crop.convert('RGB').resize((crop.width * scale, crop.height * scale),
                                                       Image.Resampling.LANCZOS), border=12, fill=(0, 0, 0))
-    return any('메소' in text for text, _ in map_name.recognize_lines(crop, detect=True))
+    if any('메소' in text for text, _ in map_name.recognize_lines(crop, detect=True)):
+        return True
+
+    # The new UI's bright strip can start inside the label button itself.
+    # At native scale the detector may skip the white glyphs on that grey button.
+    if scale > 1:
+        return False
+    label = frame.crop((x, y, min(width, x + round(h * 1.55)), y + h)).convert('RGB')
+    enlarged = label.resize((label.width * 2, label.height * 2), Image.Resampling.LANCZOS)
+    enlarged = ImageOps.expand(enlarged, border=12, fill=(0, 0, 0))
+    return any(''.join(text.split()) == '메소' and score >= MIN_SCORE
+               for text, score in map_name.recognize_lines(enlarged, detect=True))
 
 
 class Reader:
@@ -178,6 +189,7 @@ class Confirmation:
         self.pending = None
         self.count = 0
         self.last_stamp = None
+        self.pending_since = self.first_seen = None
 
     def observe(self, value, stamp=None):
         """Return the value once it is trusted (again on every later sighting), or None."""
@@ -193,14 +205,20 @@ class Confirmation:
             return None
         if value == self.current:
             self.pending, self.count = None, 0
+            self.first_seen = stamp
             return value
-        self.count = self.count + 1 if value == self.pending else 1
+        if value == self.pending:
+            self.count += 1
+        else:
+            self.count = 1
+            self.pending_since = stamp
         self.pending = value
         needed = 2
         if self.current and value and max(value, self.current) >= JUMP_RATIO * min(value, self.current):
             needed = 3
         if self.count >= needed:
             self.current, self.pending, self.count = value, None, 0
+            self.first_seen = self.pending_since
             return value
         return None
 
@@ -317,9 +335,10 @@ class SessionMeso:
         self.end = value
         self.readings += 1
 
-    def sample(self, value, source, stamp, opening, started, threshold):
+    def sample(self, value, source, stamp, opening, started, threshold, *, first_seen=None):
         if self.source is None:
-            if not 0 <= stamp - started <= START_WINDOW:
+            start_seen = stamp if first_seen is None else first_seen
+            if not started <= start_seen <= min(stamp, started + START_WINDOW):
                 return False
             self.source = source
         if not self.check_source(source):

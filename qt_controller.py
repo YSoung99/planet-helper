@@ -345,6 +345,7 @@ class SharedController(tracker.MeasurementCore):
         self.hunt_activity_cache = {}
         self.character_results = queue.SimpleQueue()
         self.meso_reader = meso.Reader()
+        self.meso_capture_lock = threading.Lock()
         self.meso_results = queue.SimpleQueue()
         self.meso_confirmation = meso.Confirmation()
         self.meso_log = meso.DailyLog()
@@ -893,6 +894,13 @@ class SharedController(tracker.MeasurementCore):
     def apply_meso_results(self, now, *, finishing=False):
         session = self.session
         character = self.meso_character()
+        pending_start = session.meso_start_frame
+        if pending_start is not None:
+            stamp, frame, window = pending_start
+            if finishing or not self.running or now - stamp > meso.END_WINDOW:
+                session.meso_start_frame = None
+            elif self.queue_meso_frame(self.generation, stamp, frame, window):
+                session.meso_start_frame = None
         if self.meso_source is not None and self.meso_source[:2] != (self.generation, character):
             self.clear_meso_confirmation(None)
         if session.meso.source is not None and session.meso.source[:2] != (self.generation, character):
@@ -900,8 +908,8 @@ class SharedController(tracker.MeasurementCore):
         while not self.meso_results.empty():
             generation, window, stamp, observed_character, value = self.meso_results.get_nowait()
             if (not self.running or generation != self.generation or character is None
-                    or observed_character != character or window is None or stamp < session.created_monotonic
-                    or stamp < now - meso.END_WINDOW):
+                    or observed_character != character or window is None or session.meso_start_at is None
+                    or stamp < session.meso_start_at or stamp < now - meso.END_WINDOW):
                 continue
             source = generation, character, window
             session.meso.check_source(source)
@@ -920,8 +928,8 @@ class SharedController(tracker.MeasurementCore):
             except OSError as exc:
                 tracker.log_error('메소 기록 저장', exc)
             session.meso_dirty |= session.meso.sample(
-                confirmed, source, stamp, self.meso_opening, session.created_monotonic,
-                self.meso_trade_threshold)
+                confirmed, source, stamp, self.meso_opening, session.meso_start_at,
+                self.meso_trade_threshold, first_seen=self.meso_confirmation.first_seen)
         if (not finishing and self.running and session.meso_dirty and session.rows and not session.ledger_dirty
                 and now - self.meso_last_flush >= 10):
             self.meso_last_flush = now
@@ -948,7 +956,8 @@ class SharedController(tracker.MeasurementCore):
         if balance.source_changed:
             return '시작·종료 잔액 확인 불가 · 캐릭터 또는 게임 창 변경'
         start = '시작 잔액 확인' if balance.start is not None else '시작 잔액 대기'
-        if self.running and balance.start is None and now - self.session.created_monotonic > meso.START_WINDOW:
+        if (self.running and balance.start is None and self.session.meso_start_at is not None
+                and now - self.session.meso_start_at > meso.START_WINDOW):
             start = '시작 잔액 확인 시간 지남'
         end = balance.end_ready(self.meso_source, now) if self.running else balance.complete
         return start + (' · 종료 잔액 확인' if end else ' · 종료 잔액 대기')
@@ -1219,6 +1228,7 @@ class SharedController(tracker.MeasurementCore):
             return
         buffer.clear()
         self.session = session
+        session.meso_start_at = now
         self.recent_start_source = source
         self.level_var.set(level)
         exp, pct = session.last
@@ -1245,12 +1255,18 @@ class SharedController(tracker.MeasurementCore):
             self.capture_clients.client = self.capture_module().WindowCapture(**self.CAPTURE_OPTIONS)
         stamp = time.monotonic()
         generation = self.generation
-        probe = ((map_name.available() if recent else self.buff_has_templates or map_name.available())
+        session = self.session
+        models_available = map_name.available()
+        probe = ((models_available or (not recent and self.buff_has_templates))
                  and not self.hunt_activity_lock.locked()
                  and stamp >= getattr(self.capture_clients, 'next_activity_scan', 0)
                  and (not recent or stamp >= self.character_recheck_at))
-        starting = not recent and (self.session.started is None or self.recent_start_source is not None)
-        include_full = starting or probe
+        meso_probe = (not recent and models_available and session.meso_start_at is not None
+                      and session.meso_start_frame is None and not self.meso_capture_lock.locked()
+                      and (generation != getattr(self.capture_clients, 'meso_generation', None)
+                           or stamp >= getattr(self.capture_clients, 'next_meso_scan', 0)))
+        starting = not recent and (session.started is None or self.recent_start_source is not None)
+        include_full = starting or probe or meso_probe
         if self.auto_hud:
             from auto_hud import AutomaticCapture, HudLocator
             if not hasattr(self.capture_clients,'automatic'):
@@ -1265,19 +1281,26 @@ class SharedController(tracker.MeasurementCore):
             roi = dict(self.window_region) if self.window_region is not None else None
             image = self.capture_clients.client.snapshot(roi=roi, legacy_region=legacy_region if roi is None else None,
                                                          include_full=include_full)
+        full = image.info.get('full_game_image')
+        observed_at = (stamp + time.monotonic()) / 2
+        window = image.info.get('window_id')
+        if meso_probe and full is not None and window is not None:
+            if self.queue_meso_frame(generation, observed_at, full, window):
+                self.capture_clients.meso_generation = generation
+                waiting_for_start = (session.meso.start is None
+                                     and stamp - session.meso_start_at <= meso.START_WINDOW)
+                interval = 1.0 if waiting_for_start else hunt_activity.SCAN_INTERVAL
+                self.capture_clients.next_meso_scan = stamp + interval
         if probe:
             self.capture_clients.next_activity_scan = stamp + hunt_activity.SCAN_INTERVAL
-            full = image.info.get('full_game_image')
             if full is not None and self.hunt_activity_lock.acquire(blocking=False):
-                observed_at = (stamp + time.monotonic()) / 2
                 try:
                     level_roi = image.info.get('level_region')
                     style = image.info.get('ui_kind')
-                    window = image.info.get('window_id')
                     if not self.character_read_needed(generation, window, stamp):
                         level_roi = None
                     threading.Thread(target=self.read_hunt_activity,
-                                     args=(generation, observed_at, full, window, level_roi, style, self.meso_character(), recent),
+                                     args=(generation, observed_at, full, window, level_roi, style, recent),
                                      name='hunt-activity', daemon=True).start()
                 except RuntimeError as exc:
                     self.hunt_activity_lock.release()
@@ -1286,7 +1309,42 @@ class SharedController(tracker.MeasurementCore):
             image.info.pop('full_game_image', None)
         return image
 
-    def read_hunt_activity(self, generation, stamp, frame, window, level_roi, style, character=None, recent=False):
+    def start_meso_capture(self, generation, stamp, details):
+        full = details.get('full_game_image')
+        window = details.get('window_id')
+        if full is not None and window is not None and map_name.available():
+            if not self.queue_meso_frame(generation, stamp, full, window):
+                self.session.meso_start_frame = stamp, full, window
+        self.session.meso_start_at = stamp
+
+    def queue_meso_frame(self, generation, stamp, frame, window):
+        if not self.meso_capture_lock.acquire(blocking=False):
+            return False
+        try:
+            threading.Thread(target=self.read_meso_frame,
+                             args=(generation, stamp, frame, window, self.meso_character()),
+                             name='meso-reader', daemon=True).start()
+        except RuntimeError as exc:
+            self.meso_capture_lock.release()
+            tracker.log_error('메소 판독 시작', exc)
+            return False
+        return True
+
+    def read_meso_frame(self, generation, stamp, frame, window, character):
+        try:
+            if generation == self.generation:
+                source = generation, window
+                if self.meso_reader_source != source:
+                    self.meso_reader = meso.Reader()
+                    self.meso_reader_source = source
+                value = self.meso_reader.read(frame, stamp)
+                self.meso_results.put((generation, window, stamp, character, value))
+        except Exception as exc:
+            tracker.log_error('메소 판독', exc)
+        finally:
+            self.meso_capture_lock.release()
+
+    def read_hunt_activity(self, generation, stamp, frame, window, level_roi, style, recent=False):
         try:
             try:
                 if level_roi is not None and window is not None and map_name.available():
@@ -1309,15 +1367,6 @@ class SharedController(tracker.MeasurementCore):
                     self.hunt_activity_results.put((generation, stamp, observation))
             except Exception as exc:
                 tracker.log_error('사냥 신호 판독', exc)
-            try:
-                if map_name.available():
-                    source = generation, window
-                    if self.meso_reader_source != source:
-                        self.meso_reader = meso.Reader()
-                        self.meso_reader_source = source
-                    self.meso_results.put((generation, window, stamp, character, self.meso_reader.read(frame, stamp)))
-            except Exception as exc:
-                tracker.log_error('메소 판독', exc)
         finally:
             self.hunt_activity_lock.release()
 
@@ -1660,6 +1709,8 @@ class SharedController(tracker.MeasurementCore):
                 verified_baseline = bool(self.auto_hud and details.get('auto_confirmed') and corroborated)
                 state = self.session.accept(value, observed_at, corroborated=corroborated,
                                             baseline_verified=verified_baseline)
+                if before_first is None and self.session.first is not None:
+                    self.start_meso_capture(generation, observed_at, details)
                 if len(self.session.rows)>before:
                     if previous_value is not None and self.session.last[0] > previous_value[0]:
                         self.hunt_activity.update(generation, observed_at, gained=True)

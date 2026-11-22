@@ -39,7 +39,7 @@ class ViewTests(unittest.TestCase):
         self.assertEqual(c.meso_delta_label.text(), '—')
         c.running = True
         c.current_character = '본캐'
-        c.session.created_monotonic = 100.0
+        c.session.meso_start_at = 100.0
         for stamp, value in ((102, 1_000_000), (104, 1_000_000), (106, 1_000_000),
                              (120, None), (124, 3_250_000), (126, 3_250_000)):
             c.meso_results.put((c.generation, 20, stamp, '본캐', value))
@@ -60,6 +60,86 @@ class ViewTests(unittest.TestCase):
         self.assertEqual(c.session.meso.hunted(), 2_250_000)
         c.toggle_display()
         self.assertFalse(c.meso_label.isVisibleTo(c.window))
+
+    def test_meso_confirmation_capture_ignores_previous_generation_cadence(self):
+        from PIL import Image
+        from unittest.mock import Mock
+
+        c = self.c
+        c.auto_hud = False
+        c.running = True
+        c.session.meso_start_at = 100.0
+        c.capture_clients.meso_generation = c.generation - 1
+        c.capture_clients.next_meso_scan = 900.0
+        full = Image.new('RGB', (800, 600))
+        exp = Image.new('RGB', (150, 30))
+        exp.info.update(window_id=20, full_game_image=full)
+        c.capture_clients.client = Mock()
+        c.capture_clients.client.snapshot.return_value = exp
+        with c.hunt_activity_lock, patch('qt_controller.time.monotonic', return_value=101.0), patch(
+            'map_name.available', return_value=True
+        ), patch.object(c, 'queue_meso_frame', return_value=True) as queued:
+            self.assertIs(c.capture_frame({}), exp)
+        queued.assert_called_once_with(c.generation, 101.0, full, 20)
+        self.assertTrue(c.capture_clients.client.snapshot.call_args.kwargs['include_full'])
+        self.assertEqual(c.capture_clients.next_meso_scan, 102.0)
+
+    def test_accepted_exp_baseline_queues_its_full_frame_for_meso(self):
+        from PIL import Image
+
+        c = self.c
+        c.running = True
+        c.session = tracker.Session(level=170)
+        full = Image.new('RGB', (800, 600))
+        stamp = c.session.created_monotonic + 1
+        details = {'window_id': 20, 'full_game_image': full, 'auto_detected': True,
+                   'auto_confirmed': True, 'detected_level': 170, 'temporal': {'selected': 1}}
+        c.events.put((c.generation, (219671043, 51.32), 'EXP', .99, None, stamp, details))
+        with patch('map_name.available', return_value=True), patch.object(
+            c, 'queue_meso_frame', return_value=True
+        ) as queued:
+            c.poll()
+        self.assertEqual(c.session.first, (219671043, 51.32))
+        self.assertEqual(c.session.meso_start_at, stamp)
+        queued.assert_called_once_with(c.generation, stamp, full, 20)
+        self.assertIsNone(c.session.meso.start)
+
+    def test_busy_reader_retries_the_selected_frame_and_no_inventory_keeps_exp_running(self):
+        from PIL import Image
+
+        c = self.c
+        c.running = True
+        c.session = tracker.Session(level=170)
+        full = Image.new('RGB', (800, 600))
+        stamp = c.session.created_monotonic + 1
+        with patch('map_name.available', return_value=True), patch.object(
+            c, 'queue_meso_frame', side_effect=[False, True]
+        ) as queued:
+            c.start_meso_capture(c.generation, stamp, {'window_id': 20, 'full_game_image': full})
+            self.assertIsNotNone(c.session.meso_start_frame)
+            c.apply_meso_results(stamp + 1)
+        self.assertEqual(queued.call_count, 2)
+        self.assertEqual(queued.call_args.args, (c.generation, stamp, full, 20))
+        self.assertIsNone(c.session.meso_start_frame)
+        c.meso_results.put((c.generation, 20, stamp, '', None))
+        c.apply_meso_results(stamp + 1)
+        self.assertTrue(c.running)
+        self.assertIsNone(c.session.meso.start)
+        self.assertEqual(c.meso_delta_label.text(), '—')
+
+    def test_starting_balance_uses_first_of_matching_captures(self):
+        c = self.c
+        c.running = True
+        c.current_character = '본캐'
+        c.session.meso_start_at = 100.0
+        c.meso_results.put((c.generation, 20, 129.0, '본캐', 1_000_000))
+        c.apply_meso_results(129.0)
+        self.assertIsNone(c.session.meso.start)
+        c.meso_results.put((c.generation, 20, 131.0, '본캐', 1_000_000))
+        c.apply_meso_results(131.0)
+        self.assertEqual(c.session.meso.start, 1_000_000)
+        self.assertEqual(c.session.meso.last_seen, 131.0)
+        self.assertEqual(c.meso_status_label.text(), '시작 잔액 확인 · 종료 잔액 대기')
 
     def test_meso_confirmation_status_expires_before_stop(self):
         c = self.c

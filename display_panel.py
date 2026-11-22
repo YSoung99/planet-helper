@@ -202,7 +202,7 @@ def build(c, config, application, level_value, repeat_bridge=KeyRepeatBridge):
     c.meso_label = c.label('메소 · 측정 중 인벤토리를 열면 기록')
     c.meso_label.setAccessibleName('인벤토리 메소와 이번 사냥 메소')
     c.meso_label.setStyleSheet('font-size:10px;')
-    c.meso_label.setToolTip('측정 중 인벤토리 창을 열면 아래쪽 메소 칸을 읽어 기록합니다. 창을 옮겨도 다시 찾습니다.')
+    c.meso_label.setToolTip('인벤토리를 먼저 열고 측정을 시작하면 경험치와 함께 시작 잔액을 읽습니다. 종료 직전에 다시 열어 종료 잔액을 확인하세요.')
     layout.addWidget(c.meso_label)
     status=QHBoxLayout()
     status.addWidget(c.compact_level_eta)

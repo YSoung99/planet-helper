@@ -84,6 +84,18 @@ class ReaderTests(unittest.TestCase):
             with mock.patch('map_name.recognize_lines', return_value=lines):
                 self.assertEqual(meso.has_label(frame, box), lines[0][0] != '0')
 
+    def test_native_size_new_ui_retries_the_left_label_without_accepting_other_text(self):
+        frame = inventory_frame()
+        box = (100, 200, 361, 53)
+        for reading, expected in ((('메소', .93), True), (('메소', .6), False),
+                                  (('메소 상점', .98), False)):
+            with self.subTest(reading=reading), mock.patch(
+                'map_name.recognize_lines', side_effect=[[('25,936,640', .99)], [reading]]
+            ) as recognize:
+                self.assertEqual(meso.has_label(frame, box), expected)
+                label = recognize.call_args.args[0]
+                self.assertEqual(label.size, (2 * round(53 * 1.55) + 24, 2 * 53 + 24))
+
     def test_box_merged_with_bright_ui_above_is_split_at_its_border(self):
         frame = Image.new('RGB', (800, 600), (40, 60, 90))
         draw = ImageDraw.Draw(frame)
