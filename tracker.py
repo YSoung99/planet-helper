@@ -25,7 +25,7 @@ RESOURCES = Path(getattr(sys, '_MEIPASS', Path(__file__).resolve().parent))
 BASE = Path(os.environ.get('PLANET_EXP_DATA_DIR') or (
     Path.home()/'Library'/'Application Support'/'Maple Planet Helper Auto Trial'
     if sys.platform == 'darwin' else Path(__file__).resolve().parent))
-APP_VERSION = '1.4.19'
+APP_VERSION = '1.4.20'
 MAX_BOUNDARY_GAP = 10.0
 BURNING_MAX_LEVEL = 120  # Planet Up & Up grants one bonus level, capped at 120.
 REST_AFTER = 180.0  # EXP unchanged this long: rest counted from the last gain
@@ -150,9 +150,16 @@ def load_settings(path):
             clean['cloud_remote'] = payload['cloud_remote']
         else:
             invalid.append('cloud_remote')
+    nickname_patterns = payload.get('nickname_patterns')
+    if isinstance(nickname_patterns, dict):
+        clean['nickname_patterns'] = {
+            key: name for key, name in nickname_patterns.items()
+            if re.fullmatch(r'[a-f0-9]{32}', key) and isinstance(name, str)
+            and bool(re.fullmatch(r'[가-힣A-Za-z0-9]{2,16}', name))
+        }
     if 'meso_trade_threshold' in payload:
         value = payload['meso_trade_threshold']
-        if type(value) is int and 0 < value <= 10**12:
+        if type(value) is int and meso.MIN_THRESHOLD <= value <= meso.MAX_THRESHOLD:
             clean['meso_trade_threshold'] = value
         else:
             invalid.append('meso_trade_threshold')

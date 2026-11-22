@@ -6,6 +6,7 @@ only counts when the word 메소 sits right next to it, which rules out the coin
 window. Nothing is read while the inventory is closed.
 """
 import csv
+import hashlib
 import re
 from datetime import datetime
 from pathlib import Path
@@ -13,6 +14,11 @@ from pathlib import Path
 AMOUNT = re.compile(r'\d{1,3}(?:,\d{3})*')
 MIN_SCORE = .85
 TRADE_THRESHOLD = 1_000_000
+MIN_THRESHOLD = 1
+MAX_THRESHOLD = 10**12
+END_WINDOW = 12.0
+CONFIRMATION_GAP = 8.0
+START_WINDOW = 30.0
 # A reading this many times larger or smaller than the last one is usually a dropped or extra digit.
 JUMP_RATIO = 10
 
@@ -40,7 +46,8 @@ def white_boxes(frame):
     import numpy as np
 
     pixels = np.asarray(frame.convert('RGB'))
-    mask = (pixels.min(axis=2) >= 225).astype(np.uint8)
+    mask = cv2.inRange(pixels, (225, 225, 225), (255, 255, 255))
+    mask //= 255
     count, _, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=4)
     boxes = []
     for x, y, w, h, area in stats[1:count]:
@@ -108,32 +115,58 @@ class Reader:
     """Find the inventory meso box, remembering where it was last seen."""
 
     RECHECK_SECONDS = 30.0
+    MAX_REJECTED = 128
 
     def __init__(self):
         self.box = None
+        self.cached = None
         self.rejected = {}
+
+    @staticmethod
+    def signature(frame, box):
+        x, y, w, h = box
+        reach = round(h * 2.6)
+        region = frame.crop((max(0, x - reach), max(0, y - 3),
+                             min(frame.width, x + w + reach), min(frame.height, y + h + 3)))
+        return frame.size, hashlib.blake2b(region.tobytes(), digest_size=16).digest()
 
     def read(self, frame, now=None):
         import time
         now = time.monotonic() if now is None else now
-        if self.box is not None:
-            value = read_amount(frame, self.box)
-            if value is not None:
-                return value
-            self.box = None
-        # The quick number read filters the candidates before the slower label check, and a
-        # number box without the label (trade window, NPC dialog) is not checked again for a while.
-        self.rejected = {box: when for box, when in self.rejected.items() if now - when < self.RECHECK_SECONDS}
+        if self.box is not None and self.cached is not None:
+            signature = self.signature(frame, self.box)
+            if signature == self.cached[0]:
+                return self.cached[1]
+        old_box = self.box
+        self.box = self.cached = None
+        self.rejected = {box: item for box, item in self.rejected.items()
+                         if now - item[0] < self.RECHECK_SECONDS}
+
+        if old_box is not None and self.check(frame, old_box, now) is not None:
+            return self.cached[1]
         for box in white_boxes(frame):
-            if box in self.rejected:
-                continue
-            value = read_amount(frame, box)
-            if value is None:
-                continue
-            if has_label(frame, box):
-                self.box = box
-                return value
-            self.rejected[box] = now
+            if box != old_box:
+                value = self.check(frame, box, now)
+                if value is not None:
+                    return value
+        return None
+
+    def check(self, frame, box, now):
+        x, y, w, h = box
+        if x + w > frame.width or y + h > frame.height:
+            return None
+        signature = self.signature(frame, box)
+        rejected = self.rejected.get(box)
+        if rejected is not None and rejected[1] == signature:
+            return None
+        value = read_amount(frame, box)
+        if value is not None and has_label(frame, box):
+            self.box, self.cached = box, (signature, value)
+            return value
+        self.rejected.pop(box, None)
+        if len(self.rejected) >= self.MAX_REJECTED:
+            del self.rejected[next(iter(self.rejected))]
+        self.rejected[box] = (now, signature)
         return None
 
 
@@ -144,9 +177,17 @@ class Confirmation:
         self.current = None
         self.pending = None
         self.count = 0
+        self.last_stamp = None
 
-    def observe(self, value):
+    def observe(self, value, stamp=None):
         """Return the value once it is trusted (again on every later sighting), or None."""
+        if stamp is not None:
+            if self.last_stamp is not None:
+                if stamp <= self.last_stamp:
+                    return None
+                if stamp - self.last_stamp > CONFIRMATION_GAP:
+                    self.current, self.pending, self.count = None, None, 0
+            self.last_stamp = stamp
         if value is None:
             self.pending, self.count = None, 0
             return None
@@ -171,7 +212,7 @@ def log_path(base):
 def append(base, character, value, when=None):
     path = log_path(base)
     path.parent.mkdir(parents=True, exist_ok=True)
-    new = not path.exists()
+    new = not path.exists() or path.stat().st_size == 0
     with path.open('a', newline='', encoding='utf-8') as stream:
         writer = csv.writer(stream)
         if new:
@@ -179,19 +220,25 @@ def append(base, character, value, when=None):
         writer.writerow([(when or datetime.now()).isoformat(timespec='seconds'), character or '', value])
 
 
-def load(base):
-    """[(datetime, character, meso)] in file order; unreadable lines are skipped."""
-    entries = []
+def iter_entries(base):
+    """Read valid balances in file order."""
     try:
-        with log_path(base).open(newline='', encoding='utf-8') as stream:
+        with log_path(base).open(newline='', encoding='utf-8', errors='replace') as stream:
             for row in csv.DictReader(stream):
                 try:
-                    entries.append((datetime.fromisoformat(row['시각']), row['캐릭터'], int(row['메소'])))
+                    value = int(row['메소'])
+                    when = datetime.fromisoformat(row['시각'])
+                    character = row['캐릭터']
+                    if value >= 0 and character is not None:
+                        yield when, character, value
                 except (KeyError, TypeError, ValueError):
                     continue
     except OSError:
-        pass
-    return entries
+        return
+
+
+def load(base):
+    return list(iter_entries(base))
 
 
 def day_change(entries, character, day):
@@ -200,32 +247,113 @@ def day_change(entries, character, day):
     return values[-1] - values[0] if len(values) >= 2 else None
 
 
+class DailyLog:
+    """Keep today's first and last balance per character after the initial file read."""
+
+    def __init__(self):
+        self.day = None
+        self.balances = {}
+
+    def refresh(self, base, day):
+        if self.day == day:
+            return
+        self.day = day
+        self.balances = {}
+        for when, character, value in iter_entries(base):
+            if when.date() == day:
+                self.remember(character, value)
+
+    def remember(self, character, value):
+        first, _ = self.balances.get(character, (value, value))
+        self.balances[character] = first, value
+
+    def record(self, base, character, value, when):
+        self.refresh(base, when.date())
+        previous = self.balances.get(character)
+        if previous is None or previous[1] != value:
+            append(base, character, value, when)
+            self.remember(character, value)
+
+    def change(self, character):
+        pair = self.balances.get(character)
+        return pair[1] - pair[0] if pair else None
+
+
 class SessionMeso:
-    """Meso at the start and end of one measurement, with large single changes kept apart."""
+    """Store sampled balance changes without guessing their cause."""
 
     def __init__(self, data=None):
         data = data if isinstance(data, dict) else {}
         self.start = data.get('start')
         self.end = data.get('end')
-        self.trade = data.get('trade', 0)
         self.readings = data.get('readings', 1 if self.start is not None else 0)
+        if (type(self.start) is not int or self.start < 0 or type(self.end) is not int
+                or self.end < 0 or type(self.readings) is not int or self.readings < 1):
+            self.start = self.end = None
+            self.readings = 0
+        trade = data.get('trade')
+        self.trade = trade if type(trade) is int else 0
+        changes = data.get('large_changes')
+        self.large_changes = changes.copy() if isinstance(changes, list) and all(
+            type(change) is int for change in changes) else []
+        marks = data.get('marked')
+        self.marked = {index for index in marks if type(index) is int and 0 <= index < len(self.large_changes)
+                       } if isinstance(marks, list) else set()
+        self.complete = data.get('complete', self.readings >= 2) is True
+        self.legacy = bool(data) and 'large_changes' not in data
+        self.source = self.last_seen = self.opening = None
+        self.source_changed = False
+
+    def check_source(self, source):
+        if self.source is not None and source != self.source:
+            self.source_changed = True
+        return not self.source_changed
 
     def observe(self, value, threshold=TRADE_THRESHOLD):
         if self.start is None:
-            self.start = self.end = value
-        else:
-            if abs(value - self.end) > threshold:
-                self.trade += value - self.end
-            self.end = value
+            self.start = value
+        elif abs(value - self.end) > threshold:
+            self.large_changes.append(value - self.end)
+        self.end = value
         self.readings += 1
 
+    def sample(self, value, source, stamp, opening, started, threshold):
+        if self.source is None:
+            if not 0 <= stamp - started <= START_WINDOW:
+                return False
+            self.source = source
+        if not self.check_source(source):
+            return False
+        changed = self.start is None or value != self.end or opening != self.opening
+        if changed:
+            self.observe(value, threshold)
+        self.last_seen, self.opening = stamp, opening
+        return changed
+
+    def end_ready(self, source, now):
+        return (self.readings >= 2 and not self.source_changed and self.source == source
+                and self.last_seen is not None and 0 <= now - self.last_seen <= END_WINDOW)
+
+    def finish(self, source, now):
+        self.complete = self.end_ready(source, now)
+
+    def toggle_trade(self, index):
+        self.marked.symmetric_difference_update({index})
+
     def hunted(self):
-        """Meso earned while hunting, or None until the inventory was seen twice."""
-        if self.readings < 2:
+        if not self.complete or self.readings < 2 or self.start is None or self.end is None:
             return None
-        return self.end - self.start - self.trade
+        return self.end - self.start - self.excluded_trade()
+
+    def excluded_trade(self):
+        if self.legacy:
+            return self.trade
+        return sum(amount for index, amount in enumerate(self.large_changes) if index in self.marked)
 
     def as_dict(self):
         if self.start is None:
             return None
-        return {'start': self.start, 'end': self.end, 'trade': self.trade, 'readings': self.readings}
+        data = {'start': self.start, 'end': self.end, 'trade': self.trade, 'readings': self.readings}
+        if not self.legacy:
+            data.update(complete=self.complete, large_changes=self.large_changes, marked=sorted(self.marked))
+        return data

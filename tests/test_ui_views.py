@@ -31,25 +31,68 @@ class ViewTests(unittest.TestCase):
         self.c.toggle_display();self.assertLess(self.c.window.height(),205)
 
     def test_meso_readings_reach_the_log_session_and_detail_line(self):
-        c=self.c;c.toggle_display()
+        c = self.c
+        c.toggle_display()
         self.assertTrue(c.meso_label.isVisibleTo(c.window))
-        self.assertEqual(c.meso_label.text(),'메소 · 측정 중 인벤토리를 열면 기록')
-        for value in (1_000_000,1_000_000):c.meso_results.put((c.generation,value))
-        c.apply_meso_results(100.0)
-        self.assertEqual(c.meso_label.text(),'메소 1,000,000')
-        c.running=True
-        c.apply_meso_results(200.0)  # the reading from before the start becomes the starting meso
-        self.assertEqual(c.meso_label.text(),'메소 · 측정 시작과 끝에 인벤토리를 한 번씩 열어 주세요')
-        for value in (None,1_250_000,1_250_000):c.meso_results.put((c.generation,value))
-        c.apply_meso_results(300.0)
-        self.assertEqual(c.meso_label.text(),'메소 1,250,000 · 이번 사냥 +250,000')
-        for value in (3_250_000,3_250_000):c.meso_results.put((c.generation,value))
-        c.apply_meso_results(310.0)
-        self.assertEqual(c.meso_label.text(),'메소 3,250,000 · 이번 사냥 +250,000 (거래·구매 +2,000,000 제외)')
-        c.meso_results.put((c.generation-1,9));c.apply_meso_results(320.0)
+        c.running = True
+        c.current_character = '본캐'
+        c.session.created_monotonic = 100.0
+        for stamp, value in ((102, 1_000_000), (104, 1_000_000), (106, 1_000_000),
+                             (120, None), (124, 3_250_000), (126, 3_250_000)):
+            c.meso_results.put((c.generation, 20, stamp, '본캐', value))
+            c.apply_meso_results(stamp)
+        c.meso_results.put((c.generation, 20, 127, '부캐', 999))
+        c.apply_meso_results(127)
+        self.assertEqual(c.meso_label.text(), '메소 3,250,000 · 잔액 변화 +2,250,000 · 큰 변동 1건')
         import meso
-        self.assertEqual([value for _,_,value in meso.load(tracker.BASE)],[1_000_000,1_250_000,3_250_000])
-        c.toggle_display();self.assertFalse(c.meso_label.isVisibleTo(c.window))
+        self.assertEqual([value for _, _, value in meso.load(tracker.BASE)], [1_000_000, 3_250_000])
+        self.assertIsNone(c.session.meso.hunted())
+        with patch('qt_controller.time.monotonic', return_value=128):
+            self.assertTrue(c.finish_measurement('사용자 정지'))
+        self.assertEqual(c.session.meso.hunted(), 2_250_000)
+        c.toggle_display()
+        self.assertFalse(c.meso_label.isVisibleTo(c.window))
+
+    def test_meso_confirmation_status_expires_before_stop(self):
+        c = self.c
+        c.running = True
+        c.meso_source = (c.generation, '본캐', 20)
+        balance = c.session.meso
+        balance.sample(100, c.meso_source, 102, 1, 100, 100)
+        self.assertEqual(c.meso_status(103), '시작 잔액 확인 · 종료 잔액 대기')
+        balance.sample(200, c.meso_source, 130, 2, 100, 100)
+        self.assertEqual(c.meso_status(131), '시작 잔액 확인 · 종료 잔액 확인')
+        self.assertEqual(c.meso_status(143), '시작 잔액 확인 · 종료 잔액 대기')
+
+    def test_connected_nickname_registration_and_character_change(self):
+        c = self.c
+        c.set_character_source((c.generation, 20))
+        unknown = 'a' * 32
+        for stamp in (100, 102):
+            c.character_results.put((c.generation, 20, stamp, '섀도어', None, unknown))
+            c.apply_character_results(stamp)
+        self.assertIn('확인 대기', c.source_label.text())
+        with patch('qt_controller.time.monotonic', return_value=103), patch(
+                'PySide6.QtWidgets.QInputDialog.getText', return_value=('테스트본캐', True)):
+            c.register_nickname()
+        self.assertIn('접속 닉네임 테스트본캐', c.source_label.text())
+        clean, warning = tracker.load_settings(tracker.BASE / 'settings.json')
+        self.assertIsNone(warning)
+        self.assertEqual(clean['nickname_patterns'], {unknown: '테스트본캐'})
+        other = 'b' * 32
+        c.character_results.put((c.generation, 20, 105, '아란', '테스트부캐', other))
+        c.apply_character_results(105)
+        self.assertIn('확인 대기', c.source_label.text())
+        c.character_results.put((c.generation, 20, 107, '아란', '테스트부캐', other))
+        c.apply_character_results(107)
+        self.assertIn('접속 닉네임 테스트부캐', c.source_label.text())
+        c.apply_character_results(123)
+        self.assertIn('확인 대기', c.source_label.text())
+
+    def test_meso_threshold_accepts_a_value_above_qt_integer_range(self):
+        with patch('PySide6.QtWidgets.QInputDialog.getText', return_value=('1,000,000,000,000', True)):
+            self.c.meso_threshold_settings()
+        self.assertEqual(self.c.meso_trade_threshold, 10**12)
 
     def test_level_eta_shows_arrival_clock(self):
         from datetime import datetime

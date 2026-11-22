@@ -68,4 +68,4 @@ class CharacterRecheckTests(unittest.TestCase):
         self.assertTrue(needed(2, 7, 50.0))
         self.assertTrue(needed(1, 8, 50.0))
         state.character_identity = (None, '닉네임')
-        self.assertTrue(needed(1, 7, 50.0))
+        self.assertFalse(needed(1, 7, 50.0))

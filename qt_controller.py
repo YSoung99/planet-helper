@@ -347,13 +347,17 @@ class SharedController(tracker.MeasurementCore):
         self.meso_reader = meso.Reader()
         self.meso_results = queue.SimpleQueue()
         self.meso_confirmation = meso.Confirmation()
-        self.meso_logged = {}
+        self.meso_log = meso.DailyLog()
+        self.meso_source = None
+        self.meso_opening = 0
+        self.meso_visible = False
+        self.meso_reader_source = None
         self.meso_last_flush = float('-inf')
-        self.meso_seen_at = None
         self.character_candidate = (None, None)
         self.character_identity = (None, None)
         self.character_source = None
         self.character_recheck_at = 0.0
+        self.nickname_sample = None
         config, warning = tracker.load_settings(tracker.BASE/'settings.json') if restore else ({}, None)
         self.auto_hud = config.get('auto_hud', True)
         self.recent_recording = config.get('recent_recording', True)
@@ -362,6 +366,7 @@ class SharedController(tracker.MeasurementCore):
         self.auto_start_hold = None
         self.jev_enabled = config.get('jev_enabled', False)
         self.current_character = config.get('current_character')
+        self.nickname_patterns = config.get('nickname_patterns', {})
         self.meso_trade_threshold = config.get('meso_trade_threshold', meso.TRADE_THRESHOLD)
         self.cloud_remote = config.get('cloud_remote')
         self.cloud_lock = threading.Lock()
@@ -783,7 +788,9 @@ class SharedController(tracker.MeasurementCore):
         burning.toggled.connect(self.set_burning)
         menu.addAction('이번 사냥터 메모', self.edit_memo)
         menu.addAction('JEV API 키 설정', self.api_key_settings)
-        menu.addAction('메소 거래·구매 기준 금액', self.meso_threshold_settings)
+        menu.addAction('현재 닉네임 등록·수정…', self.register_nickname)
+        menu.addAction('메소 큰 변동 기준 금액', self.meso_threshold_settings)
+        menu.addAction('이번 측정의 큰 메소 변동 분류…', self.classify_meso_change)
         menu.addAction('배경 투명도', self.opacity_settings)
         menu.addAction('기록 폴더 열기', self.open_records)
         backup_menu = menu.addMenu('기록 백업·옮기기')
@@ -818,68 +825,150 @@ class SharedController(tracker.MeasurementCore):
         self.buff_confirmation = exp_buffs.Confirmation()
         self.buff_label.setText(f'{label} 등록 완료 · 측정 중 확인')
 
+    def register_nickname(self):
+        from PySide6.QtWidgets import QInputDialog, QMessageBox
+        sample = self.nickname_sample
+        if sample is None or not sample[2] or sample[0] != self.character_source or time.monotonic() - sample[1] > 15:
+            self.status.set('자동 인식으로 게임 HUD가 표시되면 닉네임을 등록할 수 있어요')
+            return
+        source, _, key = sample
+        text, ok = QInputDialog.getText(
+            self.window, '현재 닉네임 등록·수정', '게임 HUD에 보이는 닉네임을 입력해 주세요.',
+            text=self.nickname_patterns.get(key) or self.character_identity[1] or self.current_character or '')
+        if not ok:
+            return
+        name = text.strip()
+        if not character_hud.valid_nickname(name):
+            QMessageBox.warning(self.window, '닉네임 확인', '한글·영문·숫자 2~16자를 입력해 주세요.')
+            return
+        self.nickname_patterns = {**self.nickname_patterns, key: name}
+        self.save_config()
+        if self.nickname_sample and self.nickname_sample[0] == source and self.nickname_sample[2] == key:
+            self.character_candidate = (self.character_candidate[0], name)
+            self.set_detected_character((self.character_identity[0], name))
+
     def meso_threshold_settings(self):
-        from PySide6.QtWidgets import QInputDialog
-        value, ok = QInputDialog.getInt(
-            self.window, '메소 거래·구매 기준',
-            '측정 중 메소가 한 번에 이 금액보다 크게 바뀌면\n상점·거래로 보고 사냥 수익에서 뺍니다.',
-            self.meso_trade_threshold, 10_000, 10**12, 100_000)
-        if not ok: return
+        from PySide6.QtWidgets import QInputDialog, QMessageBox
+        text, ok = QInputDialog.getText(
+            self.window, '메소 큰 변동 기준',
+            '잔액 차이가 이 금액을 넘으면 큰 변동으로 표시합니다.',
+            text=f'{self.meso_trade_threshold:,}')
+        if not ok:
+            return
+        try:
+            value = int(text.strip().replace(',', ''))
+            if not meso.MIN_THRESHOLD <= value <= meso.MAX_THRESHOLD:
+                raise ValueError
+        except ValueError:
+            QMessageBox.warning(self.window, '메소 큰 변동 기준', '1~1조 사이의 정수를 입력해 주세요.')
+            return
         self.meso_trade_threshold = value
         self.save_config()
 
+    def classify_meso_change(self):
+        from PySide6.QtWidgets import QInputDialog
+        balance = self.session.meso
+        if not self.running or not balance.large_changes:
+            self.status.set('이번 측정에서 분류할 큰 메소 변동이 없어요')
+            return
+        options = [f'{i + 1}. {amount:+,} · ' + ('거래·구매' if i in balance.marked else '미분류')
+                   for i, amount in enumerate(balance.large_changes)]
+        choice, ok = QInputDialog.getItem(
+            self.window, '메소 큰 변동 분류', '거래·구매 표시를 켜거나 끌 변동을 고르세요.',
+            options, 0, False)
+        if ok and self.session.meso is balance and self.running:
+            balance.toggle_trade(options.index(choice))
+            self.session.meso_dirty = True
+
     def meso_character(self):
-        return self.session.character_name or getattr(self, 'current_character', None) or ''
+        if self.session.character_conflict:
+            return None
+        return self.session.character_name or self.current_character or ''
 
-    MESO_START_WINDOW = 600.0
+    def clear_meso_confirmation(self, source):
+        self.meso_source = source
+        self.meso_visible = False
+        self.meso_confirmation = meso.Confirmation()
 
-    def apply_meso_results(self, now):
+    def apply_meso_results(self, now, *, finishing=False):
         session = self.session
-        # A reading from shortly before the start counts as the starting meso.
-        if (self.running and session.meso.start is None and self.meso_seen_at is not None
-                and now - self.meso_seen_at <= self.MESO_START_WINDOW):
-            session.meso.observe(self.meso_confirmation.current, self.meso_trade_threshold)
+        character = self.meso_character()
+        if self.meso_source is not None and self.meso_source[:2] != (self.generation, character):
+            self.clear_meso_confirmation(None)
+        if session.meso.source is not None and session.meso.source[:2] != (self.generation, character):
+            session.meso.check_source(None)
         while not self.meso_results.empty():
-            generation, value = self.meso_results.get_nowait()
-            if generation != self.generation:
+            generation, window, stamp, observed_character, value = self.meso_results.get_nowait()
+            if (not self.running or generation != self.generation or character is None
+                    or observed_character != character or window is None or stamp < session.created_monotonic
+                    or stamp < now - meso.END_WINDOW):
                 continue
-            confirmed = self.meso_confirmation.observe(value)
+            source = generation, character, window
+            session.meso.check_source(source)
+            if source != self.meso_source:
+                self.clear_meso_confirmation(source)
+            if value is None:
+                self.meso_visible = False
+            elif not self.meso_visible:
+                self.meso_opening += 1
+                self.meso_visible = True
+            confirmed = self.meso_confirmation.observe(value, stamp)
             if confirmed is None:
                 continue
-            self.meso_seen_at = now
-            character = self.meso_character()
-            if self.meso_logged.get(character) != confirmed:
-                try:
-                    meso.append(tracker.BASE, character, confirmed)
-                    self.meso_logged[character] = confirmed
-                except OSError as exc:
-                    tracker.log_error('메소 기록 저장', exc)
-                self.meso_today = meso.day_change(meso.load(tracker.BASE), character, datetime.now().date())
-            if self.running:
-                session.meso.observe(confirmed, self.meso_trade_threshold)
-                session.meso_dirty = True
-        if (self.running and session.meso_dirty and session.rows and not session.ledger_dirty
+            try:
+                self.meso_log.record(tracker.BASE, character, confirmed, datetime.now())
+            except OSError as exc:
+                tracker.log_error('메소 기록 저장', exc)
+            session.meso_dirty |= session.meso.sample(
+                confirmed, source, stamp, self.meso_opening, session.created_monotonic,
+                self.meso_trade_threshold)
+        if (not finishing and self.running and session.meso_dirty and session.rows and not session.ledger_dirty
                 and now - self.meso_last_flush >= 10):
             self.meso_last_flush = now
             try:
                 self.save_summary()
             except OSError as exc:
                 tracker.log_error('메소 기록 저장', exc)
-        self.meso_label.setText(self.meso_text())
+        text = self.meso_text()
+        if text != self.meso_label.text():
+            self.meso_label.setText(text)
+        ready = self.meso_status(now)
+        if self.meso_status_label.text() != ready:
+            self.meso_status_label.setText(ready)
+
+    def meso_status(self, now):
+        balance = self.session.meso
+        if balance.source_changed:
+            return '시작·종료 잔액 확인 불가 · 캐릭터 또는 게임 창 변경'
+        start = '시작 잔액 확인' if balance.start is not None else '시작 잔액 대기'
+        if self.running and balance.start is None and now - self.session.created_monotonic > meso.START_WINDOW:
+            start = '시작 잔액 확인 시간 지남'
+        end = balance.end_ready(self.meso_source, now) if self.running else balance.complete
+        return start + (' · 종료 잔액 확인' if end else ' · 종료 잔액 대기')
 
     def meso_text(self):
         current = self.meso_confirmation.current
-        if self.running:
-            hunted = self.session.meso.hunted()
-            if hunted is None:
-                return '메소 · 측정 시작과 끝에 인벤토리를 한 번씩 열어 주세요'
-            trade = self.session.meso.trade
-            extra = f' (거래·구매 {trade:+,} 제외)' if trade else ''
-            return f'메소 {current:,} · 이번 사냥 {hunted:+,}{extra}'
         if current is None:
             return '메소 · 측정 중 인벤토리를 열면 기록'
-        today = getattr(self, 'meso_today', None)
-        return f'메소 {current:,}' + (f' · 오늘 {today:+,}' if today else '')
+        text = f'메소 {current:,}'
+        balance = self.session.meso
+        if self.running:
+            if balance.source_changed:
+                return text + ' · 캐릭터 또는 게임 창 변경 · 이번 잔액 차이 확인 안 됨'
+            if balance.readings < 2 or balance.source != self.meso_source:
+                if balance.start is None:
+                    return text + ' · 시작 후 30초 안의 잔액 필요'
+                return text + ' · 종료 직전에 인벤토리를 다시 열어 주세요'
+            delta = balance.end - balance.start
+            text += f' · 잔액 변화 {delta:+,}'
+            if balance.large_changes:
+                text += f' · 큰 변동 {len(balance.large_changes)}건'
+            excluded = balance.excluded_trade()
+            if excluded:
+                text += f' · 거래 제외 후 {delta - excluded:+,}'
+            return text
+        today = self.meso_log.change(self.meso_character())
+        return text + (f' · 오늘 {today:+,}' if today is not None else '')
 
     def show_history(self):
         from record_history import build_dialog
@@ -1092,6 +1181,10 @@ class SharedController(tracker.MeasurementCore):
         self.save_config()
 
     def finish_measurement(self, reason):
+        if self.running and not self.session.restored and hasattr(self, 'meso_results'):
+            now = time.monotonic()
+            self.apply_meso_results(now, finishing=True)
+            self.session.meso.finish(self.meso_source, now)
         had_record = bool(self.session.rows) and not self.session.restored
         if not super().finish_measurement(reason):
             return False
@@ -1147,9 +1240,10 @@ class SharedController(tracker.MeasurementCore):
             self.capture_clients.client = self.capture_module().WindowCapture(**self.CAPTURE_OPTIONS)
         stamp = time.monotonic()
         generation = self.generation
-        probe = (not recent and (self.buff_has_templates or map_name.available())
+        probe = ((map_name.available() if recent else self.buff_has_templates or map_name.available())
                  and not self.hunt_activity_lock.locked()
-                 and stamp >= getattr(self.capture_clients, 'next_activity_scan', 0))
+                 and stamp >= getattr(self.capture_clients, 'next_activity_scan', 0)
+                 and (not recent or stamp >= self.character_recheck_at))
         starting = not recent and (self.session.started is None or self.recent_start_source is not None)
         include_full = starting or probe
         if self.auto_hud:
@@ -1178,7 +1272,7 @@ class SharedController(tracker.MeasurementCore):
                     if not self.character_read_needed(generation, window, stamp):
                         level_roi = None
                     threading.Thread(target=self.read_hunt_activity,
-                                     args=(generation, observed_at, full, window, level_roi, style),
+                                     args=(generation, observed_at, full, window, level_roi, style, self.meso_character(), recent),
                                      name='hunt-activity', daemon=True).start()
                 except RuntimeError as exc:
                     self.hunt_activity_lock.release()
@@ -1187,41 +1281,45 @@ class SharedController(tracker.MeasurementCore):
             image.info.pop('full_game_image', None)
         return image
 
-    def read_hunt_activity(self, generation, stamp, frame, window, level_roi, style):
+    def read_hunt_activity(self, generation, stamp, frame, window, level_roi, style, character=None, recent=False):
         try:
-            if window is not None and self.buff_has_templates:
-                revision = self.buff_revision
-                readings = self.buff_detector.read(frame, tracker.BASE)
-                self.buff_results.put((generation, window, revision, stamp, readings))
-        except Exception as exc:
-            tracker.log_error('경험치 버프 판독', exc)
-        try:
-            if map_name.available():
-                observation = hunt_activity.read(frame, self.hunt_activity_cache)
-                self.hunt_activity_results.put((generation, stamp, observation))
-        except Exception as exc:
-            tracker.log_error('사냥 신호 판독', exc)
-        try:
-            if map_name.available():
-                self.meso_results.put((generation, self.meso_reader.read(frame)))
-        except Exception as exc:
-            tracker.log_error('메소 판독', exc)
-        try:
-            if level_roi is not None:
-                identity = character_hud.read(frame, level_roi, style)
-                self.character_results.put((generation, window, identity))
-        except Exception as exc:
-            tracker.log_error('캐릭터 HUD 판독', exc)
+            try:
+                if level_roi is not None and window is not None and map_name.available():
+                    job, nickname, key = character_hud.inspect(frame, level_roi, style, self.nickname_patterns)
+                    self.character_results.put((generation, window, stamp, job, nickname, key))
+            except Exception as exc:
+                tracker.log_error('캐릭터 HUD 판독', exc)
+            if recent:
+                return
+            try:
+                if window is not None and self.buff_has_templates:
+                    revision = self.buff_revision
+                    readings = self.buff_detector.read(frame, tracker.BASE)
+                    self.buff_results.put((generation, window, revision, stamp, readings))
+            except Exception as exc:
+                tracker.log_error('경험치 버프 판독', exc)
+            try:
+                if map_name.available():
+                    observation = hunt_activity.read(frame, self.hunt_activity_cache)
+                    self.hunt_activity_results.put((generation, stamp, observation))
+            except Exception as exc:
+                tracker.log_error('사냥 신호 판독', exc)
+            try:
+                if map_name.available():
+                    source = generation, window
+                    if self.meso_reader_source != source:
+                        self.meso_reader = meso.Reader()
+                        self.meso_reader_source = source
+                    self.meso_results.put((generation, window, stamp, character, self.meso_reader.read(frame, stamp)))
+            except Exception as exc:
+                tracker.log_error('메소 판독', exc)
         finally:
             self.hunt_activity_lock.release()
 
-    CHARACTER_RECHECK_SECONDS = 300.0
+    CHARACTER_RECHECK_SECONDS = 8.0
 
     def character_read_needed(self, generation, window, now):
-        """Skip the character OCR once job and name are confirmed for this window."""
-        confirmed = ((generation, window) == self.character_source
-                     and all(self.character_identity))
-        return not confirmed or now >= self.character_recheck_at
+        return (generation, window) != self.character_source or now >= self.character_recheck_at
 
     DISCOVERY_PERIOD = 1.0
 
@@ -1405,12 +1503,59 @@ class SharedController(tracker.MeasurementCore):
         for overlay in self.overlays: overlay.close()
         self.overlays = []
 
+    def set_character_source(self, source):
+        if source != self.character_source:
+            self.character_source = source
+            self.character_candidate = (None, None)
+            self.character_identity = (None, None)
+            self.character_recheck_at = 0.0
+            self.nickname_sample = None
+            self.update_capture_label()
+
     def update_capture_label(self):
         if not self.auto_hud:
             self.source_label.setText('MapleStory Worlds · 수동 영역')
             return
-        identity = [text for text in reversed(self.character_identity) if text]
-        self.source_label.setText(' · '.join([f'Lv. {self.session.level}', *identity]))
+        job, nickname = self.character_identity
+        fields = [f'Lv. {self.session.level}'] if self.running else []
+        fields.append(f'접속 닉네임 {nickname}' if nickname else '접속 닉네임 확인 대기')
+        if job:
+            fields.append(job)
+        self.source_label.setText(' · '.join(fields))
+
+    def set_detected_character(self, identity):
+        self.character_identity = identity
+        self.update_capture_label()
+        nickname = identity[1]
+        session = self.session
+        if self.running and nickname and not session.character_conflict and nickname != session.character_name:
+            session.character_conflict = session.character_name is not None
+            session.character_name = None if session.character_conflict else nickname
+            if session.rows:
+                try:
+                    self.save_summary()
+                except OSError as exc:
+                    tracker.log_error('사냥 기록 캐릭터 저장', exc)
+
+    def apply_character_results(self, now):
+        while not self.character_results.empty():
+            generation, window, stamp, job, nickname, key = self.character_results.get_nowait()
+            source = generation, window
+            if source != self.character_source or generation != self.generation or now - stamp > 15:
+                continue
+            previous = self.nickname_sample
+            if previous and stamp <= previous[1]:
+                continue
+            self.nickname_sample = (source, stamp, key) if key else None
+            old_job, old_name = self.character_candidate
+            registered = self.nickname_patterns.get(key)
+            confirmed_name = registered or (nickname if nickname and nickname == old_name
+                                            and previous and previous[2] == key else None)
+            self.character_candidate = (job, nickname)
+            self.set_detected_character((job if job == old_job else None, confirmed_name))
+            self.character_recheck_at = now + (self.CHARACTER_RECHECK_SECONDS if confirmed_name else 2.0)
+        if self.nickname_sample and now - self.nickname_sample[1] > 15:
+            self.set_character_source(None)
 
     def apply_buff_results(self, now):
         session = self.session
@@ -1456,10 +1601,12 @@ class SharedController(tracker.MeasurementCore):
                 if not self.running and self.collect_recent():
                     if details.get('source_changed'):
                         self.recent_exp.clear()
+                        self.set_character_source(None)
                     elif value is None:
                         self.recent_exp.readable = False
                     else:
                         self.recent_exp.observe(details['source'], observed_at, value)
+                        self.set_character_source(details['source'][:2])
                 continue
             if not self.running: continue
             if self.recent_start_source is not None and (value is not None or details.get('level_changed')):
@@ -1497,11 +1644,7 @@ class SharedController(tracker.MeasurementCore):
                 self.buff_window = (generation, details.get('window_id'))
             if details.get('backend') in self.CAPTURE_BACKENDS:
                 source = (generation, details.get('window_id'))
-                if source != self.character_source:
-                    self.character_source = source
-                    self.character_candidate = (None, None)
-                    self.character_identity = (None, None)
-                    self.character_recheck_at = 0.0
+                self.set_character_source(source)
                 self.update_capture_label()
             before = len(self.session.rows)
             before_first, before_started = self.session.first, self.session.started
@@ -1578,27 +1721,7 @@ class SharedController(tracker.MeasurementCore):
                 self.hunt_activity.update(generation, stamp, observation)
         self.activity_label.setText(self.hunt_activity.text(self.generation, now) if self.running
                                     else '사냥 신호 · 측정 대기')
-        while not self.character_results.empty():
-            generation, window, current = self.character_results.get_nowait()
-            if not self.running or (generation, window) != self.character_source:
-                continue
-            self.character_identity = tuple(
-                reading if reading and reading == candidate else None
-                for reading, candidate in zip(current, self.character_candidate))
-            self.character_candidate = current
-            if all(self.character_identity):
-                self.character_recheck_at = time.monotonic() + self.CHARACTER_RECHECK_SECONDS
-            self.update_capture_label()
-            nickname = self.character_identity[1]
-            session = self.session
-            if nickname and not session.character_conflict and nickname != session.character_name:
-                session.character_conflict = session.character_name is not None
-                session.character_name = None if session.character_conflict else nickname
-                if session.rows:
-                    try:
-                        self.save_summary()
-                    except OSError as exc:
-                        tracker.log_error('사냥 기록 캐릭터 저장', exc)
+        self.apply_character_results(now)
         self.apply_buff_results(now)
         self.apply_meso_results(now)
         self.check_efficiency_change()
@@ -1690,6 +1813,7 @@ class SharedController(tracker.MeasurementCore):
                 'recent_recording': self.recent_recording, 'burning': self.burning,
                 'jev_enabled': self.jev_enabled, 'auto_measure': self.auto_measure,
                 'current_character': getattr(self, 'current_character', None),
+                'nickname_patterns': getattr(self, 'nickname_patterns', {}),
                 'cloud_remote': getattr(self, 'cloud_remote', None),
                 'meso_trade_threshold': getattr(self, 'meso_trade_threshold', meso.TRADE_THRESHOLD),
             }), encoding='utf-8')

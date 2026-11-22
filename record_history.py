@@ -93,7 +93,8 @@ def summarize(csv_path):
     import segments
     return dict(session_id=csv_path.stem, started=started, level=level, active=active, idle=idle,
                 character_name=session.character_name or assigned, exp_buff_intervals=session.exp_buff_intervals,
-                level_ups=len(session.level_ups), meso=session.meso.hunted(), meso_trade=session.meso.trade,
+                level_ups=len(session.level_ups), meso=session.meso.hunted(), meso_trade=session.meso.excluded_trade(),
+                meso_large_changes=len(session.meso.large_changes),
                 gained=gained, per_minute=rate['cumulative'], rate_gain=rate['rate_gain'],
                 rate_seconds=rate['duration'], gap=session.gap_seconds(0.0), gap_gain=session.gap_gain,
                 blocked=session.blocked, stop_reason=session.stop_reason,
@@ -472,10 +473,13 @@ def meso_cell(row):
 
 def meso_detail(row):
     if row.get('meso') is None:
-        return '메소 · 측정 시작과 끝에 인벤토리를 열지 않아 확인 안 됨'
+        return '메소 · 같은 캐릭터와 게임 창에서 시작·종료 잔액 확인 안 됨'
     trade = row.get('meso_trade') or 0
     per_minute = row['meso']*60/row['active'] if row['active'] else None
     text = f"메소 {row['meso']:+,}" + (f' · 분당 {per_minute:,.0f}' if per_minute is not None else '')
+    large = row.get('meso_large_changes') or 0
+    if large:
+        text += f' · 큰 변동 {large}건'
     return text + (f' (거래·구매 {trade:+,} 제외)' if trade else '')
 
 

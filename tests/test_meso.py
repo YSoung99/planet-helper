@@ -37,16 +37,24 @@ class ReaderTests(unittest.TestCase):
             self.assertEqual(reader.read(frame), 8890080)
         self.assertEqual(reader.box, (300, 400, 150, 18))
 
-    def test_remembered_box_is_read_first_and_dropped_when_gone(self):
+    def test_cached_box_rechecks_label_after_the_inventory_moves(self):
+        original = (300, 400, 150, 18)
+        moved = (24, 38, 150, 18)
         reader = meso.Reader()
-        reader.box = (1, 2, 3, 4)
-        with mock.patch.object(meso, 'read_amount', return_value=5) as read:
-            self.assertEqual(reader.read(inventory_frame()), 5)
-        read.assert_called_once()
-        with mock.patch.object(meso, 'read_amount', return_value=None), \
-             mock.patch.object(meso, 'white_boxes', return_value=[]):
-            self.assertIsNone(reader.read(inventory_frame()))
-        self.assertIsNone(reader.box)
+        first = inventory_frame(original)
+        second = inventory_frame(moved, trade_box=original)
+        ImageDraw.Draw(second).point((310, 405), fill=(0, 0, 0))
+        with mock.patch.object(meso, 'read_amount', return_value=5) as read, \
+             mock.patch.object(meso, 'has_label', side_effect=lambda frame, box:
+                               (frame is first and box == original) or (frame is second and box == moved)):
+            self.assertEqual(reader.read(first), 5)
+            calls = read.call_count
+            self.assertEqual(reader.read(first), 5)
+            self.assertEqual(read.call_count, calls)
+            self.assertEqual(reader.read(second), 5)
+            self.assertEqual(reader.box, moved)
+            self.assertIsNone(reader.read(Image.new('RGB', first.size)))
+            self.assertIsNone(reader.box)
 
     def test_amount_must_be_a_clean_number(self):
         frame = inventory_frame()
@@ -125,24 +133,56 @@ class ConfirmationTests(unittest.TestCase):
 
 
 class SessionMesoTests(unittest.TestCase):
-    def test_hunted_needs_two_readings(self):
+    def test_duplicate_and_distant_frames_do_not_confirm(self):
+        confirm = meso.Confirmation()
+        self.assertIsNone(confirm.observe(100, 1))
+        self.assertIsNone(confirm.observe(100, 1))
+        self.assertIsNone(confirm.observe(100, 20))
+        self.assertEqual(confirm.observe(100, 22), 100)
+
+    def test_single_opening_and_stale_end_do_not_complete(self):
         session = meso.SessionMeso()
+        source = (1, '본캐', 10)
+        for stamp in (2, 4, 6):
+            session.sample(100, source, stamp, 1, 0, 100)
+        session.finish(source, 7)
         self.assertIsNone(session.hunted())
-        session.observe(1000)
+        session.sample(100, source, 30, 2, 0, 100)
+        session.finish(source, 45)
         self.assertIsNone(session.hunted())
-        session.observe(1000)
+        session.finish(source, 32)
         self.assertEqual(session.hunted(), 0)
 
-    def test_large_changes_are_kept_out_of_hunting_meso(self):
+    def test_switching_windows_invalidates_the_delta_even_after_returning(self):
         session = meso.SessionMeso()
-        for value in (1_000_000, 1_050_000, 3_050_000, 3_100_000, 600_000):
-            session.observe(value, threshold=1_000_000)
-        self.assertEqual(session.trade, 2_000_000 - 2_500_000)
-        self.assertEqual(session.hunted(), 100_000)
+        source = (1, '본캐', 10)
+        self.assertTrue(session.sample(100, source, 2, 1, 0, 100))
+        self.assertFalse(session.sample(900, (1, '본캐', 20), 20, 2, 0, 100))
+        self.assertFalse(session.sample(300, source, 30, 3, 0, 100))
+        session.finish(source, 31)
+        self.assertIsNone(session.hunted())
+
+    def test_malformed_saved_balance_is_ignored(self):
+        session = meso.SessionMeso({'start': '100', 'end': 200, 'readings': '2',
+                                    'large_changes': 1, 'marked': [[0]]})
+        self.assertIsNone(session.hunted())
+        self.assertIsNone(session.as_dict())
+
+    def test_large_changes_count_until_marked_as_trade(self):
+        session = meso.SessionMeso()
+        source = (1, '본캐', 10)
+        session.sample(1_000_000, source, 2, 1, 0, 1_000_000)
+        session.sample(3_050_000, source, 32, 2, 0, 1_000_000)
+        session.finish(source, 34)
+        self.assertEqual(session.hunted(), 2_050_000)
+        session.toggle_trade(0)
+        self.assertEqual(session.hunted(), 0)
+        self.assertEqual(meso.SessionMeso(session.as_dict()).hunted(), 0)
 
     def test_round_trip(self):
         session = meso.SessionMeso()
         session.observe(10); session.observe(20)
+        session.complete = True
         again = meso.SessionMeso(session.as_dict())
         self.assertEqual((again.start, again.end, again.trade, again.hunted()), (10, 20, 0, 10))
         self.assertIsNone(meso.SessionMeso().as_dict())
@@ -166,6 +206,20 @@ class LogTests(unittest.TestCase):
 
 
 class RecordTests(unittest.TestCase):
+    def test_daily_log_loads_once_per_day_and_keeps_character_totals(self):
+        with tempfile.TemporaryDirectory() as base, mock.patch.object(meso, 'iter_entries', wraps=meso.iter_entries) as load:
+            log = meso.DailyLog()
+            first = datetime(2026, 11, 22, 10)
+            log.record(base, '본캐', 10, first)
+            log.record(base, '본캐', 30, first)
+            log.record(base, '부캐', 90, first)
+            self.assertEqual(log.change('본캐'), 20)
+            self.assertEqual(log.change('부캐'), 0)
+            self.assertEqual(load.call_count, 1)
+            log.record(base, '본캐', 30, datetime(2026, 11, 23, 10))
+            self.assertEqual(log.change('본캐'), 0)
+            self.assertEqual(load.call_count, 2)
+
     def test_saved_record_keeps_session_meso(self):
         import json
         import record_history
@@ -178,12 +232,14 @@ class RecordTests(unittest.TestCase):
                     session.accept(value, stamp)
                 for value in (1_000_000, 1_120_000):
                     session.meso.observe(value)
+                session.meso.complete = True
                 writer = tracker.App.__new__(tracker.App)
                 writer.session = session
                 with mock.patch.object(tracker.time, 'monotonic', return_value=62):
                     writer.save_observation()
             saved = json.loads((Path(base)/'records'/f'{session.session_id}.json').read_text(encoding='utf-8'))
-            self.assertEqual(saved['meso'], {'start': 1_000_000, 'end': 1_120_000, 'trade': 0, 'readings': 2})
+            self.assertEqual(saved['meso'], {'start': 1_000_000, 'end': 1_120_000, 'trade': 0, 'readings': 2,
+                                             'complete': True, 'large_changes': [], 'marked': []})
             row, = record_history.collect(base)
             self.assertEqual((row['meso'], row['meso_trade']), (120_000, 0))
 
