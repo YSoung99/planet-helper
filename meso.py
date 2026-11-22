@@ -340,10 +340,13 @@ class SessionMeso:
     def toggle_trade(self, index):
         self.marked.symmetric_difference_update({index})
 
-    def hunted(self):
-        if not self.complete or self.readings < 2 or self.start is None or self.end is None:
+    def observed_delta(self):
+        if self.readings < 2 or self.start is None or self.end is None:
             return None
         return self.end - self.start - self.excluded_trade()
+
+    def hunted(self):
+        return self.observed_delta() if self.complete else None
 
     def excluded_trade(self):
         if self.legacy:

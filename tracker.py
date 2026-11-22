@@ -25,7 +25,7 @@ RESOURCES = Path(getattr(sys, '_MEIPASS', Path(__file__).resolve().parent))
 BASE = Path(os.environ.get('PLANET_EXP_DATA_DIR') or (
     Path.home()/'Library'/'Application Support'/'Maple Planet Helper Auto Trial'
     if sys.platform == 'darwin' else Path(__file__).resolve().parent))
-APP_VERSION = '1.4.20'
+APP_VERSION = '1.4.21'
 MAX_BOUNDARY_GAP = 10.0
 BURNING_MAX_LEVEL = 120  # Planet Up & Up grants one bonus level, capped at 120.
 REST_AFTER = 180.0  # EXP unchanged this long: rest counted from the last gain

@@ -34,6 +34,9 @@ class ViewTests(unittest.TestCase):
         c = self.c
         c.toggle_display()
         self.assertTrue(c.meso_label.isVisibleTo(c.window))
+        self.assertTrue(c.meso_delta_label.isVisibleTo(c.window))
+        self.assertIs(c.meso_delta_label.parentWidget(), c.total_label.parentWidget())
+        self.assertEqual(c.meso_delta_label.text(), '—')
         c.running = True
         c.current_character = '본캐'
         c.session.created_monotonic = 100.0
@@ -43,7 +46,12 @@ class ViewTests(unittest.TestCase):
             c.apply_meso_results(stamp)
         c.meso_results.put((c.generation, 20, 127, '부캐', 999))
         c.apply_meso_results(127)
-        self.assertEqual(c.meso_label.text(), '메소 3,250,000 · 잔액 변화 +2,250,000 · 큰 변동 1건')
+        self.assertEqual(c.meso_label.text(), '메소 3,250,000 · 큰 변동 1건')
+        self.assertEqual(c.meso_delta_label.text(), '+2,250,000')
+        c.session.meso.toggle_trade(0)
+        c.apply_meso_results(127)
+        self.assertEqual(c.meso_delta_label.text(), '+0')
+        c.session.meso.toggle_trade(0)
         import meso
         self.assertEqual([value for _, _, value in meso.load(tracker.BASE)], [1_000_000, 3_250_000])
         self.assertIsNone(c.session.meso.hunted())

@@ -935,6 +935,13 @@ class SharedController(tracker.MeasurementCore):
         ready = self.meso_status(now)
         if self.meso_status_label.text() != ready:
             self.meso_status_label.setText(ready)
+        delta = session.meso.hunted()
+        if (self.running and not session.meso.source_changed
+                and session.meso.source == self.meso_source):
+            delta = session.meso.observed_delta()
+        amount = '—' if delta is None else f'{delta:+,}'
+        if self.meso_delta_label.text() != amount:
+            self.meso_delta_label.setText(amount)
 
     def meso_status(self, now):
         balance = self.session.meso
@@ -959,13 +966,11 @@ class SharedController(tracker.MeasurementCore):
                 if balance.start is None:
                     return text + ' · 시작 후 30초 안의 잔액 필요'
                 return text + ' · 종료 직전에 인벤토리를 다시 열어 주세요'
-            delta = balance.end - balance.start
-            text += f' · 잔액 변화 {delta:+,}'
             if balance.large_changes:
                 text += f' · 큰 변동 {len(balance.large_changes)}건'
             excluded = balance.excluded_trade()
             if excluded:
-                text += f' · 거래 제외 후 {delta - excluded:+,}'
+                text += f' · 거래·구매 {excluded:+,} 제외'
             return text
         today = self.meso_log.change(self.meso_character())
         return text + (f' · 오늘 {today:+,}' if today is not None else '')
