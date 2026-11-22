@@ -94,6 +94,27 @@ class ReaderTests(unittest.TestCase):
             self.assertEqual(reader.read(lower, 3), 95)
             self.assertFalse(reader.needs_recheck)
 
+    def test_short_balance_uses_the_tight_crop_and_still_needs_agreement(self):
+        box = (300, 400, 150, 18)
+        frame = add_amount_glyphs(inventory_frame(box), box, '0')
+        for binary, expected in ((0, 0), (8, None), (None, None)):
+            with self.subTest(binary=binary), mock.patch.object(
+                meso, 'read_amount', return_value=None
+            ), mock.patch.object(meso, 'read_gray_amount', return_value=0) as gray, \
+                 mock.patch.object(meso, 'read_binary_amount', return_value=binary), \
+                 mock.patch.object(meso, 'has_label', return_value=True):
+                reader = meso.Reader()
+                self.assertEqual(reader.check(frame, box, 1), expected)
+                gray.assert_called_once()
+                self.assertEqual(reader.needs_recheck, expected is None)
+
+    def test_binary_retries_native_scale_only_when_the_enlarged_read_fails(self):
+        glyph = Image.new('L', (15, 22), 255)
+        with mock.patch.object(meso, 'recognize_amount', side_effect=[None, 0]) as recognize:
+            self.assertEqual(meso.read_binary_amount(glyph), 0)
+        self.assertEqual([call.args[0].size for call in recognize.call_args_list],
+                         [(46, 60), (35, 32)])
+
     def test_amount_must_be_a_clean_number(self):
         frame = inventory_frame()
         box = (300, 400, 150, 18)
@@ -121,6 +142,16 @@ class ReaderTests(unittest.TestCase):
         for lines in ([('8,890,080 메소', .95)], [('0', .9)]):
             with mock.patch('map_name.recognize_lines', return_value=lines):
                 self.assertEqual(meso.has_label(frame, box), lines[0][0] != '0')
+
+    def test_small_new_ui_reads_the_label_to_the_left_without_text_detection(self):
+        frame = inventory_frame()
+        box = (180, 496, 185, 23)
+        readings = [[('24,608,229', .99)], [('메소', .98382)]]
+        with mock.patch('map_name.recognize_lines', side_effect=readings) as recognize:
+            self.assertTrue(meso.has_label(frame, box))
+        label = recognize.call_args.args[0]
+        self.assertEqual(recognize.call_args.kwargs, {'detect': False})
+        self.assertEqual(label.size, (2 * round(23 * 2.45) + 24, 2 * 23 + 24))
 
     def test_native_size_new_ui_retries_the_left_label_without_accepting_other_text(self):
         frame = inventory_frame()

@@ -129,13 +129,26 @@ def amount_glyphs(frame, box):
                       left + margin + glyph_right, margin + rows[-1] + 1))
 
 
+def read_gray_amount(glyphs):
+    """Retry the original shading without the empty area or the label beside the digits."""
+    from PIL import Image, ImageOps
+
+    scale = max(2, round(40 / glyphs.height))
+    scaled = glyphs.resize((glyphs.width * scale, glyphs.height * scale), Image.Resampling.LANCZOS)
+    return recognize_amount(ImageOps.expand(scaled, border=(10, 5), fill=255))
+
+
 def read_binary_amount(glyphs):
     from PIL import Image, ImageOps
 
     binary = glyphs.point(lambda pixel: 0 if pixel < 135 else 255)
     scale = max(2, round(40 / glyphs.height))
-    binary = binary.resize((binary.width * scale, binary.height * scale), Image.Resampling.NEAREST)
-    return recognize_amount(ImageOps.expand(binary, border=8, fill=255))
+    scaled = binary.resize((binary.width * scale, binary.height * scale), Image.Resampling.NEAREST)
+    value = recognize_amount(ImageOps.expand(scaled, border=8, fill=255))
+    if value is not None:
+        return value
+    # A narrow glyph such as 0 can become ambiguous after enlargement.
+    return recognize_amount(ImageOps.expand(binary, border=(10, 5), fill=255))
 
 
 def has_label(frame, box):
@@ -153,15 +166,21 @@ def has_label(frame, box):
     if any('메소' in text for text, _ in map_name.recognize_lines(crop, detect=True)):
         return True
 
-    # The new UI's bright strip can start inside the label button itself.
-    # At native scale the detector may skip the white glyphs on that grey button.
+    # In small new UI windows the bright strip starts after the label.
+    # In larger windows it can include part of the grey label button.
     if scale > 1:
-        return False
-    label = frame.crop((x, y, min(width, x + round(h * 1.55)), y + h)).convert('RGB')
+        left, right = max(0, x - round(h * 2.45)), x
+        if right - left < h:
+            return False
+        detect = False
+    else:
+        left, right = x, min(width, x + round(h * 1.55))
+        detect = True
+    label = frame.crop((left, y, right, y + h)).convert('RGB')
     enlarged = label.resize((label.width * 2, label.height * 2), Image.Resampling.LANCZOS)
     enlarged = ImageOps.expand(enlarged, border=12, fill=(0, 0, 0))
     return any(''.join(text.split()) == '메소' and score >= MIN_SCORE
-               for text, score in map_name.recognize_lines(enlarged, detect=True))
+               for text, score in map_name.recognize_lines(enlarged, detect=detect))
 
 
 class Reader:
@@ -223,6 +242,8 @@ class Reader:
         key = glyphs.size, glyphs.tobytes()
         reuse = self.last_glyphs is not None and self.last_glyphs[0] == key
         value = self.last_glyphs[1] if reuse else read_amount(frame, box)
+        if value is None:
+            value = read_gray_amount(glyphs)
         if value is not None and has_label(frame, box):
             self.box = box
             if not reuse and read_binary_amount(glyphs) != value:
