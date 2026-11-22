@@ -18,6 +18,12 @@ def inventory_frame(box=(300, 400, 150, 18), trade_box=(60, 200, 120, 18)):
     return frame
 
 
+def add_amount_glyphs(frame, box, text='105'):
+    x, y, w, _ = box
+    ImageDraw.Draw(frame).text((x + w - 28, y + 4), text, fill=(0, 0, 0))
+    return frame
+
+
 class ReaderTests(unittest.TestCase):
     def test_white_boxes_finds_wide_boxes_only(self):
         frame = inventory_frame()
@@ -25,14 +31,15 @@ class ReaderTests(unittest.TestCase):
         self.assertEqual(sorted(meso.white_boxes(frame)), [(60, 200, 120, 18), (300, 400, 150, 18)])
 
     def test_box_without_the_meso_label_is_ignored(self):
-        frame = inventory_frame()
+        frame = add_amount_glyphs(inventory_frame(), (300, 400, 150, 18))
         calls = []
 
         def label(frame, box):
             calls.append(box)
             return box == (300, 400, 150, 18)
         with mock.patch.object(meso, 'has_label', side_effect=label), \
-             mock.patch.object(meso, 'read_amount', return_value=8890080):
+             mock.patch.object(meso, 'read_amount', return_value=8890080), \
+             mock.patch.object(meso, 'read_binary_amount', return_value=8890080):
             reader = meso.Reader()
             self.assertEqual(reader.read(frame), 8890080)
         self.assertEqual(reader.box, (300, 400, 150, 18))
@@ -41,10 +48,11 @@ class ReaderTests(unittest.TestCase):
         original = (300, 400, 150, 18)
         moved = (24, 38, 150, 18)
         reader = meso.Reader()
-        first = inventory_frame(original)
-        second = inventory_frame(moved, trade_box=original)
+        first = add_amount_glyphs(inventory_frame(original), original)
+        second = add_amount_glyphs(inventory_frame(moved, trade_box=original), moved)
         ImageDraw.Draw(second).point((310, 405), fill=(0, 0, 0))
         with mock.patch.object(meso, 'read_amount', return_value=5) as read, \
+             mock.patch.object(meso, 'read_binary_amount', return_value=5), \
              mock.patch.object(meso, 'has_label', side_effect=lambda frame, box:
                                (frame is first and box == original) or (frame is second and box == moved)):
             self.assertEqual(reader.read(first), 5)
@@ -55,6 +63,36 @@ class ReaderTests(unittest.TestCase):
             self.assertEqual(reader.box, moved)
             self.assertIsNone(reader.read(Image.new('RGB', first.size)))
             self.assertIsNone(reader.box)
+
+    def test_same_digits_survive_an_inventory_move_without_repeating_amount_ocr(self):
+        original = (300, 400, 150, 18)
+        moved = (24, 38, 150, 18)
+        first = add_amount_glyphs(inventory_frame(original), original)
+        second = add_amount_glyphs(inventory_frame(moved), moved)
+        reader = meso.Reader()
+        with mock.patch.object(meso, 'read_amount', return_value=105) as color, \
+             mock.patch.object(meso, 'read_binary_amount', return_value=105) as binary, \
+             mock.patch.object(meso, 'has_label', return_value=True) as label:
+            self.assertEqual(reader.check(first, original, 1), 105)
+            self.assertEqual(reader.check(second, moved, 2), 105)
+        self.assertEqual(color.call_count, 1)
+        self.assertEqual(binary.call_count, 1)
+        self.assertEqual(label.call_count, 2)
+
+    def test_changed_digits_need_color_and_binary_ocr_to_agree(self):
+        box = (300, 400, 150, 18)
+        first = add_amount_glyphs(inventory_frame(box), box, '105')
+        lower = add_amount_glyphs(inventory_frame(box), box, '95')
+        reader = meso.Reader()
+        with mock.patch.object(meso, 'read_amount', side_effect=[105, 95, 95]), \
+             mock.patch.object(meso, 'read_binary_amount', side_effect=[105, 85, 95]), \
+             mock.patch.object(meso, 'has_label', return_value=True):
+            self.assertEqual(reader.check(first, box, 1), 105)
+            self.assertIsNone(reader.read(lower, 2))
+            self.assertTrue(reader.needs_recheck)
+            self.assertEqual(reader.last_glyphs[1], 105)
+            self.assertEqual(reader.read(lower, 3), 95)
+            self.assertFalse(reader.needs_recheck)
 
     def test_amount_must_be_a_clean_number(self):
         frame = inventory_frame()
@@ -116,6 +154,8 @@ class ReaderTests(unittest.TestCase):
 
     def test_numbers_without_the_label_are_skipped_for_a_while(self):
         frame = inventory_frame()
+        add_amount_glyphs(frame, (60, 200, 120, 18))
+        add_amount_glyphs(frame, (300, 400, 150, 18))
         reader = meso.Reader()
         with mock.patch.object(meso, 'read_amount', return_value=0), \
              mock.patch.object(meso, 'has_label', return_value=False) as label:

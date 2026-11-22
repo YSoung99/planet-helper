@@ -7,25 +7,8 @@ from unittest.mock import patch
 
 from PySide6.QtWidgets import QApplication, QInputDialog, QMessageBox
 
-import qt_controller
 import tracker
 from mac_app import Controller
-
-
-class FakeMenu:
-    """Records labels; Qt's exec() would block offscreen."""
-    labels = []
-
-    def __init__(self, parent=None, title=''):
-        if title: FakeMenu.labels.append(title)
-
-    def addAction(self, label, *args):
-        FakeMenu.labels.append(label)
-        return qt_controller.QAction(label)
-
-    def addMenu(self, title): return FakeMenu(title=title)
-    def addSeparator(self): pass
-    def exec(self, *args): return None
 
 
 class RecordsMenuTests(unittest.TestCase):
@@ -41,13 +24,18 @@ class RecordsMenuTests(unittest.TestCase):
         self.c.key_repeat.shutdown(); self.c.start_captures.close(); self.c.window.hide(); self.c.window.deleteLater()
         self.app.processEvents(); self.base.stop(); self.temp.cleanup()
 
-    def test_menu_lists_the_new_record_tools(self):
-        FakeMenu.labels = []
-        with patch.object(qt_controller, 'QMenu', FakeMenu):
-            self.c.context_menu(self.c.window.rect().center())
-        for label in ('오늘·이번 주 요약', '현재 캐릭터: 지정 안 함…', '기록 백업·옮기기',
-                      '백업 파일로 내보내기…', '백업 파일에서 가져오기 (합치기)…'):
-            self.assertIn(label, FakeMenu.labels)
+    def test_menu_groups_actions_and_keeps_frequent_actions_at_the_top(self):
+        menu = self.c.build_context_menu()
+        self.addCleanup(menu.deleteLater)
+        actions = {action.text(): action for action in menu.actions() if not action.isSeparator()}
+        self.assertEqual(list(actions), ['사냥 기록 비교', '이번 사냥터 메모', '측정·화면', '게임 인식',
+                                         '메소·버프', '기록·백업', '도움말·권한', '종료'])
+        records = {a.text() for a in actions['기록·백업'].menu().actions()}
+        self.assertTrue({'오늘·이번 주 요약', '백업 파일로 내보내기…',
+                         '백업 파일에서 가져오기 (합치기)…', 'CSV 저장…'} <= records)
+        recognition = {a.text() for a in actions['게임 인식'].menu().actions()}
+        self.assertTrue({'현재 캐릭터: 지정 안 함…', '현재 닉네임 등록·수정…',
+                         '경험치 영역 지정…'} <= recognition)
 
     def test_choosing_a_character_is_saved_and_survives_restart(self):
         with patch.object(QInputDialog, 'getItem', staticmethod(lambda *args: ('  곰곰스렁 ', True))):

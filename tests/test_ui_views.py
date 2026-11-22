@@ -141,6 +141,25 @@ class ViewTests(unittest.TestCase):
         self.assertEqual(c.session.meso.last_seen, 131.0)
         self.assertEqual(c.meso_status_label.text(), '시작 잔액 확인 · 종료 잔액 대기')
 
+    def test_meso_ocr_disagreement_holds_the_last_value_until_a_real_decrease_is_confirmed(self):
+        import meso
+        c = self.c
+        c.running = True
+        c.session.meso_start_at = 100.0
+        for stamp, value in ((101, 100), (102, 100), (103, 110), (104, 110),
+                             (105, meso.RECHECK)):
+            c.meso_results.put((c.generation, 20, stamp, '', value))
+            c.apply_meso_results(stamp)
+        self.assertEqual(c.meso_delta_label.text(), '+10')
+        self.assertEqual(c.meso_label.text(), '메소 110 · 잔액 재확인 중')
+        self.assertEqual(c.meso_status_label.text(), '시작 잔액 확인 · 종료 잔액 대기')
+        self.assertEqual([amount for _, _, amount in meso.load(tracker.BASE)], [100, 110])
+        for stamp in (106, 107):
+            c.meso_results.put((c.generation, 20, stamp, '', 95))
+            c.apply_meso_results(stamp)
+        self.assertEqual(c.meso_delta_label.text(), '-5')
+        self.assertEqual(c.meso_status_label.text(), '시작 잔액 확인 · 종료 잔액 확인')
+
     def test_meso_confirmation_status_expires_before_stop(self):
         c = self.c
         c.running = True
@@ -196,6 +215,17 @@ class ViewTests(unittest.TestCase):
         rate['cumulative']=100
         self.assertIn('(11/24 17:30)',level_eta_text(rate,session,compact=True,now=now))
 
+    def test_detailed_view_keeps_controls_for_the_active_recognition_mode(self):
+        c = self.c
+        c.toggle_display()
+        self.assertFalse(c.region_button.isVisibleTo(c.window))
+        self.assertTrue(c.auto_checkbox.isVisibleTo(c.window))
+        c.auto_checkbox.setChecked(False)
+        self.assertTrue(c.region_button.isVisibleTo(c.window))
+        self.assertTrue(c.level_picker.isEnabled())
+        c.auto_checkbox.setChecked(True)
+        self.assertFalse(c.region_button.isVisibleTo(c.window))
+
     def test_pin_button_is_reachable_in_both_views(self):
         c=self.c
         self.assertTrue(c.compact);self.assertTrue(c.pin_button.isVisibleTo(c.window))
@@ -203,7 +233,7 @@ class ViewTests(unittest.TestCase):
         c.pin_button.click();self.assertFalse(c.always_on_top);self.assertEqual(c.pin_button.text(),'맨 위 끔')
         c.toggle_display()
         self.assertTrue(c.pin_button.isVisibleTo(c.window))
-        self.assertEqual(c.character_controls.indexOf(c.pin_button),3)
+        self.assertEqual(c.header_layout.indexOf(c.pin_button), c.header_layout.indexOf(c.mode_button)-1)
 
     def test_compact_view_keeps_new_measurement_button(self):
         c=self.c

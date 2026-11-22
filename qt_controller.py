@@ -348,6 +348,7 @@ class SharedController(tracker.MeasurementCore):
         self.meso_capture_lock = threading.Lock()
         self.meso_results = queue.SimpleQueue()
         self.meso_confirmation = meso.Confirmation()
+        self.meso_rechecking = False
         self.meso_log = meso.DailyLog()
         self.meso_source = None
         self.meso_opening = 0
@@ -441,6 +442,8 @@ class SharedController(tracker.MeasurementCore):
         self.auto_rescan.set()
         self.save_config()
         self.status.set('자동 인식 준비 · 측정 시작을 눌러 주세요' if enabled else '수동 인식 · 영역과 레벨을 확인해 주세요')
+        from display_panel import resize
+        resize(self)
 
     def opacity_settings(self):
         from PySide6.QtWidgets import QInputDialog
@@ -761,54 +764,72 @@ class SharedController(tracker.MeasurementCore):
         self.window.activateWindow()
 
     def context_menu(self, point):
+        menu = self.build_context_menu()
+        try:
+            menu.exec(self.window.mapToGlobal(point))
+        finally:
+            menu.deleteLater()
+
+    def build_context_menu(self):
         menu = QMenu(self.window)
-        menu.addAction('정보', self.show_information)
         menu.addAction('사냥 기록 비교', self.show_history)
-        menu.addAction('오늘·이번 주 요약', self.show_period_summary)
-        menu.addAction(f"현재 캐릭터: {self.current_character or '지정 안 함'}…", self.choose_character)
-        pinned = menu.addAction('항상 맨 위')
-        pinned.setCheckable(True)
-        pinned.setChecked(self.always_on_top)
-        pinned.toggled.connect(self.toggle_pin)
-        menu.addAction('연타 설정', self.repeat_settings)
-        buff_menu = menu.addMenu('경험치 버프 아이콘 등록')
-        for kind, label in exp_buffs.LABELS.items():
-            buff_menu.addAction(f'{label} 아이콘 등록',
-                                lambda checked=False, key=kind: self.register_buff_icon(key))
-        collect = menu.addAction('대기 중 최근 경험치 모으기')
-        collect.setCheckable(True)
-        collect.setChecked(self.recent_recording)
-        collect.toggled.connect(self.set_recent_recording)
-        automatic = menu.addAction('경험치 증가 시 자동 측정 · 5분 정지 시 자동 종료')
-        automatic.setCheckable(True)
-        automatic.setChecked(self.auto_measure)
-        automatic.toggled.connect(self.set_auto_measure)
-        burning = menu.addAction('플래닛 버닝 적용')
-        burning.setCheckable(True)
-        burning.setChecked(self.burning)
-        burning.toggled.connect(self.set_burning)
         menu.addAction('이번 사냥터 메모', self.edit_memo)
-        menu.addAction('JEV API 키 설정', self.api_key_settings)
-        menu.addAction('현재 닉네임 등록·수정…', self.register_nickname)
-        menu.addAction('메소 큰 변동 기준 금액', self.meso_threshold_settings)
-        menu.addAction('이번 측정의 큰 메소 변동 분류…', self.classify_meso_change)
-        menu.addAction('배경 투명도', self.opacity_settings)
-        menu.addAction('기록 폴더 열기', self.open_records)
-        backup_menu = menu.addMenu('기록 백업·옮기기')
-        backup_menu.addAction('백업 파일로 내보내기…', self.export_records)
-        backup_menu.addAction('백업 파일에서 가져오기 (합치기)…', self.import_records)
-        backup_menu.addAction('자동 백업 폴더 열기 (하루 1번 · 14일 보관)', self.open_backups)
-        backup_menu.addSeparator()
-        backup_menu.addAction('구글 드라이브 동기화 설정…', self.cloud_settings)
+        menu.addSeparator()
+
+        def add_toggle(parent, title, checked, callback):
+            action = parent.addAction(title)
+            action.setCheckable(True)
+            action.setChecked(checked)
+            action.toggled.connect(callback)
+
+        measurement = menu.addMenu('측정·화면')
+        add_toggle(measurement, '항상 맨 위', self.always_on_top, self.toggle_pin)
+        measurement.addAction('배경 투명도', self.opacity_settings)
+        measurement.addSeparator()
+        add_toggle(measurement, '경험치 증가 시 자동 측정', self.auto_measure, self.set_auto_measure)
+        add_toggle(measurement, '대기 중 최근 경험치 모으기', self.recent_recording, self.set_recent_recording)
+        add_toggle(measurement, '플래닛 버닝 적용', self.burning, self.set_burning)
+        measurement.addAction('연타 설정', self.repeat_settings)
+
+        recognition = menu.addMenu('게임 인식')
+        recognition.addAction(f"현재 캐릭터: {self.current_character or '지정 안 함'}…", self.choose_character)
+        recognition.addAction('현재 닉네임 등록·수정…', self.register_nickname)
+        recognition.addSeparator()
+        recognition.addAction('경험치 영역 지정…', self.select)
+        recognition.addAction('JEV API 키 설정', self.api_key_settings)
+
+        gains = menu.addMenu('메소·버프')
+        gains.addAction('메소 큰 변동 기준 금액', self.meso_threshold_settings)
+        gains.addAction('이번 측정의 큰 메소 변동 분류…', self.classify_meso_change)
+        gains.addSeparator()
+        for kind, label in exp_buffs.LABELS.items():
+            gains.addAction(f'{label} 아이콘 등록…',
+                            lambda checked=False, key=kind: self.register_buff_icon(key))
+
+        records = menu.addMenu('기록·백업')
+        records.addAction('오늘·이번 주 요약', self.show_period_summary)
+        records.addAction('CSV 저장…', self.export)
+        records.addAction('기록 폴더 열기', self.open_records)
+        records.addSeparator()
+        records.addAction('백업 파일로 내보내기…', self.export_records)
+        records.addAction('백업 파일에서 가져오기 (합치기)…', self.import_records)
+        records.addAction('자동 백업 폴더 열기', self.open_backups)
+        records.addSeparator()
+        records.addAction('구글 드라이브 동기화 설정…', self.cloud_settings)
         if self.cloud_remote:
-            backup_menu.addAction('지금 동기화', lambda: self.start_cloud_sync(manual=True))
+            records.addAction('지금 동기화', lambda: self.start_cloud_sync(manual=True))
             import cloud_sync
-            info = backup_menu.addAction(cloud_sync.describe(cloud_sync.load_state()))
+            info = records.addAction(cloud_sync.describe(cloud_sync.load_state()))
             info.setEnabled(False)
-        menu.addAction('시작 화면 폴더 열기', self.open_start_captures)
-        self.extra_menu_actions(menu)
-        menu.addSeparator(); menu.addAction('종료', self.close)
-        menu.exec(self.window.mapToGlobal(point))
+
+        help_menu = menu.addMenu('도움말·권한')
+        help_menu.addAction('인식 정보', self.show_information)
+        help_menu.addAction('시작 화면 폴더 열기', self.open_start_captures)
+        self.extra_menu_actions(help_menu)
+
+        menu.addSeparator()
+        menu.addAction('종료', self.close)
+        return menu
 
     def register_buff_icon(self, kind):
         label = exp_buffs.LABELS[kind]
@@ -890,6 +911,7 @@ class SharedController(tracker.MeasurementCore):
         self.meso_source = source
         self.meso_visible = False
         self.meso_confirmation = meso.Confirmation()
+        self.meso_rechecking = False
 
     def apply_meso_results(self, now, *, finishing=False):
         session = self.session
@@ -915,6 +937,10 @@ class SharedController(tracker.MeasurementCore):
             session.meso.check_source(source)
             if source != self.meso_source:
                 self.clear_meso_confirmation(source)
+            if value is meso.RECHECK:
+                self.meso_rechecking = True
+                self.meso_confirmation.observe(None, stamp)
+                continue
             if value is None:
                 self.meso_visible = False
             elif not self.meso_visible:
@@ -922,7 +948,10 @@ class SharedController(tracker.MeasurementCore):
                 self.meso_visible = True
             confirmed = self.meso_confirmation.observe(value, stamp)
             if confirmed is None:
+                if value is not None and session.meso.end is not None:
+                    self.meso_rechecking = True
                 continue
+            self.meso_rechecking = False
             try:
                 self.meso_log.record(tracker.BASE, character, confirmed, datetime.now())
             except OSError as exc:
@@ -959,11 +988,17 @@ class SharedController(tracker.MeasurementCore):
         if (self.running and balance.start is None and self.session.meso_start_at is not None
                 and now - self.session.meso_start_at > meso.START_WINDOW):
             start = '시작 잔액 확인 시간 지남'
-        end = balance.end_ready(self.meso_source, now) if self.running else balance.complete
+        end = balance.complete
+        if self.running:
+            end = not self.meso_rechecking and balance.end_ready(self.meso_source, now)
         return start + (' · 종료 잔액 확인' if end else ' · 종료 잔액 대기')
 
     def meso_text(self):
         current = self.meso_confirmation.current
+        if self.running and self.meso_rechecking:
+            if self.session.meso.end is not None:
+                current = self.session.meso.end
+            return ('메소' if current is None else f'메소 {current:,}') + ' · 잔액 재확인 중'
         if current is None:
             return '메소 · 측정 중 인벤토리를 열면 기록'
         text = f'메소 {current:,}'
@@ -1112,6 +1147,8 @@ class SharedController(tracker.MeasurementCore):
         self.auto_checkbox.setChecked(False)
         self.auto_checkbox.blockSignals(previous)
         self.save_config(); self.reset()
+        from display_panel import resize
+        resize(self)
         if selection_image is not None:
             pixel_rect = self.capture_module().pixel_rect
             left,top,width,height=pixel_rect(roi,selection_image.width,selection_image.height)
@@ -1198,7 +1235,7 @@ class SharedController(tracker.MeasurementCore):
         if self.running and not self.session.restored and hasattr(self, 'meso_results'):
             now = time.monotonic()
             self.apply_meso_results(now, finishing=True)
-            self.session.meso.finish(self.meso_source, now)
+            self.session.meso.finish(None if self.meso_rechecking else self.meso_source, now)
         had_record = bool(self.session.rows) and not self.session.restored
         if not super().finish_measurement(reason):
             return False
@@ -1338,6 +1375,8 @@ class SharedController(tracker.MeasurementCore):
                     self.meso_reader = meso.Reader()
                     self.meso_reader_source = source
                 value = self.meso_reader.read(frame, stamp)
+                if self.meso_reader.needs_recheck:
+                    value = meso.RECHECK
                 self.meso_results.put((generation, window, stamp, character, value))
         except Exception as exc:
             tracker.log_error('메소 판독', exc)
@@ -1455,8 +1494,7 @@ class SharedController(tracker.MeasurementCore):
         if self.jev_status.text() != text:
             self.jev_status.setText(text)
             self.jev_status.setVisible(bool(text))
-            from display_panel import resize
-            resize(self)
+            self.jev_button.setAccessibleDescription(text)
 
     def apply_map_results(self):
         from record_history import load_memos, save_memo
@@ -1815,7 +1853,8 @@ class SharedController(tracker.MeasurementCore):
         if footer_style != self.footer.styleSheet():
             self.footer.setStyleSheet(footer_style)
         self.current_label.setText(self.value.get())
-        self.baseline_label.setText(f'시작 기준 {self.session.first[0]:,}' if self.session.first else '시작 기준 —')
+        starting_exp = self.session.rows[0][1] if self.session.rows else None
+        self.baseline_label.setText(f'시작 기준 {starting_exp:,}' if starting_exp is not None else '시작 기준 —')
         checked = str(self.session.level) in tracker.EXP_METADATA.get('screenshot_verified',{})
         if self.session.level is not None and self.session.level in tracker.EXP_TABLE:
             table_text = (f'남음 {self.session.total-self.session.last[0]:,} · 통 {self.session.total:,}'

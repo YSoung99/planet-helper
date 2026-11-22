@@ -21,6 +21,7 @@ CONFIRMATION_GAP = 8.0
 START_WINDOW = 30.0
 # A reading this many times larger or smaller than the last one is usually a dropped or extra digit.
 JUMP_RATIO = 10
+RECHECK = object()
 
 
 def longest_run(flags, bridge=0):
@@ -74,26 +75,67 @@ def white_boxes(frame):
 HANGUL = re.compile('[가-힣]')
 
 
-def read_amount(frame, box):
-    """The amount inside a white box, or None when it is not a clean number.
-
-    In the new UI the band also catches the edge of the 메소 button, so Hangul is dropped."""
-    from PIL import Image, ImageOps
+def recognize_amount(crop, *, allow_hangul=False):
     import map_name
+
+    lines = map_name.recognize_lines(crop, detect=False)
+    if len(lines) != 1:
+        return None
+    text, score = lines[0]
+    if allow_hangul:
+        text = HANGUL.sub('', text)
+    text = ''.join(text.split()).replace('.', ',')
+    if score < MIN_SCORE or not AMOUNT.fullmatch(text):
+        return None
+    return int(text.replace(',', ''))
+
+
+def read_amount(frame, box):
+    """Read the original color strip, which can include the edge of the new UI label."""
+    from PIL import Image, ImageOps
 
     x, y, w, h = box
     crop = frame.crop((x, y, x + w, y + h)).convert('RGB')
     scale = max(1, round(40 / max(1, h)))
     crop = ImageOps.expand(crop.resize((crop.width * scale, crop.height * scale), Image.Resampling.LANCZOS),
                            border=8, fill=(255, 255, 255))
-    lines = map_name.recognize_lines(crop, detect=False)
-    if len(lines) != 1:
+    return recognize_amount(crop, allow_hangul=True)
+
+
+def amount_glyphs(frame, box):
+    """Isolate the right-aligned dark glyphs inside the light amount field."""
+    import numpy as np
+
+    x, y, w, h = box
+    gray = frame.crop((x, y, x + w, y + h)).convert('L')
+    pixels = np.asarray(gray)
+    left, right = longest_run((pixels >= 222).mean(axis=0) >= .32, bridge=max(2, round(h * .3)))
+    margin = max(1, h // 24)
+    if right - left < h or h <= margin * 2:
         return None
-    text, score = lines[0]
-    text = HANGUL.sub('', text).replace(' ', '').replace('.', ',')
-    if score < MIN_SCORE or not AMOUNT.fullmatch(text):
+    interior = pixels[margin:h - margin, left + margin:right - margin]
+    ink = interior < 135
+    # Separate the glyph run from the label and any isolated specks to its left.
+    columns = np.flatnonzero(ink.any(axis=0))
+    if not len(columns):
         return None
-    return int(text.replace(',', ''))
+    gaps = np.flatnonzero(np.diff(columns) > max(3, round(h * .3)))
+    glyph_left = columns[gaps[-1] + 1] if len(gaps) else columns[0]
+    glyph_right = columns[-1] + 1
+    rows = np.flatnonzero(ink[:, glyph_left:glyph_right].any(axis=1))
+    if rows[-1] - rows[0] + 1 < max(4, h // 3):
+        return None
+    return gray.crop((left + margin + glyph_left, margin + rows[0],
+                      left + margin + glyph_right, margin + rows[-1] + 1))
+
+
+def read_binary_amount(glyphs):
+    from PIL import Image, ImageOps
+
+    binary = glyphs.point(lambda pixel: 0 if pixel < 135 else 255)
+    scale = max(2, round(40 / glyphs.height))
+    binary = binary.resize((binary.width * scale, binary.height * scale), Image.Resampling.NEAREST)
+    return recognize_amount(ImageOps.expand(binary, border=8, fill=255))
 
 
 def has_label(frame, box):
@@ -131,6 +173,8 @@ class Reader:
     def __init__(self):
         self.box = None
         self.cached = None
+        self.last_glyphs = None
+        self.needs_recheck = False
         self.rejected = {}
 
     @staticmethod
@@ -144,6 +188,7 @@ class Reader:
     def read(self, frame, now=None):
         import time
         now = time.monotonic() if now is None else now
+        self.needs_recheck = False
         if self.box is not None and self.cached is not None:
             signature = self.signature(frame, self.box)
             if signature == self.cached[0]:
@@ -153,12 +198,14 @@ class Reader:
         self.rejected = {box: item for box, item in self.rejected.items()
                          if now - item[0] < self.RECHECK_SECONDS}
 
-        if old_box is not None and self.check(frame, old_box, now) is not None:
-            return self.cached[1]
+        if old_box is not None:
+            value = self.check(frame, old_box, now)
+            if value is not None or self.needs_recheck:
+                return value
         for box in white_boxes(frame):
             if box != old_box:
                 value = self.check(frame, box, now)
-                if value is not None:
+                if value is not None or self.needs_recheck:
                     return value
         return None
 
@@ -170,9 +217,19 @@ class Reader:
         rejected = self.rejected.get(box)
         if rejected is not None and rejected[1] == signature:
             return None
-        value = read_amount(frame, box)
+        glyphs = amount_glyphs(frame, box)
+        if glyphs is None:
+            return None
+        key = glyphs.size, glyphs.tobytes()
+        reuse = self.last_glyphs is not None and self.last_glyphs[0] == key
+        value = self.last_glyphs[1] if reuse else read_amount(frame, box)
         if value is not None and has_label(frame, box):
-            self.box, self.cached = box, (signature, value)
+            self.box = box
+            if not reuse and read_binary_amount(glyphs) != value:
+                self.needs_recheck = True
+                return None
+            self.last_glyphs = key, value
+            self.cached = signature, value
             return value
         self.rejected.pop(box, None)
         if len(self.rejected) >= self.MAX_REJECTED:

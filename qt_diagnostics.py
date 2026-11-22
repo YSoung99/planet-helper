@@ -40,7 +40,11 @@ def run_diagnostics(application, report_path):
     window_id=int(view.window().windowNumber())
     def client(): return WindowCapture(bundle_id=None,preferred_id=window_id,expected_pid=os.getpid())
     with patch('window_capture.WindowCapture',side_effect=client), patch.object(controller,'check_permission',return_value=True):
-        QTest.mouseClick(controller.region_button,Qt.MouseButton.LeftButton)
+        menu = controller.build_context_menu()
+        recognition = next(action.menu() for action in menu.actions() if action.text() == '게임 인식')
+        region = next(action for action in recognition.actions() if action.text() == '경험치 영역 지정…')
+        region.trigger()
+        menu.deleteLater()
         deadline=time.monotonic()+8
         while not controller.overlays and time.monotonic()<deadline:
             application.processEvents(); time.sleep(.02)
