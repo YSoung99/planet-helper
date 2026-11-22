@@ -162,9 +162,8 @@ def has_label(frame, box):
     import map_name
 
     x, y, w, h = box
-    width, height = frame.size
-    reach = round(h * 2.6)
-    crop = frame.crop((max(0, x - reach), max(0, y - 3), min(width, x + w + reach), min(height, y + h + 3)))
+    width = frame.width
+    crop = frame.crop(label_context(frame, box))
     scale = max(1, round(40 / max(1, h)))
     crop = ImageOps.expand(crop.convert('RGB').resize((crop.width * scale, crop.height * scale),
                                                       Image.Resampling.LANCZOS), border=12, fill=(0, 0, 0))
@@ -188,6 +187,37 @@ def has_label(frame, box):
                for text, score in map_name.recognize_lines(enlarged, detect=detect))
 
 
+def label_context(frame, box):
+    x, y, w, h = box
+    reach = round(h * 2.6)
+    return (max(0, x - reach), max(0, y - 3),
+            min(frame.width, x + w + reach), min(frame.height, y + h + 3))
+
+
+def find_label(frame, box):
+    """Return the verified label pixels, avoiding animated scenery when possible."""
+    from PIL import Image, ImageOps
+    import map_name
+
+    x, y, w, h = box
+    candidates = [
+        ((x + w, y, min(frame.width, x + w + round(h * 1.7)), y + h), False),
+        ((max(0, x - round(h * 2.45)), y, x, y + h), False),
+    ]
+    if round(40 / h) <= 1:
+        candidates.append(((x, y, min(frame.width, x + round(h * 1.55)), y + h), True))
+    for rect, detect in candidates:
+        if rect[2] - rect[0] < h:
+            continue
+        crop = frame.crop(rect).convert('RGB')
+        enlarged = crop.resize((crop.width * 2, crop.height * 2), Image.Resampling.LANCZOS)
+        enlarged = ImageOps.expand(enlarged, border=12, fill=(0, 0, 0))
+        if any(''.join(text.split()) == '메소' and score >= MIN_SCORE
+               for text, score in map_name.recognize_lines(enlarged, detect=detect)):
+            return rect
+    return label_context(frame, box) if has_label(frame, box) else None
+
+
 class Reader:
     """Find the inventory meso box, remembering where it was last seen."""
 
@@ -198,16 +228,36 @@ class Reader:
         self.box = None
         self.cached = None
         self.last_glyphs = None
+        self.label_cache = None
         self.needs_recheck = False
         self.rejected = {}
 
     @staticmethod
     def signature(frame, box):
-        x, y, w, h = box
-        reach = round(h * 2.6)
-        region = frame.crop((max(0, x - reach), max(0, y - 3),
-                             min(frame.width, x + w + reach), min(frame.height, y + h + 3)))
+        region = frame.crop(label_context(frame, box))
         return frame.size, hashlib.blake2b(region.tobytes(), digest_size=16).digest()
+
+    def label_is_current(self, frame, box):
+        source = frame.size, box
+        if self.label_cache is not None:
+            previous, rect, pixels = self.label_cache
+            if source == previous and frame.crop(rect).tobytes() == pixels:
+                return True
+        rect = find_label(frame, box)
+        if rect is None:
+            return False
+        self.label_cache = source, rect, frame.crop(rect).tobytes()
+        return True
+
+    def confirmation_area(self, size):
+        """Return the smallest rectangle covering the verified amount and label."""
+        if self.cached is None or self.label_cache is None:
+            return None
+        source, (left, top, right, bottom), _ = self.label_cache
+        if source != (size, self.box):
+            return None
+        x, y, w, h = self.box
+        return min(left, x), min(top, y), max(right, x + w), max(bottom, y + h)
 
     def read(self, frame, now=None):
         import time
@@ -249,7 +299,7 @@ class Reader:
         value = self.last_glyphs[1] if reuse else read_amount(frame, box)
         if value is None:
             value = read_gray_amount(glyphs)
-        if value is not None and has_label(frame, box):
+        if value is not None and self.label_is_current(frame, box):
             self.box = box
             if not reuse and read_binary_amount(glyphs) != value:
                 self.needs_recheck = True

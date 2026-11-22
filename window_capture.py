@@ -135,9 +135,10 @@ class WindowCapture:
             try:
                 captured = _await_callback(lambda done:
                     SCScreenshotManager.captureImageWithFilter_configuration_completionHandler_(content_filter,configuration,done))
+                source_size = Quartz.CGImageGetWidth(captured), Quartz.CGImageGetHeight(captured)
                 crop = None
                 if roi is not None:
-                    left,top,crop_width,crop_height=pixel_rect(roi,Quartz.CGImageGetWidth(captured),Quartz.CGImageGetHeight(captured))
+                    left,top,crop_width,crop_height=pixel_rect(roi,*source_size)
                     crop = (left,top,left+crop_width,top+crop_height)
                     if not include_full:
                         captured=Quartz.CGImageCreateWithImageInRect(captured,((left,top),(crop_width,crop_height)))
@@ -150,7 +151,8 @@ class WindowCapture:
                 raise
             image.info.update(capture_backend='sck-window',window_id=int(window.windowID()),
                               window_title=str(window.title() or ''),window_bounds=bounds,
-                              content_points=(width,height),window_region=roi)
+                              content_points=(width,height),window_region=roi,
+                              source_pixel_size=source_size,source_pixel_crop=crop)
             if include_full and crop is not None:
                 full = image
                 image = full.crop(crop)

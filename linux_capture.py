@@ -93,9 +93,11 @@ class WindowCapture:
         if current.id != window.id or current_bounds != bounds:
             raise ValueError('게임 창 위치 또는 크기 변경 · 다시 확인 중')
         frame.info.update(capture_backend=backend, content_points=size, window_id=window.id,
-                          window_bounds=bounds, window_title='MapleStory Worlds')
+                          window_bounds=bounds, window_title='MapleStory Worlds', source_pixel_size=size)
         if full is not None: frame.info['full_game_image']=full
-        if roi is not None: frame.info['window_region']=roi
+        if roi is not None:
+            x, y, width, height = rect
+            frame.info.update(window_region=roi, source_pixel_crop=(x, y, x+width, y+height))
         return frame
 
     def desktop_snapshot(self, window, bounds, roi, legacy_region, include_full):
