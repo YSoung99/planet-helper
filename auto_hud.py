@@ -140,16 +140,18 @@ class HudLocator:
                 else:
                     binary = Image.fromarray(((a[:, :, 0] > 170) & (a[:, :, 1] > 160)
                                              & (a[:, :, 2] < 110)).astype('uint8')*255)
-                readings = [recognize(self.engine, digits), recognize(self.engine, binary)]
+                readings = [(''.join(raw.split()), score) for raw, score in
+                            (recognize(self.engine, digits), recognize(self.engine, binary))]
                 votes = Counter(int(raw) for raw, score in readings
                                 if score >= .90 and re.fullmatch(r'[1-9]\d{0,2}', raw)
                                 and int(raw) in tracker.EXP_TABLE)
                 # The wider crop can corroborate a crisp digit reading when
                 # one of the two digit-only variants falls below the cutoff.
-                anchored_level = re.fullmatch(r'\s*L\s*V[.:\s]+([1-9]\d{0,2})\s*', anchored, re.I)
+                match = re.fullmatch(r'\s*L\s*V[.:\s]+([1-9](?:\s*\d){0,2})\s*', anchored, re.I)
+                anchored_level = ''.join(match[1].split()) if match else None
                 if (anchor_score >= .90 and anchored_level and len(votes) == 1
-                        and all(raw == anchored_level[1] for raw, _ in readings)):
-                    votes[int(anchored_level[1])] += 1
+                        and all(raw == anchored_level for raw, _ in readings)):
+                    votes[int(anchored_level)] += 1
                 if votes and votes.most_common(1)[0][1] >= 2:
                     levels.append((votes.most_common(1)[0][0], normalized(box, image.size),
                                    'classic' if kind == 'orange' else 'new'))

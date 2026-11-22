@@ -70,6 +70,23 @@ class LevelReadingTests(unittest.TestCase):
                                 locator.read_level(image)
 
 
+    def test_spaced_classic_level_digits_agree_without_loosening_verification(self):
+        image = Image.new('RGB', (1569, 910))
+        locator = HudLocator(Mock())
+        with patch('auto_hud.color_groups', side_effect=lambda im, kind:
+                   [(57, 872, 116, 893)] if kind == 'orange' else []):
+            with patch('auto_hud.recognize', side_effect=[
+                ('LV. 1 4 4', .90689), ('1 4 4', .85649), ('144', .99998),
+            ]):
+                level, _, ui_kind = locator.read_level(image)
+            self.assertEqual((level, ui_kind), (144, 'classic'))
+            with patch('auto_hud.recognize', side_effect=[
+                ('LV. 1 4 4', .98), ('1 4 1', .86), ('144', .99),
+            ]):
+                with self.assertRaises(HudNotFound):
+                    locator.read_level(image)
+
+
 class CaptureTests(unittest.TestCase):
     def setUp(self):
         self.image = Image.new('RGB', (1600, 1000))

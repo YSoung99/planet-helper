@@ -21,7 +21,7 @@ coll = COLLECT(exe, a.binaries, a.datas, strip=False, upx=False, name='PlanetHel
 app = BUNDLE(coll, name=f'플래닛 도우미 {version}.app', icon=str(source/'PlanetEXP.icns'),
              bundle_identifier='local.codex.planethelper.autotrial',
              info_plist={'CFBundleDisplayName': f'플래닛 도우미 {version}', 'CFBundleName': f'플래닛 도우미 {version}',
-                         'CFBundleShortVersionString': version, 'CFBundleVersion': '27',
+                         'CFBundleShortVersionString': version, 'CFBundleVersion': '28',
                          'NSHighResolutionCapable': True,
                          'LSMinimumSystemVersion': '14.0',
                          'NSScreenCaptureUsageDescription': '게임 화면의 경험치 숫자를 읽어 획득량을 계산합니다.',
