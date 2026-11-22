@@ -1,8 +1,9 @@
 """Read the meso total from the item inventory and keep confirmed values.
 
-The inventory shows `[coin] [white box with 8,890,080] 메소` at its bottom edge, wherever the
-window is. A white box only counts when the word 메소 sits right after it, which rules out the
-coin boxes of the trade window. Nothing is read while the inventory is closed.
+The inventory shows the amount in a white box at its bottom edge, wherever the window is: the
+classic UI writes `[coin] [8,890,080] 메소`, the new UI `[coin 메소] [24,252,276]`. A white box
+only counts when the word 메소 sits right next to it, which rules out the coin boxes of the trade
+window. Nothing is read while the inventory is closed.
 """
 import csv
 import re
@@ -10,14 +11,31 @@ from datetime import datetime
 from pathlib import Path
 
 AMOUNT = re.compile(r'\d{1,3}(?:,\d{3})*')
-MIN_SCORE = .9
+MIN_SCORE = .85
 TRADE_THRESHOLD = 1_000_000
 # A reading this many times larger or smaller than the last one is usually a dropped or extra digit.
 JUMP_RATIO = 10
 
 
+def longest_run(flags, bridge=0):
+    """(start, end) of the longest stretch of True values, joining gaps up to `bridge` long.
+
+    Digits make some columns of a small box dark; the bridge keeps the box in one piece."""
+    runs, start = [], None
+    for index, flag in enumerate([*flags, False]):
+        if flag and start is None:
+            start = index
+        elif not flag and start is not None:
+            if runs and start - runs[-1][1] <= bridge:
+                runs[-1] = (runs[-1][0], index)
+            else:
+                runs.append((start, index))
+            start = None
+    return max(runs, key=lambda run: run[1] - run[0], default=(0, 0))
+
+
 def white_boxes(frame):
-    """Wide, nearly white rectangles that could hold a meso amount: [(x, y, w, h)]."""
+    """Wide, nearly white bands that could hold a meso amount: [(x, y, w, h)]."""
     import cv2
     import numpy as np
 
@@ -26,67 +44,96 @@ def white_boxes(frame):
     count, _, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=4)
     boxes = []
     for x, y, w, h, area in stats[1:count]:
-        if 9 <= h <= 48 and 4 * h <= w <= 16 * h and area >= .55 * w * h:
-            boxes.append((int(x), int(y), int(w), int(h)))
+        if h < 9 or w < 36 or area < 200:
+            continue
+        # A box can touch other bright UI through a gap in its border; split at rows that are
+        # mostly dark (the border lines) and keep each band that is shaped like a box.
+        region = mask[y:y + h, x:x + w]
+        top = None
+        for index, bright in enumerate([*(region.mean(axis=1) >= .35), False]):
+            if bright and top is None:
+                top = index
+            elif not bright and top is not None:
+                band = region[top:index]
+                height = index - top
+                left, right = longest_run(band.mean(axis=0) >= .25, bridge=height // 2)
+                width = right - left
+                if 9 <= height <= 80 and width >= 4 * height and band[:, left:right].mean() >= .55:
+                    boxes.append((int(x) + left, int(y) + top, width, height))
+                top = None
     return boxes
 
 
-def read_amount(frame, box):
-    """The amount inside a white box, or None when it is not a clean number."""
-    from PIL import Image, ImageOps
+HANGUL = re.compile('[가-힣]')
 
-    x, y, w, h = box
-    crop = frame.crop((x + 2, y + 1, x + w - 2, y + h - 1)).convert('RGB')
-    scale = max(1, round(36 / max(1, crop.height)))
-    crop = ImageOps.expand(crop.resize((crop.width * scale, crop.height * scale), Image.Resampling.LANCZOS),
-                           border=8, fill=(255, 255, 255))
+
+def read_amount(frame, box):
+    """The amount inside a white box, or None when it is not a clean number.
+
+    In the new UI the band also catches the edge of the 메소 button, so Hangul is dropped."""
+    from PIL import Image, ImageOps
     import map_name
 
+    x, y, w, h = box
+    crop = frame.crop((x, y, x + w, y + h)).convert('RGB')
+    scale = max(1, round(40 / max(1, h)))
+    crop = ImageOps.expand(crop.resize((crop.width * scale, crop.height * scale), Image.Resampling.LANCZOS),
+                           border=8, fill=(255, 255, 255))
     lines = map_name.recognize_lines(crop, detect=False)
     if len(lines) != 1:
         return None
     text, score = lines[0]
-    text = text.replace(' ', '').replace('.', ',')
+    text = HANGUL.sub('', text).replace(' ', '').replace('.', ',')
     if score < MIN_SCORE or not AMOUNT.fullmatch(text):
         return None
     return int(text.replace(',', ''))
 
 
 def has_label(frame, box):
-    """True when the word 메소 follows the box, as it does only in the item inventory."""
+    """True when the word 메소 is written next to the box, as it is only in the item inventory."""
     from PIL import Image, ImageOps
+    import map_name
 
     x, y, w, h = box
     width, height = frame.size
-    crop = frame.crop((x + w, max(0, y - 2), min(width, x + w + round(h * 2.6)), min(height, y + h + 2)))
-    if crop.width < h:
-        return False
-    crop = crop.convert('RGB')
-    crop = ImageOps.expand(crop.resize((crop.width * 3, crop.height * 3), Image.Resampling.LANCZOS),
-                           border=8, fill=(0, 0, 0))
-    import map_name
-
-    return any('메소' in text for text, _ in map_name.recognize_lines(crop, detect=False))
+    reach = round(h * 2.6)
+    crop = frame.crop((max(0, x - reach), max(0, y - 3), min(width, x + w + reach), min(height, y + h + 3)))
+    scale = max(1, round(40 / max(1, h)))
+    crop = ImageOps.expand(crop.convert('RGB').resize((crop.width * scale, crop.height * scale),
+                                                      Image.Resampling.LANCZOS), border=12, fill=(0, 0, 0))
+    return any('메소' in text for text, _ in map_name.recognize_lines(crop, detect=True))
 
 
 class Reader:
     """Find the inventory meso box, remembering where it was last seen."""
 
+    RECHECK_SECONDS = 30.0
+
     def __init__(self):
         self.box = None
+        self.rejected = {}
 
-    def read(self, frame):
+    def read(self, frame, now=None):
+        import time
+        now = time.monotonic() if now is None else now
         if self.box is not None:
             value = read_amount(frame, self.box)
             if value is not None:
                 return value
             self.box = None
+        # The quick number read filters the candidates before the slower label check, and a
+        # number box without the label (trade window, NPC dialog) is not checked again for a while.
+        self.rejected = {box: when for box, when in self.rejected.items() if now - when < self.RECHECK_SECONDS}
         for box in white_boxes(frame):
+            if box in self.rejected:
+                continue
+            value = read_amount(frame, box)
+            if value is None:
+                continue
             if has_label(frame, box):
-                value = read_amount(frame, box)
-                if value is not None:
-                    self.box = box
-                    return value
+                self.box = box
+                return value
+            self.rejected[box] = now
         return None
 
 

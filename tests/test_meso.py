@@ -58,14 +58,52 @@ class ReaderTests(unittest.TestCase):
         with mock.patch('map_name.recognize_lines', return_value=[('8,890,080', .5)]):
             self.assertIsNone(meso.read_amount(frame, box))
 
-    def test_label_reads_the_area_right_of_the_box(self):
+    def test_new_ui_button_edge_is_dropped_from_the_amount(self):
         frame = inventory_frame()
-        with mock.patch('map_name.recognize_lines', return_value=[('메소', .9)]) as recognize:
-            self.assertTrue(meso.has_label(frame, (300, 400, 150, 18)))
+        with mock.patch('map_name.recognize_lines', return_value=[('메24,252,276', .91)]):
+            self.assertEqual(meso.read_amount(frame, (300, 400, 150, 18)), 24252276)
+
+    def test_label_is_looked_for_on_both_sides_of_the_box(self):
+        frame = inventory_frame()
+        box = (300, 400, 150, 18)
+        with mock.patch('map_name.recognize_lines', return_value=[('메소', .9), ('24,252,276', .99)]) as recognize:
+            self.assertTrue(meso.has_label(frame, box))
         crop = recognize.call_args.args[0]
-        self.assertGreater(crop.width, 18 * 3)
-        with mock.patch('map_name.recognize_lines', return_value=[('0', .9)]):
-            self.assertFalse(meso.has_label(frame, (300, 400, 150, 18)))
+        self.assertEqual(recognize.call_args.kwargs, {'detect': True})
+        # 2.6 box heights on each side, scaled up, plus padding.
+        self.assertGreater(crop.width, (150 + 2 * 18 * 2) * 2)
+        for lines in ([('8,890,080 메소', .95)], [('0', .9)]):
+            with mock.patch('map_name.recognize_lines', return_value=lines):
+                self.assertEqual(meso.has_label(frame, box), lines[0][0] != '0')
+
+    def test_box_merged_with_bright_ui_above_is_split_at_its_border(self):
+        frame = Image.new('RGB', (800, 600), (40, 60, 90))
+        draw = ImageDraw.Draw(frame)
+        draw.rectangle((300, 380, 520, 399), fill=(250, 250, 250))   # bright panel above
+        draw.line((300, 400, 520, 400), fill=(150, 150, 150))        # box border
+        draw.rectangle((300, 401, 520, 440), fill=(255, 255, 255))   # the meso box
+        draw.rectangle((300, 395, 303, 405), fill=(255, 255, 255))   # a gap joins them
+        for x in range(380, 500, 12):                                 # digits darken columns
+            draw.rectangle((x, 404, x + 5, 437), fill=(20, 20, 20))
+        boxes = meso.white_boxes(frame)
+        self.assertIn((300, 401, 221, 40), boxes)
+
+    def test_longest_run_bridges_short_gaps(self):
+        flags = [True] * 5 + [False] * 2 + [True] * 5 + [False] * 9 + [True] * 7
+        self.assertEqual(meso.longest_run(flags), (21, 28))
+        self.assertEqual(meso.longest_run(flags, bridge=2), (0, 12))
+        self.assertEqual(meso.longest_run([]), (0, 0))
+
+    def test_numbers_without_the_label_are_skipped_for_a_while(self):
+        frame = inventory_frame()
+        reader = meso.Reader()
+        with mock.patch.object(meso, 'read_amount', return_value=0), \
+             mock.patch.object(meso, 'has_label', return_value=False) as label:
+            self.assertIsNone(reader.read(frame, now=0))
+            self.assertIsNone(reader.read(frame, now=10))
+            self.assertEqual(label.call_count, 2)  # two boxes, checked once
+            self.assertIsNone(reader.read(frame, now=31))
+            self.assertEqual(label.call_count, 4)
 
 
 class ConfirmationTests(unittest.TestCase):
