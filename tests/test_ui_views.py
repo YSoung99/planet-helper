@@ -160,63 +160,33 @@ class ViewTests(unittest.TestCase):
         self.assertEqual(c.meso_delta_label.text(), '-5')
         self.assertEqual(c.meso_status_label.text(), '시작 잔액 확인 · 종료 잔액 확인')
 
-    def test_changed_balance_triggers_one_fresh_frame_from_the_same_window(self):
-        from PIL import Image
-        from types import SimpleNamespace
-        from unittest.mock import Mock
-        from auto_hud import normalized
+    def test_meso_changes_are_confirmed_on_the_regular_capture_cadence(self):
+        from PIL import Image, ImageDraw
+        import meso
+
         c = self.c
         c.running = True
-        first = Image.new('RGB', (800, 600))
-        area = (40, 83, 70, 92)
-        actual = (39, 82, 70, 93)
-        first.putpixel((69, 91), (0, 255, 0))
-        follow = first.crop(actual)
-        follow.info.update(window_id=20, source_pixel_size=first.size, source_pixel_crop=actual)
-        client = Mock()
-        client.snapshot.return_value = follow
-        c.meso_reader_source = c.generation, 20
-        c.meso_capture_lock.acquire()
-        with patch.object(c, 'capture_module', return_value=SimpleNamespace(WindowCapture=Mock(return_value=client))), \
-             patch.object(c.stop, 'wait', return_value=False), \
-             patch.object(c.meso_reader, 'read', return_value=125) as recognize, \
-             patch.object(c.meso_reader, 'confirmation_area', return_value=area), \
-             patch('qt_controller.time.monotonic', side_effect=[100.20, 100.24]):
-            c.read_meso_frame(c.generation, 100.0, first, 20, '')
-        recognize.assert_called_once_with(first, 100.0)
-        client.snapshot.assert_called_once_with(roi=normalized(area, first.size))
-        client.close.assert_called_once()
-        self.assertEqual(c.meso_results.get_nowait(), (c.generation, 20, 100.0, '', 125))
-        self.assertEqual(c.meso_results.get_nowait()[-1], 125)
-        self.assertTrue(c.meso_results.empty())
-
-    def test_confirmation_discards_changed_pixels_or_stale_capture(self):
-        from PIL import Image
-        from types import SimpleNamespace
-        from unittest.mock import Mock
-        c = self.c
-        first = Image.new('RGB', (800, 600))
-        area = (40, 83, 70, 92)
-        client = Mock()
-        with patch.object(c, 'capture_module', return_value=SimpleNamespace(WindowCapture=Mock(return_value=client))), \
-             patch.object(c.stop, 'wait', return_value=False):
-            for case in ('different window', 'resized window', 'shifted crop', 'changed pixels', 'too late'):
-                with self.subTest(case=case):
-                    follow = first.crop(area)
-                    follow.info.update(window_id=20, source_pixel_size=first.size, source_pixel_crop=area)
-                    if case == 'different window':
-                        follow.info['window_id'] = 21
-                    elif case == 'resized window':
-                        follow.info['source_pixel_size'] = (799, 600)
-                    elif case == 'shifted crop':
-                        follow.info['source_pixel_crop'] = (41, 83, 71, 92)
-                    elif case == 'changed pixels':
-                        follow.putpixel((0, 0), (255, 0, 0))
-                    client.snapshot.return_value = follow
-                    with patch('qt_controller.time.monotonic', return_value=109 if case == 'too late' else 101):
-                        c.confirm_meso_frame(c.generation, 20, '', 100, first, area, 125)
-                    self.assertTrue(c.meso_results.empty())
-        self.assertEqual(client.close.call_count, 5)
+        c.session.meso_start_at = 100.0
+        with patch.object(c, 'capture_module') as extra_capture, \
+             patch('map_name.recognize_lines', return_value=[]), \
+             patch('meso.has_label', return_value=True), \
+             patch('meso.read_amount', side_effect=[100, 95, 99]), \
+             patch('meso.read_binary_amount', side_effect=[100, 95, 99]):
+            for stamp, amount, confirmed in (
+                (101, 100, None), (103, 100, 100), (105, 95, 100), (107, 99, 100), (109, 99, 99)
+            ):
+                frame = Image.new('RGB', (400, 300), (40, 60, 90))
+                draw = ImageDraw.Draw(frame)
+                draw.rectangle((50, 75, 199, 92), fill=(250, 250, 250))
+                draw.text((172, 79), str(amount), fill=(0, 0, 0))
+                c.meso_capture_lock.acquire()
+                c.read_meso_frame(c.generation, stamp, frame, 20, '')
+                self.assertFalse(c.meso_capture_lock.locked())
+                c.apply_meso_results(stamp)
+                self.assertEqual(c.session.meso.end, confirmed)
+        extra_capture.assert_not_called()
+        self.assertEqual([value for _, _, value in meso.load(tracker.BASE)], [100, 99])
+        self.assertEqual(c.meso_delta_label.text(), '-1')
 
     def test_meso_confirmation_status_expires_before_stop(self):
         c = self.c

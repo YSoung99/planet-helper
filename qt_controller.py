@@ -1378,45 +1378,10 @@ class SharedController(tracker.MeasurementCore):
                 if self.meso_reader.needs_recheck:
                     value = meso.RECHECK
                 self.meso_results.put((generation, window, stamp, character, value))
-                if type(value) is int and value != self.meso_confirmation.current:
-                    area = self.meso_reader.confirmation_area(frame.size)
-                    if area is not None:
-                        self.confirm_meso_frame(generation, window, character, stamp, frame, area, value)
         except Exception as exc:
             tracker.log_error('메소 판독', exc)
         finally:
             self.meso_capture_lock.release()
-
-    def confirm_meso_frame(self, generation, window, character, first_stamp, first_frame, area, value):
-        """Corroborate a balance with fresh pixels from the inventory's amount and label."""
-        from auto_hud import normalized
-
-        if self.stop.wait(.18) or generation != self.generation:
-            return
-        client = self.capture_module().WindowCapture(**self.CAPTURE_OPTIONS)
-        try:
-            capture_start = time.monotonic()
-            frame = client.snapshot(roi=normalized(area, first_frame.size))
-            stamp = (capture_start + time.monotonic()) / 2
-            if (generation != self.generation or not 0 < stamp - first_stamp <= meso.CONFIRMATION_GAP
-                    or frame.info.get('source_pixel_size') != first_frame.size
-                    or frame.info.get('window_id') != window):
-                return
-            # Normalized coordinates can round outward by a pixel.
-            actual = frame.info.get('source_pixel_crop')
-            if actual is None:
-                return
-            left, top, right, bottom = actual
-            x, y, x1, y1 = area
-            if (frame.size != (right - left, bottom - top)
-                    or not (left <= x < x1 <= right and top <= y < y1 <= bottom)):
-                return
-            crop = frame.crop((x - left, y - top, x1 - left, y1 - top))
-            if crop.mode == first_frame.mode and crop.tobytes() == first_frame.crop(area).tobytes():
-                self.meso_results.put((generation, window, stamp, character, value))
-        finally:
-            if hasattr(client, 'close'):
-                client.close()
 
     def read_hunt_activity(self, generation, stamp, frame, window, level_roi, style, recent=False):
         try:
