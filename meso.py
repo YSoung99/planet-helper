@@ -115,6 +115,11 @@ def amount_glyphs(frame, box):
         return None
     interior = pixels[margin:h - margin, left + margin:right - margin]
     ink = interior < 135
+    # A broad opaque strip inside the light field can hide leading or trailing
+    # digits. Do not read the surviving suffix as a different total.
+    blocked_left, blocked_right = longest_run(ink.mean(axis=0) >= .45)
+    if blocked_right - blocked_left >= .85 * h:
+        return None
     # Separate the glyph run from the label and any isolated specks to its left.
     columns = np.flatnonzero(ink.any(axis=0))
     if not len(columns):

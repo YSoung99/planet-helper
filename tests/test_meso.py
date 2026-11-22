@@ -94,6 +94,17 @@ class ReaderTests(unittest.TestCase):
             self.assertEqual(reader.read(lower, 3), 95)
             self.assertFalse(reader.needs_recheck)
 
+    def test_opaque_strip_does_not_leave_a_readable_suffix(self):
+        frame = Image.new('RGB', (600, 400), (40, 60, 90))
+        box = (130, 250, 350, 52)
+        x, y, w, h = box
+        draw = ImageDraw.Draw(frame)
+        draw.rectangle((x, y, x + w - 1, y + h - 1), fill='white')
+        draw.rectangle((x + 270, y + 7, x + 279, y + 30), fill='black')
+        self.assertIsNotNone(meso.amount_glyphs(frame, box))
+        draw.rectangle((x + 185, y + 6, x + 237, y + 36), fill=(40, 50, 70))
+        self.assertIsNone(meso.amount_glyphs(frame, box))
+
     def test_short_balance_uses_the_tight_crop_and_still_needs_agreement(self):
         box = (300, 400, 150, 18)
         frame = add_amount_glyphs(inventory_frame(box), box, '0')
