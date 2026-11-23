@@ -110,8 +110,11 @@ def collect(base=None):
     memos = load_memos(base)
     names = load_character_names(base)
     import segments
+    import jev_assist
     tags = segments.load_tags(base)
+    stalls = jev_assist.load_stalls(base)
     for row in rows:
+        row['stalls'] = stalls.get(row['session_id'], {})
         row['memo'] = memos.get(row['session_id'], '')
         row['detected_character'] = row['character_name']
         if row['session_id'] in names:
@@ -500,6 +503,9 @@ def row_details(row, buff_times):
         lines.append(f"효율 변화 {change_text(row['changes'])}")
     lines.append(f"경험치 버프 {buff_times.replace(chr(10), ' / ') or '확인된 구간 없음'}")
     lines.append(meso_detail(row))
+    if row.get('stalls'):
+        import jev_assist
+        lines.append(f"경험치가 멈춘 이유 (JEV) {jev_assist.stall_text(row['stalls'])}")
     return '\n'.join(lines)
 
 

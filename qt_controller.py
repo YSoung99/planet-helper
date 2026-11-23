@@ -25,6 +25,8 @@ from PySide6.QtWidgets import (QApplication, QWidget, QLabel, QPushButton, QSpin
 import character_hud
 import exp_buffs
 import hunt_activity
+import jev
+import jev_assist
 import map_name
 import meso
 import tracker
@@ -344,7 +346,12 @@ class SharedController(tracker.MeasurementCore):
         self.hunt_activity_lock = threading.Lock()
         self.hunt_activity_cache = {}
         self.character_results = queue.SimpleQueue()
-        self.meso_reader = meso.Reader()
+        # One JEV question at a time for every feature; nothing is sent while JEV is off.
+        self.jev_arbiter = jev.Arbiter(lambda: self.jev_enabled)
+        self.jev_frames = jev_assist.FrameRing()
+        self.jev_hud_missing = None
+        self.jev_stall_saved = None
+        self.meso_reader = meso.Reader(self.jev_arbiter)
         self.meso_capture_lock = threading.Lock()
         self.meso_results = queue.SimpleQueue()
         self.meso_confirmation = meso.Confirmation()
@@ -1082,8 +1089,10 @@ class SharedController(tracker.MeasurementCore):
         self.jev_button.setChecked(self.jev_enabled)
         self.jev_button.setText('JEV 켬' if self.jev_enabled else 'JEV 끔')
         self.jev_button.setToolTip(
-            '다음 측정부터 필요할 때 미니맵 이름 부분을 JEV에 보내 확인 · 우클릭 메뉴에서 API 키 설정'
-            if self.jev_enabled else 'JEV를 켜면 다음 측정부터 사냥터 이름 확인에 사용')
+            'OCR이 헷갈리거나 상황 판단이 필요할 때만 게임 화면 일부를 JEV에 보내 확인\n'
+            '사냥터 이름 · 메소/경험치 판독 · 닉네임 · 버프 · 경험치가 멈춘 이유 · 효율 변화 태그 · 화면 상태\n'
+            '우클릭 메뉴에서 API 키 설정'
+            if self.jev_enabled else 'JEV를 켜면 판독이 헷갈릴 때와 상황 판단에 JEV를 사용 (게임 화면 일부를 전송)')
 
     def toggle_jev(self, enabled):
         self.jev_enabled = enabled
@@ -1305,15 +1314,21 @@ class SharedController(tracker.MeasurementCore):
         starting = not recent and (session.started is None or self.recent_start_source is not None)
         include_full = starting or probe or meso_probe
         if self.auto_hud:
-            from auto_hud import AutomaticCapture, HudLocator
+            from auto_hud import AutomaticCapture, HudLocator, HudNotFound
             if not hasattr(self.capture_clients,'automatic'):
                 self.capture_clients.automatic = AutomaticCapture(self.capture_clients.client, HudLocator(self.engine))
             automatic = self.capture_clients.automatic
             if self.auto_rescan.is_set():
                 self.auto_rescan.clear()
                 automatic.reset()
-            image = automatic.read(generation, self.session.level,
-                                   not recent and self.session.first is not None, include_full)
+            try:
+                image = automatic.read(generation, self.session.level,
+                                       not recent and self.session.first is not None, include_full)
+            except HudNotFound:
+                if not recent:
+                    self.note_missing_hud(generation, getattr(automatic, 'last_full', None))
+                raise
+            self.jev_hud_missing = None
         else:
             roi = dict(self.window_region) if self.window_region is not None else None
             image = self.capture_clients.client.snapshot(roi=roi, legacy_region=legacy_region if roi is None else None,
@@ -1372,7 +1387,7 @@ class SharedController(tracker.MeasurementCore):
             if generation == self.generation:
                 source = generation, window
                 if self.meso_reader_source != source:
-                    self.meso_reader = meso.Reader()
+                    self.meso_reader = meso.Reader(self.jev_arbiter)
                     self.meso_reader_source = source
                 value = self.meso_reader.read(frame, stamp)
                 if self.meso_reader.needs_recheck:
@@ -1388,15 +1403,18 @@ class SharedController(tracker.MeasurementCore):
             try:
                 if level_roi is not None and window is not None and map_name.available():
                     job, nickname, key = character_hud.inspect(frame, level_roi, style, self.nickname_patterns)
+                    if nickname is None and key is not None:
+                        nickname = self.jev_nickname(frame, level_roi, style, key)
                     self.character_results.put((generation, window, stamp, job, nickname, key))
             except Exception as exc:
                 tracker.log_error('캐릭터 HUD 판독', exc)
             if recent:
                 return
+            self.jev_frames.remember(stamp, frame)
             try:
                 if window is not None and self.buff_has_templates:
                     revision = self.buff_revision
-                    readings = self.buff_detector.read(frame, tracker.BASE)
+                    readings = self.jev_buff_readings(frame, stamp, self.buff_detector.read(frame, tracker.BASE))
                     self.buff_results.put((generation, window, revision, stamp, readings))
             except Exception as exc:
                 tracker.log_error('경험치 버프 판독', exc)
@@ -1529,6 +1547,117 @@ class SharedController(tracker.MeasurementCore):
             except OSError as exc:
                 tracker.log_error('사냥터 자동 메모 저장', exc)
 
+    # ---- JEV: ask once per situation; keep the local result whenever JEV is unsure ----
+
+    def jev_nickname(self, frame, level_roi, style, key):
+        """Worker thread: a known character name JEV recognised in the nickname line, or None."""
+        found, name = self.jev_arbiter.answer(('nick', key))
+        if found:
+            return name
+        crops = character_hud.lines(frame, level_roi, style)
+        if crops is not None:
+            def question():
+                import record_history
+                names = [*([self.current_character] if self.current_character else []),
+                         *self.nickname_patterns.values(), *record_history.known_characters()]
+                return jev_assist.ask_nickname(crops[1], names)
+            self.jev_arbiter.submit(('nick', key), question)
+        return None
+
+    def jev_buff_readings(self, frame, stamp, readings):
+        """Worker thread: settle 'unknown' buff readings with one JEV look per kind and period."""
+        readings = dict(readings)
+        bucket = int(stamp // jev_assist.BUFF_SECONDS)
+        for kind, value in readings.items():
+            if value != 'unknown':
+                continue
+            question = ('buff', kind, bucket)
+            found, verdict = self.jev_arbiter.answer(question)
+            if found:
+                if verdict:
+                    readings[kind] = verdict
+                continue
+            corner = exp_buffs.buff_corner(frame)
+
+            def ask(kind=kind, corner=corner):
+                from PIL import Image
+                with Image.open(exp_buffs.template_path(tracker.BASE, kind)) as icon:
+                    return jev_assist.ask_buff(icon.convert('RGB'), corner)
+            self.jev_arbiter.submit(question, ask)
+        return readings
+
+    def note_missing_hud(self, generation, full):
+        """Worker thread: once the HUD stays missing, ask (at most once a minute) what the window shows."""
+        now = time.monotonic()
+        if not self.running or self.session.first is not None:
+            self.jev_hud_missing = None
+            return
+        missing = self.jev_hud_missing
+        if missing is None or missing[0] != generation:
+            self.jev_hud_missing = (generation, now, None)
+            return
+        if full is None or now - missing[1] < jev_assist.SCREEN_SECONDS:
+            return
+        question = ('screen', generation, int(now // 60))
+        if self.jev_arbiter.submit(question, lambda: jev_assist.ask_screen(full)):
+            self.jev_hud_missing = (generation, missing[1], question)
+
+    def change_suggestion(self, change):
+        """JEV's tag for an efficiency change, from frames before and after it, or None."""
+        if not self.jev_enabled or self.session.started is None:
+            return None
+        question = ('change', self.session.session_id, change['minute'])
+        found, tag = self.jev_arbiter.answer(question)
+        if found:
+            return tag
+        before = self.jev_frames.before(self.session.started + (change['minute']-1)*60)
+        after = self.jev_frames.latest(since=self.session.started + change['minute']*60)
+        if before is not None and after is not None:
+            self.jev_arbiter.submit(question, lambda: jev_assist.ask_change(before, after))
+        return None
+
+    def apply_jev_hints(self, now):
+        """Show JEV answers for the current measurement and start the questions that are due."""
+        session = self.session
+        enabled = self.jev_enabled and self.running
+        # What the window shows while the level and EXP display cannot be found.
+        missing = self.jev_hud_missing
+        hint = ''
+        if enabled and missing and missing[0] == self.generation and missing[2] and session.first is None:
+            hint = self.jev_arbiter.answer(missing[2])[1] or ''
+        if hint:
+            self.set_jev_status(f'JEV 화면 확인 · {hint}')
+        elif self.jev_status.text().startswith('JEV 화면 확인'):
+            self.set_jev_status('')
+        # Why EXP stopped: asked once per stall, saved with the record.
+        activity = self.hunt_activity
+        if (enabled and session.started is not None and activity.generation == self.generation
+                and activity.gained > float('-inf') and now - activity.gained >= jev_assist.STALL_SECONDS):
+            question = ('stall', session.session_id, activity.gained)
+            found, reason = self.jev_arbiter.answer(question)
+            if not found:
+                frame = self.jev_frames.latest(since=activity.gained + 30)
+                if frame is not None:
+                    self.jev_arbiter.submit(question, lambda: jev_assist.ask_stall(frame))
+            elif reason:
+                suffix = f' · JEV: {reason}'
+                if not self.activity_label.text().endswith(suffix):
+                    self.activity_label.setText(self.activity_label.text() + suffix)
+                if self.jev_stall_saved != question:
+                    self.jev_stall_saved = question
+                    minute = int(max(0.0, activity.gained - session.started) // 60)
+                    try:
+                        jev_assist.save_stall(session.session_id, minute, reason)
+                    except OSError as exc:
+                        tracker.log_error('멈춘 이유 저장', exc)
+        # Suggested tag for an efficiency change.
+        change = getattr(self, 'pending_change', None)
+        if change is not None and enabled:
+            suggestion = self.change_suggestion(change)
+            text = self.change_prompt_text + (f' · JEV 추천: {suggestion}' if suggestion else '')
+            if self.change_prompt.text() != text:
+                self.change_prompt.setText(text)
+
     def check_efficiency_change(self):
         """After each new minute, ask once about a confirmed change in efficiency."""
         count = len(self.session.minute_snapshots)
@@ -1548,9 +1677,10 @@ class SharedController(tracker.MeasurementCore):
             self.change_prompt.setVisible(False)
         else:
             direction = '▲' if pending['after'] > pending['before'] else '▼'
-            self.change_prompt.setText(
+            self.change_prompt_text = (
                 f"{direction} {pending['minute']}분째부터 분당 {short_exp(pending['before'])} → {short_exp(pending['after'])}"
                 ' · 뭐가 달라졌나요? (눌러서 태그)')
+            self.change_prompt.setText(self.change_prompt_text)
             if self.change_prompt.isHidden():
                 self.change_prompt.setVisible(True)
                 from display_panel import resize
@@ -1561,10 +1691,13 @@ class SharedController(tracker.MeasurementCore):
         if change is None: return
         from PySide6.QtWidgets import QInputDialog
         import segments
+        suggestion = self.change_suggestion(change)
         text, ok = QInputDialog.getText(
             self.window, '효율 변화',
             f"{change['minute']}분째부터 분당 {change['before']:,.0f} → {change['after']:,.0f}\n"
-            '여기서 뭐가 달라졌나요? (예: 버프 끝, 파티 합류, 맵 이동)\n비워 두고 확인하면 다시 묻지 않아요.')
+            '여기서 뭐가 달라졌나요? (예: 버프 끝, 파티 합류, 맵 이동)\n비워 두고 확인하면 다시 묻지 않아요.'
+            + ('\nJEV가 화면을 비교해 추천한 태그를 미리 넣어 뒀어요.' if suggestion else ''),
+            text=suggestion or '')
         if not ok: return
         try:
             segments.save_tag(self.session.session_id, change['minute'], text)
@@ -1815,6 +1948,7 @@ class SharedController(tracker.MeasurementCore):
                 self.hunt_activity.update(generation, stamp, observation)
         self.activity_label.setText(self.hunt_activity.text(self.generation, now) if self.running
                                     else '사냥 신호 · 측정 대기')
+        self.apply_jev_hints(now)
         self.apply_character_results(now)
         self.apply_buff_results(now)
         self.apply_meso_results(now)
@@ -1839,9 +1973,14 @@ class SharedController(tracker.MeasurementCore):
             footer = '캡처 재시도 중'
         else:
             footer = f'갱신 {self.scan_seconds:.1f}초 · 목표 {self.target_seconds:.1f}초' if self.session.first else '숫자 확인 중'
-        delayed = bool(self.session.samples and now-self.session.samples[-1][0] > 5)
-        if self.running and delayed:
-            footer = f'인식 지연 · {int(now-self.session.samples[-1][0])}초 전 값'
+        last_sample_age = now-self.session.samples[-1][0] if self.session.samples else 0
+        delayed = last_sample_age > 5
+        if self.running and delayed and not self.session.blocked:
+            if self.session.started is not None and round(last_sample_age, 3) > tracker.MAX_BOUNDARY_GAP:
+                minutes, seconds = divmod(int(last_sample_age), 60)
+                footer = f'기록 공백 {minutes}:{seconds:02d} · 마지막 값 표시'
+            else:
+                footer = f'인식 지연 · {int(last_sample_age)}초 전 값'
         if not self.session.blocked and (self.save_warning or self.audit_warning):
             footer = self.save_warning or self.audit_warning
         if not self.session.blocked and any(key[0] == self.session.session_id for key in self.capture_failures):

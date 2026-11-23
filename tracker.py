@@ -25,7 +25,7 @@ RESOURCES = Path(getattr(sys, '_MEIPASS', Path(__file__).resolve().parent))
 BASE = Path(os.environ.get('PLANET_EXP_DATA_DIR') or (
     Path.home()/'Library'/'Application Support'/'Maple Planet Helper Auto Trial'
     if sys.platform == 'darwin' else Path(__file__).resolve().parent))
-APP_VERSION = '1.4.27'
+APP_VERSION = '1.4.28'
 MAX_BOUNDARY_GAP = 10.0
 BURNING_MAX_LEVEL = 120  # Planet Up & Up grants one bonus level, capped at 120.
 REST_AFTER = 180.0  # EXP unchanged this long: rest counted from the last gain
@@ -382,6 +382,32 @@ class LineReader:
         self.cached_at = 0
         self.last_readings = []
         self.cached_readings = []
+        self.arbiter = None
+
+    def judged(self, image, key, readings):
+        """Two confident readings that both fit the level total: let JEV pick one for these pixels.
+
+        JEV only chooses between the OCR results, and its answer is still one
+        frame that temporal verification has to corroborate.
+        """
+        candidates = list(dict.fromkeys(value for value, score, raw in readings
+                                        if value is not None and score >= .85))
+        if self.arbiter is None or len(candidates) != 2:
+            return None
+        import hashlib
+        pixels = hashlib.blake2b(repr(key[:2]).encode() + key[2], digest_size=16).digest()
+        question = ('exp', pixels, key[3], tuple(candidates))
+        found, picked = self.arbiter.answer(question)
+        if not found:
+            import jev
+            self.arbiter.submit(question, lambda: jev.pick_reading(
+                image, [f'{exp:,} [{pct:.2f}%]' for exp, pct in candidates], 'EXP number and percentage'))
+            return None
+        if picked is None:
+            return None
+        value = candidates[picked]
+        matching = next(entry for entry in readings if entry[0] == value)
+        return value, matching[1], matching[2]
 
     def read(self, image, observed_at, force=False, *, level=None):
         import numpy as np
@@ -393,6 +419,10 @@ class LineReader:
         if self.native is not None:
             value, score, raw, self.last_readings = self.native(image.convert('RGB'), EXP_TABLE.get(level))
             result = (value, score, raw)
+            if value is None:
+                result = self.judged(image, key, [(parse(text, EXP_TABLE.get(level)), score, text)
+                                                  for text in self.last_readings]) or result
+                value = result[0]
             if value is not None:
                 self.key,self.result,self.cached_at = key,result,observed_at
                 self.cached_readings = list(self.last_readings)
@@ -436,7 +466,12 @@ class LineReader:
                 self.key,self.result,self.cached_at = key,result,observed_at
                 self.cached_readings = list(self.last_readings)
             else:
-                result = (None,readings[0][1],readings[0][2])
+                result = self.judged(image, key, readings)
+                if result is None:
+                    result = (None,readings[0][1],readings[0][2])
+                else:
+                    self.key,self.result,self.cached_at = key,result,observed_at
+                    self.cached_readings = list(self.last_readings)
         return (*result,False)
 
 
@@ -1039,7 +1074,9 @@ class MeasurementCore:
                         cpu_started = sum(process.cpu_times()[:2])
                         system_load = psutil.cpu_percent()
                         if self.engine is None: self.engine = create_ocr_engine()
-                        if reader is None: reader = LineReader(self.engine)
+                        if reader is None:
+                            reader = LineReader(self.engine)
+                            reader.arbiter = getattr(self, 'jev_arbiter', None)
                         from temporal_ocr import verify, save_rejected, save_conflict, usable_image
                         verification_wait = 0.0
 

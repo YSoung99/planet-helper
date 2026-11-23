@@ -38,10 +38,10 @@ def _confirmed(readings, *, job):
     return text if count >= 2 and len(votes) == 1 else None
 
 
-def inspect(frame, level_roi, ui_kind, known=None):
-    """Return job, nickname and a fingerprint of the nickname glyphs."""
+def lines(frame, level_roi, ui_kind):
+    """Crops of the job line and the nickname line beside the level, or None."""
     if ui_kind not in ('classic', 'new') or level_roi is None:
-        return None, None, None
+        return None
     width, height = frame.size
     x, y, w, h = pixel_rect(level_roi, width, height)
     if ui_kind == 'new':
@@ -55,10 +55,16 @@ def inspect(frame, level_roi, ui_kind, known=None):
         middle = y + round(h * .43)
         top, bottom = max(0, middle - round(h * .88)), min(height, middle + round(h * 1.12))
     if right <= left or not top < middle < bottom:
-        return None, None, None
+        return None
+    return frame.crop((left, top, right, middle)), frame.crop((left, middle, right, bottom))
 
-    job_line = frame.crop((left, top, right, middle))
-    name_line = frame.crop((left, middle, right, bottom))
+
+def inspect(frame, level_roi, ui_kind, known=None):
+    """Return job, nickname and a fingerprint of the nickname glyphs."""
+    found = lines(frame, level_roi, ui_kind)
+    if found is None:
+        return None, None, None
+    job_line, name_line = found
     key = fingerprint(name_line)
     nickname = (known or {}).get(key) or _read_line(name_line, job=False)
     return _read_line(job_line, job=True), nickname, key

@@ -382,6 +382,34 @@ class ViewTests(unittest.TestCase):
         self.assertIn('마지막 확인 0:59',c.rate_info.text())
         self.assertIn('139초 관측 공백',c.rate_info.text())
 
+    def test_footer_shows_current_recording_gap_until_experience_is_verified_again(self):
+        c = self.c
+        c.running = True
+        generation = c.generation
+        details = {'detected_level': 169, 'auto_detected': True, 'auto_confirmed': True,
+                   'ui_kind': 'classic', 'temporal': {'selected': 1}}
+        c.events.put((generation, (172680132, 42.55), '', .99, None, 100, details))
+        c.events.put((generation, (172680232, 42.55), '', .99, None, 101, details))
+        with patch('time.monotonic', return_value=111):
+            c.poll()
+        self.assertIn('인식 지연', c.footer.text())
+
+        error = '레벨 표시 확인 중 · LV와 숫자가 보이게 해 주세요'
+        c.events.put((generation, None, '', 0, error, 112, {}))
+        with patch('time.monotonic', return_value=166):
+            c.poll()
+        self.assertIn('기록 공백 1:05', c.footer.text())
+        self.assertIn(error, c.footer.toolTip())
+        self.assertIn('172,680,232', c.current_label.text())
+
+        c.events.put((generation, (172680532, 42.55), '', .99, None, 167, details))
+        with patch('time.monotonic', return_value=167):
+            c.poll()
+        self.assertIn('갱신', c.footer.text())
+        self.assertEqual(c.session.gap_closed, 66)
+        self.assertEqual(c.session.gap_gain, 300)
+        self.assertIn('172,680,532', c.current_label.text())
+
     def test_both_views_show_the_same_time_and_six_minute_statistics(self):
         c = self.c
         session = c.session

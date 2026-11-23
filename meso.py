@@ -194,12 +194,13 @@ class Reader:
     RECHECK_SECONDS = 30.0
     MAX_REJECTED = 128
 
-    def __init__(self):
+    def __init__(self, arbiter=None):
         self.box = None
         self.cached = None
         self.last_glyphs = None
         self.needs_recheck = False
         self.rejected = {}
+        self.arbiter = arbiter
 
     @staticmethod
     def signature(frame, box):
@@ -251,9 +252,13 @@ class Reader:
             value = read_gray_amount(glyphs)
         if value is not None and has_label(frame, box):
             self.box = box
-            if not reuse and read_binary_amount(glyphs) != value:
-                self.needs_recheck = True
-                return None
+            if not reuse:
+                binary = read_binary_amount(glyphs)
+                if binary != value:
+                    value = self.judge(glyphs, key, value, binary)
+                    if value is None:
+                        self.needs_recheck = True
+                        return None
             self.last_glyphs = key, value
             self.cached = signature, value
             return value
@@ -261,6 +266,24 @@ class Reader:
         if len(self.rejected) >= self.MAX_REJECTED:
             del self.rejected[next(iter(self.rejected))]
         self.rejected[box] = (now, signature)
+        return None
+
+    def judge(self, glyphs, key, color, binary):
+        """When the two readings differ, let JEV pick one of them for these exact glyphs.
+
+        The question runs in the background; until its answer arrives (and when
+        JEV is unsure) the balance stays unconfirmed as before.
+        """
+        if self.arbiter is None or color is None or binary is None:
+            return None
+        readings = (color, binary)
+        question = ('meso', hashlib.blake2b(str(key[0]).encode() + key[1], digest_size=16).digest(), readings)
+        found, picked = self.arbiter.answer(question)
+        if found:
+            return None if picked is None else readings[picked]
+        import jev
+        self.arbiter.submit(question,
+                            lambda: jev.pick_reading(glyphs, [f'{v:,}' for v in readings], 'meso amount'))
         return None
 
 

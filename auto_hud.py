@@ -80,6 +80,21 @@ def recognize(engine, image, scale=3):
     return ''.join(texts).strip(), min(scores) if len(scores) else 0
 
 
+def classic_level_fallback(engine, anchor, digits):
+    """Retry low-confidence classic HUD digits with the orange plates removed."""
+    anchor_pixels = np.asarray(anchor).min(axis=2)
+    digit_pixels = np.asarray(digits).min(axis=2)
+    label, label_score = recognize(engine, Image.fromarray((anchor_pixels > 185).astype('uint8')*255))
+    masked, masked_score = recognize(engine, Image.fromarray((digit_pixels > 210).astype('uint8')*255))
+    scaled, scaled_score = recognize(engine, digits, scale=4)
+    match = re.fullmatch(r'\s*L\s*V[.:\s]+([1-9](?:\s*\d){0,2})\s*', label, re.I)
+    if match and min(label_score, masked_score, scaled_score) >= .90:
+        level = ''.join(match[1].split())
+        if level == ''.join(masked.split()) == ''.join(scaled.split()):
+            return int(level)
+    return None
+
+
 def color_groups(image, kind):
     """Find digit plates or legacy yellow glyphs; dimensions follow HUD scale."""
     import cv2
@@ -129,7 +144,8 @@ class HudLocator:
                 # A level must have a visible LV anchor directly to its left.
                 anchor_box = (max(0, x-round(dh*3.2)), max(0, y-3),
                               min(w, right+2), min(h, bottom+3))
-                anchored, anchor_score = recognize(self.engine, image.crop(anchor_box))
+                anchor = image.crop(anchor_box).convert('RGB')
+                anchored, anchor_score = recognize(self.engine, anchor)
                 if not re.match(r'^\s*L\s*V[.:\s]', anchored, re.I):
                     continue
                 box = (max(0, x-2), max(0, y-2), min(w, right+2), min(h, bottom+2))
@@ -152,6 +168,10 @@ class HudLocator:
                 if (anchor_score >= .90 and anchored_level and len(votes) == 1
                         and all(raw == anchored_level for raw, _ in readings)):
                     votes[int(anchored_level)] += 1
+                if not votes and kind == 'orange':
+                    level = classic_level_fallback(self.engine, anchor, digits)
+                    if level in tracker.EXP_TABLE:
+                        votes[level] = 2
                 if votes and votes.most_common(1)[0][1] >= 2:
                     levels.append((votes.most_common(1)[0][0], normalized(box, image.size),
                                    'classic' if kind == 'orange' else 'new'))
@@ -298,6 +318,7 @@ class AutomaticCapture:
             self.reset()
             raise
         self.hud = None
+        self.last_full = full
         try:
             hud = self.locator.locate(full)
         except HudNotFound:

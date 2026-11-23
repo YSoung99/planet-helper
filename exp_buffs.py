@@ -52,6 +52,12 @@ def _patches(path, stamp):
     return patches
 
 
+def buff_corner(frame):
+    """The top-right area of the game frame where buff icons are drawn."""
+    width, height = frame.size
+    return frame.crop((round(width * .42), round(height * .055), width, round(height * .27)))
+
+
 def available(base):
     return any(template_path(base, kind).is_file() for kind in LABELS)
 
@@ -81,9 +87,8 @@ class Detector:
         import cv2
         import numpy as np
 
-        width, height = frame.size
-        ratio = 750 / height
-        corner = frame.crop((round(width * .42), round(height * .055), width, round(height * .27)))
+        ratio = 750 / frame.height
+        corner = buff_corner(frame)
         dimensions = (round(corner.width * ratio), round(corner.height * ratio))
         if min(dimensions) < 25:
             return matches
@@ -128,7 +133,7 @@ class Confirmation:
                        and 0 < stamp - self.stamp <= MAX_GAP)
         self.current = {
             kind: ('active' if consecutive and self.previous.get(kind) == value == 'active'
-                   else 'unregistered' if value == 'unregistered' else 'unknown')
+                   else value if value in ('unregistered', 'inactive') else 'unknown')
             for kind, value in readings.items()
         }
         confirmed_since = self.stamp if consecutive else None
@@ -138,7 +143,7 @@ class Confirmation:
     def text(self, generation, now):
         if self.source is None or self.source[0] != generation or now - self.stamp > MAX_GAP:
             return '경쿠 · 심볼 확인 불가'
-        words = {'active': '사용 중', 'unknown': '확인 불가', 'unregistered': '미등록'}
+        words = {'active': '사용 중', 'inactive': '없음', 'unknown': '확인 불가', 'unregistered': '미등록'}
         return ' · '.join(f'{label} {words[self.current[key]]}' for key, label in LABELS.items())
 
 

@@ -49,6 +49,18 @@ class ConfirmationTests(unittest.TestCase):
 
 
 class LevelReadingTests(unittest.TestCase):
+    def test_classic_level_151_regression_with_bundled_ocr(self):
+        locator = HudLocator(tracker.create_ocr_engine(prefer_native=False))
+        fixture = Path(__file__).with_name('fixtures') / 'classic-lv151.png'
+        with Image.open(fixture) as image:
+            found = locator.locate(image)
+            self.assertEqual((found.ui_kind, found.level, found.value), ('classic', 151, (13371271, 8.61)))
+
+            covered = image.copy()
+            covered.paste(0, (0, 923, 128, 957))
+            with self.assertRaises(HudNotFound):
+                locator.locate(covered)
+
     def test_anchor_corroborates_only_matching_digit_variants(self):
         image = Image.new('RGB', (1719, 866))
         locator = HudLocator(Mock())
@@ -62,9 +74,30 @@ class LevelReadingTests(unittest.TestCase):
                 (('LV. 41', .93848), ('41', .8779), ('41', .89), False),
             ]:
                 with self.subTest(anchor=anchor, raw=raw, binary=binary):
-                    with patch('auto_hud.recognize', side_effect=[anchor, raw, binary]):
+                    with patch('auto_hud.recognize', side_effect=[anchor, raw, binary]), \
+                         patch('auto_hud.classic_level_fallback', return_value=None):
                         if succeeds:
                             self.assertEqual(locator.read_level(image)[0], 41)
+                        else:
+                            with self.assertRaises(HudNotFound):
+                                locator.read_level(image)
+
+    def test_classic_level_retries_only_when_no_digit_read_passes(self):
+        image = Image.new('RGB', (1684, 970))
+        locator = HudLocator(Mock())
+        weak = [('LV. 050', .87), ('150', .84), ('1 51', .89)]
+        with patch('auto_hud.color_groups', side_effect=lambda im, kind:
+                   [(61, 929, 124, 951)] if kind == 'orange' else []):
+            for label, masked, scaled, expected in [
+                (('LV.151', .99), ('151', .99), ('151', .97), 151),
+                (('LV.151', .99), ('151', .99), ('150', .97), None),
+                (('LV.151', .89), ('151', .99), ('151', .97), None),
+                (('151', .99), ('151', .99), ('151', .97), None),
+            ]:
+                with self.subTest(label=label, masked=masked, scaled=scaled):
+                    with patch('auto_hud.recognize', side_effect=weak+[label, masked, scaled]):
+                        if expected is not None:
+                            self.assertEqual(locator.read_level(image)[0], expected)
                         else:
                             with self.assertRaises(HudNotFound):
                                 locator.read_level(image)

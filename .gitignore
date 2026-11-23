@@ -32,5 +32,7 @@ __pycache__/
 *.csv
 /PlanetEXP.icns
 !/planet-helper-icon.png
+# An anonymized HUD-only fixture for the Lv.151 regression test.
+!/tests/fixtures/classic-lv151.png
 /native/KeyRepeatHelper
 /native/ocr-rust/target/
