@@ -93,9 +93,6 @@ def build(c, config, application, level_value, repeat_bridge=KeyRepeatBridge):
 
     c.mode_button=QPushButton();c.mode_button.setAccessibleName('간단 화면 전환')
     c.mode_button.clicked.connect(c.toggle_display);header.addWidget(c.mode_button)
-    c.pin_button=QPushButton();c.pin_button.setCheckable(True)
-    c.pin_button.setChecked(c.always_on_top);c.pin_button.setAccessibleName('항상 맨 위 고정')
-    c.pin_button.toggled.connect(c.toggle_pin)
     c.history_button = QPushButton('기록')
     c.history_button.setAccessibleName('사냥 기록 비교')
     c.history_button.clicked.connect(c.show_history)
@@ -208,6 +205,20 @@ def build(c, config, application, level_value, repeat_bridge=KeyRepeatBridge):
     c.detail_label.setWordWrap(True)
     c.detail_label.setStyleSheet('font-size:10px;')
     side.addWidget(c.detail_label)
+    # Lines that appear only while they have something to say.
+    c.jev_status = c.label('')
+    c.jev_status.setWordWrap(True)
+    c.jev_status.setStyleSheet('color:#c4b5fd;font-size:10px;')
+    c.jev_status.hide()
+    c.stall_label = c.label('')
+    c.stall_label.setWordWrap(True)
+    c.stall_label.setStyleSheet('color:#fcd99a;font-size:10px;')
+    c.stall_label.hide()
+    c.buff_label = c.label('경험치 버프 · 아이콘 미등록')
+    c.buff_label.setStyleSheet('font-size:10px;')
+    c.buff_label.setVisible(c.buff_has_templates)
+    for line in (c.jev_status, c.stall_label, c.buff_label):
+        side.addWidget(line)
     c.auto_checkbox = QCheckBox('레벨·경험치 자동 인식')
     c.auto_checkbox.setChecked(c.auto_hud)
     c.auto_checkbox.toggled.connect(c.toggle_auto_hud)
@@ -243,12 +254,9 @@ def build(c, config, application, level_value, repeat_bridge=KeyRepeatBridge):
     c.baseline_label = c.label('시작 기준 —')
     c.table_label = c.label('')
     c.activity_label = c.label('사냥 신호 · 측정 대기')
-    c.jev_status = c.label('')
-    c.jev_status.hide()
-    c.buff_label = c.label('경험치 버프 · 아이콘 미등록')
     c.repeat_status = c.label('연타 꺼짐 · 준비 중')
     for widget in (c.minute_info, c.rate_info, c.baseline_label, c.table_label,
-                   c.activity_label, c.jev_status, c.buff_label, c.repeat_status, c.ui_label):
+                   c.activity_label, c.repeat_status, c.ui_label):
         widget.setParent(diagnostics)
     c.preview = QLabel(diagnostics)
     c.preview.setFixedSize(290, 34)
@@ -301,16 +309,13 @@ def build(c, config, application, level_value, repeat_bridge=KeyRepeatBridge):
 def resize(c):
     c.title_label.setText('플래닛 도우미')
     c.mode_button.setText('상세' if c.compact else '접기')
-    c.pin_button.setText('맨 위 켬' if c.always_on_top else '맨 위 끔')
     c.version_label.setVisible(not c.compact)
     c.manual_controls.setVisible(not c.auto_hud)
     c.window.layout().setContentsMargins(10 if c.compact else 14,10,10 if c.compact else 14,10)
     c.window.layout().setSpacing(5 if c.compact else 8)
-    for button in (c.jev_button,c.mode_button,c.pin_button,c.toggle_button,c.reset_button,c.recent_button,c.repeat_button,c.repeat_settings_button,c.history_button,c.options_button):
+    for button in (c.jev_button,c.mode_button,c.toggle_button,c.reset_button,c.recent_button,c.repeat_button,c.repeat_settings_button,c.history_button,c.options_button):
         button.setStyleSheet('padding:3px 7px;font-size:10px;border-radius:8px;' if c.compact else '')
     c.toggle_button.setStyleSheet('padding:4px 12px;border-radius:8px;' if c.compact else 'padding:6px 16px;border-radius:10px;')
-    if c.header_layout.indexOf(c.pin_button) < 0:
-        c.header_layout.insertWidget(c.header_layout.indexOf(c.mode_button), c.pin_button)
     if c.compact:
         c.repeat_controls.insertWidget(0,c.toggle_button)
         c.repeat_controls.insertWidget(1,c.reset_button)

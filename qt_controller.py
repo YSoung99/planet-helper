@@ -479,10 +479,6 @@ class SharedController(tracker.MeasurementCore):
     def toggle_pin(self, checked):
         enabled = self.apply_pin(bool(checked))
         self.always_on_top = enabled
-        previous = self.pin_button.blockSignals(True)
-        self.pin_button.setChecked(enabled)
-        self.pin_button.blockSignals(previous)
-        self.pin_button.setText('맨 위 켬' if self.always_on_top else '맨 위 끔')
         self.save_config()
 
     def update_rate_display(self, now):
@@ -1493,11 +1489,21 @@ class SharedController(tracker.MeasurementCore):
             self.map_results.put((session_id, revision, (raw, picked)))
         threading.Thread(target=work, name='map-name', daemon=True).start()
 
+    def set_card_line(self, label, text, visible=None):
+        """Show a recognition-card line only while it has text; refit the window when it appears or goes."""
+        visible = bool(text) if visible is None else visible
+        if label.text() != text:
+            label.setText(text)
+        if label.isHidden() == visible:
+            label.setVisible(visible)
+            if not self.compact:
+                from display_panel import resize
+                resize(self)
+
     def set_jev_status(self, text):
         if self.jev_status.text() != text:
-            self.jev_status.setText(text)
-            self.jev_status.setVisible(bool(text))
             self.jev_button.setAccessibleDescription(text)
+        self.set_card_line(self.jev_status, text)
 
     def apply_map_results(self):
         from record_history import load_memos, save_memo
@@ -1649,6 +1655,7 @@ class SharedController(tracker.MeasurementCore):
             self.set_jev_status('')
         # Why EXP stopped: asked once per stall, saved with the record.
         activity = self.hunt_activity
+        stall = ''
         if (enabled and session.started is not None and activity.generation == self.generation
                 and activity.gained > float('-inf') and now - activity.gained >= jev_assist.STALL_SECONDS):
             question = ('stall', session.session_id, activity.gained)
@@ -1658,6 +1665,8 @@ class SharedController(tracker.MeasurementCore):
                 if frame is not None:
                     self.jev_arbiter.submit(question, lambda: jev_assist.ask_stall(frame))
             elif reason:
+                minutes = int(now - activity.gained) // 60
+                stall = f'경험치 멈춤 {minutes}분 · JEV 판단: {reason}'
                 suffix = f' · JEV: {reason}'
                 if not self.activity_label.text().endswith(suffix):
                     self.activity_label.setText(self.activity_label.text() + suffix)
@@ -1668,6 +1677,7 @@ class SharedController(tracker.MeasurementCore):
                         jev_assist.save_stall(session.session_id, minute, reason)
                     except OSError as exc:
                         tracker.log_error('멈춘 이유 저장', exc)
+        self.set_card_line(self.stall_label, stall)
         # Suggested tag for an efficiency change.
         change = getattr(self, 'pending_change', None)
         if change is not None and enabled:
@@ -1825,7 +1835,7 @@ class SharedController(tracker.MeasurementCore):
             text = self.buff_confirmation.text(self.generation, now)
         else:
             text = '경험치 버프 · 측정 대기'
-        self.buff_label.setText(text)
+        self.set_card_line(self.buff_label, text, visible=self.buff_has_templates)
 
     def poll(self):
         if self.worker_ready and self.status.get().startswith('인식기 준비 실패'):

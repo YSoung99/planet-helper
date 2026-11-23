@@ -249,6 +249,11 @@ class ControllerTests(unittest.TestCase):
             c.apply_jev_hints(72.0)
         ask.assert_called_once()
         self.assertEqual(c.activity_label.text(), '획득 대기 · 사냥 여부 확인 중 · JEV: 사망')
+        self.assertEqual(c.stall_label.text(), '경험치 멈춤 1분 · JEV 판단: 사망')
+        self.assertFalse(c.stall_label.isHidden())
+        c.hunt_activity.update(c.generation, 80.0, gained=True)    # EXP moves again
+        c.apply_jev_hints(81.0)
+        self.assertTrue(c.stall_label.isHidden())
         self.assertEqual(jev_assist.load_stalls()[c.session.session_id], {'0': '사망'})
 
     def test_screen_hint_shows_until_the_hud_is_found(self):

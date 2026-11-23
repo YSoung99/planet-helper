@@ -97,7 +97,7 @@ def run_offline_diagnostics(application, report_path):
         assert controller.session is original_session and bridge.process.processId()==original_helper, report
         clean,_=tracker.load_settings(tracker.BASE/'settings.json')
         assert clean['compact'] is False and clean['always_on_top'] is False, report
-        controller.toggle_display();controller.pin_button.setChecked(True);application.processEvents()
+        controller.toggle_display();controller.toggle_pin(True);application.processEvents()
         report['display']['pinned_native_level']=native_level()
         assert native_level()==3, report
         window.grab().save(str(report_path.with_suffix('.png')))

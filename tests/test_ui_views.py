@@ -254,14 +254,32 @@ class ViewTests(unittest.TestCase):
         c.auto_checkbox.setChecked(True)
         self.assertFalse(c.region_button.isVisibleTo(c.window))
 
-    def test_pin_button_is_reachable_in_both_views(self):
+    def test_always_on_top_lives_in_the_settings_menu(self):
         c=self.c
-        self.assertTrue(c.compact);self.assertTrue(c.pin_button.isVisibleTo(c.window))
-        self.assertEqual(c.header_layout.indexOf(c.pin_button),c.header_layout.indexOf(c.mode_button)-1)
-        c.pin_button.click();self.assertFalse(c.always_on_top);self.assertEqual(c.pin_button.text(),'맨 위 끔')
+        self.assertFalse(hasattr(c,'pin_button'))
+        menu=c.build_context_menu();self.addCleanup(menu.deleteLater)
+        screen=next(a for a in menu.actions() if a.text()=='측정·화면').menu()
+        pin=next(a for a in screen.actions() if a.text()=='항상 맨 위')
+        self.assertTrue(pin.isChecked())
+        pin.trigger();self.assertFalse(c.always_on_top)
+        self.assertFalse(tracker.load_settings(tracker.BASE/'settings.json')[0]['always_on_top'])
+
+    def test_recognition_card_lines_show_only_with_something_to_say(self):
+        c=self.c
         c.toggle_display()
-        self.assertTrue(c.pin_button.isVisibleTo(c.window))
-        self.assertEqual(c.header_layout.indexOf(c.pin_button), c.header_layout.indexOf(c.mode_button)-1)
+        self.assertFalse(c.buff_label.isVisibleTo(c.window))   # no buff icon registered
+        self.assertFalse(c.jev_status.isVisibleTo(c.window))
+        c.set_jev_status('JEV 화면 확인 · 게임 화면이 아니에요 · 다른 창이 잡혔어요')
+        c.set_card_line(c.stall_label,'경험치 멈춤 3분 · JEV 판단: 마을·상점')
+        c.buff_has_templates=True;c.apply_buff_results(0)
+        c.window.show();self.app.processEvents()
+        for line in (c.jev_status,c.stall_label,c.buff_label):
+            self.assertTrue(line.isVisibleTo(c.window))
+            card=line.parentWidget()
+            self.assertTrue(card.rect().contains(line.geometry()), line.text())   # not cut off
+            self.assertLessEqual(card.mapTo(c.window,card.rect().bottomLeft()).y(),c.window.height())
+        c.set_jev_status('')
+        self.assertFalse(c.jev_status.isVisibleTo(c.window))
 
     def test_compact_view_keeps_new_measurement_button(self):
         c=self.c
