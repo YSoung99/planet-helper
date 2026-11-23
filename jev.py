@@ -49,27 +49,35 @@ def request(content, questions, key, timeout=60):
         return json.loads(response.read())
 
 
-def best(reply, name, allowed):
-    """The answer JEV gave at least MIN_PROBABILITY to, if it is one of ``allowed``."""
+def top(reply, name, allowed):
+    """(value, probability) of JEV's most likely answer if it is one of ``allowed``, else (None, 0)."""
     try:
         answer = next(a for a in reply['answers'] if a.get('name') == name)
-        top = max(answer['probabilities'], key=lambda entry: entry['probability'])
+        first = max(answer['probabilities'], key=lambda entry: entry['probability'])
+        value, probability = str(first.get('value')), float(first['probability'])
     except (KeyError, TypeError, ValueError, StopIteration):
-        return None
-    value = str(top.get('value'))
-    return value if top['probability'] >= MIN_PROBABILITY and value in allowed else None
+        return None, 0.0
+    return (value, probability) if value in allowed else (None, 0.0)
 
 
-def ask(images, instructions, choices, *, context='JEV'):
+def best(reply, name, allowed, minimum=MIN_PROBABILITY):
+    """The answer JEV gave at least ``minimum`` to, if it is one of ``allowed``."""
+    value, probability = top(reply, name, allowed)
+    return value if probability >= minimum else None
+
+
+def ask(images, instructions, choices, *, context='JEV', minimum=MIN_PROBABILITY, scored=False):
     """Return the chosen value from ``choices`` [(value, description)], or None.
 
     ``images`` is [(label, picture)]. A 'none' choice is always added so JEV is
-    never forced to pick one of the given answers.
+    never forced to pick one of the given answers. With ``scored`` the result is
+    (value, probability), or (None, 0.0).
     """
     import map_name
     key = map_name.gateway_key()
+    missing = (None, 0.0) if scored else None
     if not key or not choices:
-        return None
+        return missing
     content = [{'type': 'input_text', 'text': INTRO}]
     for label, picture in images:
         content += [{'type': 'input_text', 'text': label},
@@ -78,10 +86,13 @@ def ask(images, instructions, choices, *, context='JEV'):
                 'choices': [{'value': value, 'description': text} for value, text in choices]
                 + [{'value': 'none', 'description': 'None of these, or unclear'}]}
     try:
-        return best(request(content, [question], key), 'answer', {value for value, _ in choices})
+        value, probability = top(request(content, [question], key), 'answer', {value for value, _ in choices})
     except (OSError, ValueError) as exc:
         tracker.log_error(context, exc)
-        return None
+        return missing
+    if probability < minimum:
+        return missing
+    return (value, probability) if scored else value
 
 
 def pick_reading(picture, readings, what):

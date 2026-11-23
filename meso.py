@@ -201,6 +201,8 @@ class Reader:
         self.needs_recheck = False
         self.rejected = {}
         self.arbiter = arbiter
+        self.hint = None      # normalized region JEV pointed at, searched when the full frame finds nothing
+        self.hinted = None
 
     @staticmethod
     def signature(frame, box):
@@ -211,6 +213,30 @@ class Reader:
         return frame.size, hashlib.blake2b(region.tobytes(), digest_size=16).digest()
 
     def read(self, frame, now=None):
+        value = self.read_frame(frame, now)
+        if value is not None or self.needs_recheck or self.hint is None:
+            return value
+        # Search only where JEV saw the inventory, enlarged when the game window is small.
+        from PIL import Image
+        left, top, right, bottom = self.hint
+        width, height = frame.size
+        crop = frame.crop((round(left*width), round(top*height), round(right*width), round(bottom*height)))
+        scale = 2 if height < 900 else 1
+        if scale > 1:
+            crop = crop.resize((crop.width*scale, crop.height*scale), Image.Resampling.LANCZOS)
+        if self.hinted is None or self.hinted[0] != self.hint:
+            self.hinted = self.hint, Reader(self.arbiter)
+        reader = self.hinted[1]
+        value = reader.read_frame(crop, now)
+        self.needs_recheck = reader.needs_recheck
+        return value
+
+    @property
+    def located(self):
+        """True when the meso box was found on the last read, in the full frame or the JEV hint."""
+        return self.box is not None or (self.hinted is not None and self.hinted[1].box is not None)
+
+    def read_frame(self, frame, now=None):
         import time
         now = time.monotonic() if now is None else now
         self.needs_recheck = False

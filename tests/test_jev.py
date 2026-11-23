@@ -116,6 +116,38 @@ class ReadingTieBreakTests(unittest.TestCase):
         self.assertIsNone(reader.judged(image, key, readings[:2] + [((341_117_617, 50.0), .9, 'd')]))
 
 
+class InventoryHintTests(unittest.TestCase):
+    def test_small_box_is_found_only_inside_the_enlarged_hint(self):
+        from PIL import ImageDraw
+        frame = Image.new('RGB', (800, 600), (40, 60, 90))
+        ImageDraw.Draw(frame).rectangle((600, 500, 659, 505), fill=(250, 250, 250))   # 6px tall: too small
+        reader = meso.Reader()
+        with patch.object(meso, 'has_label', return_value=True), \
+                patch.object(meso, 'amount_glyphs', return_value=Image.new('L', (20, 10))), \
+                patch.object(meso, 'read_amount', return_value=4_200), \
+                patch.object(meso, 'read_binary_amount', return_value=4_200):
+            self.assertIsNone(reader.read(frame))
+            self.assertFalse(reader.located)
+            reader.hint = jev_assist.quadrant_region('br')
+            self.assertEqual(reader.read(frame), 4_200)
+            self.assertTrue(reader.located)
+
+    def test_quarter_hint_needs_sixty_percent_and_closed_needs_ninety(self):
+        frame = Image.new('RGB', (900, 600))
+
+        def reply(value, probability):
+            return {'answers': [{'name': 'answer', 'probabilities': [
+                {'value': value, 'probability': probability},
+                {'value': 'none', 'probability': 1-probability}]}]}
+        with patch('map_name.gateway_key', return_value='k'), patch('jev.request') as request:
+            for value, probability, expected in [('br', .79, 'br'), ('tr', .41, None),
+                                                 ('closed', .49, None), ('closed', .95, 'closed')]:
+                with self.subTest(value=value, probability=probability):
+                    request.return_value = reply(value, probability)
+                    self.assertEqual(jev_assist.ask_inventory(frame), expected)
+        self.assertEqual(jev_assist.quadrant_region('br'), (.4, .4, 1.0, 1.0))
+
+
 class BuffConfirmationTests(unittest.TestCase):
     def test_inactive_reading_is_shown_as_absent(self):
         confirmation = exp_buffs.Confirmation()
@@ -249,6 +281,28 @@ class ControllerTests(unittest.TestCase):
             self.assertEqual(c.jev_buff_readings(frame, 12.0, readings)['coupon'], 'active')
         ask.assert_called_once()
         self.assertEqual(readings['coupon'], 'unknown')
+
+    def test_missing_meso_box_asks_where_the_inventory_is_then_waits_when_closed(self):
+        c = self.c
+        c.jev_enabled = True
+        c.running = True
+        frame = Image.new('RGB', (100, 60))
+        source = (c.generation, 7)
+        with patch('jev_assist.ask_inventory', side_effect=['closed', 'br']) as ask:
+            c.locate_inventory(source, 0.0, frame)
+            c.locate_inventory(source, 3.0, frame)
+            ask.assert_not_called()
+            c.locate_inventory(source, 7.0, frame)          # missing for 6 seconds: ask
+            c.locate_inventory(source, 9.0, frame)
+            self.assertTrue(c.meso_inventory_closed)
+            self.assertEqual(c.meso_text(), '메소 · JEV: 인벤토리가 닫혀 있어요 · 열면 기록')
+            c.locate_inventory(source, 500.0, frame)        # closed: wait ten minutes
+            self.assertEqual(ask.call_count, 1)
+            c.locate_inventory(source, 608.0, frame)
+            c.locate_inventory(source, 610.0, frame)
+        self.assertEqual(ask.call_count, 2)
+        self.assertEqual(c.meso_reader.hint, jev_assist.quadrant_region('br'))
+        self.assertFalse(c.meso_inventory_closed)
 
     def test_unread_nickname_is_matched_to_a_known_name(self):
         c = self.c

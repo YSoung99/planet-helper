@@ -1007,6 +1007,8 @@ class SharedController(tracker.MeasurementCore):
                 current = self.session.meso.end
             return ('메소' if current is None else f'메소 {current:,}') + ' · 잔액 재확인 중'
         if current is None:
+            if self.running and getattr(self, 'meso_inventory_closed', False) and self.jev_enabled:
+                return '메소 · JEV: 인벤토리가 닫혀 있어요 · 열면 기록'
             return '메소 · 측정 중 인벤토리를 열면 기록'
         text = f'메소 {current:,}'
         balance = self.session.meso
@@ -1392,6 +1394,7 @@ class SharedController(tracker.MeasurementCore):
                 value = self.meso_reader.read(frame, stamp)
                 if self.meso_reader.needs_recheck:
                     value = meso.RECHECK
+                self.locate_inventory(source, stamp, frame)
                 self.meso_results.put((generation, window, stamp, character, value))
         except Exception as exc:
             tracker.log_error('메소 판독', exc)
@@ -1601,6 +1604,39 @@ class SharedController(tracker.MeasurementCore):
         question = ('screen', generation, int(now // 60))
         if self.jev_arbiter.submit(question, lambda: jev_assist.ask_screen(full)):
             self.jev_hud_missing = (generation, missing[1], question)
+
+    def locate_inventory(self, source, stamp, frame):
+        """Meso thread: when the meso box stays missing, ask JEV where the inventory is.
+
+        A grid cell becomes a search hint for this game window; "closed" pauses the
+        question so a hunt with the inventory closed costs at most a few calls.
+        """
+        reader = self.meso_reader
+        if reader.located or reader.needs_recheck:
+            self.meso_missing = None
+            self.meso_inventory_closed = False
+            return
+        missing = getattr(self, 'meso_missing', None)
+        if missing is None or missing[0] != source:
+            self.meso_missing = (source, stamp, None, None)
+            return
+        _, since, asked, asked_at = missing
+        if asked is not None:
+            found, answer = self.jev_arbiter.answer(asked)
+            if not found:
+                return
+            if answer not in (None, 'closed'):
+                reader.hint = jev_assist.quadrant_region(answer)
+                self.meso_inventory_closed = False
+                return
+            self.meso_inventory_closed = answer == 'closed'
+            if stamp - asked_at < (jev_assist.MESO_CLOSED_SECONDS if answer else 60.0):
+                return
+        elif stamp - since < jev_assist.MESO_MISSING_SECONDS:
+            return
+        question = ('inventory', source, stamp)
+        if self.jev_arbiter.submit(question, lambda: jev_assist.ask_inventory(frame)):
+            self.meso_missing = (source, since, question, stamp)
 
     def change_suggestion(self, change):
         """JEV's tag for an efficiency change, from frames before and after it, or None."""

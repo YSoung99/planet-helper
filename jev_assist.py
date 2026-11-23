@@ -17,6 +17,8 @@ FRAME_WIDTH = 960
 STALL_SECONDS = 60.0  # EXP unchanged this long while measuring
 SCREEN_SECONDS = 15.0  # HUD not found this long before asking what is on screen
 BUFF_SECONDS = 120.0  # one JEV look per buff kind in this many seconds
+MESO_MISSING_SECONDS = 6.0   # meso box not found this long before asking where the inventory is
+MESO_CLOSED_SECONDS = 600.0  # after JEV saw no inventory, wait this long before asking again
 
 
 class FrameRing:
@@ -160,3 +162,38 @@ def ask_screen(frame):
     return _pick([('Captured window', frame)],
                  'This app could not find the level and EXP display. What does the captured window show?',
                  SCREEN_CHOICES, 'JEV 화면 확인')
+
+
+# ---- where the item inventory is, when the meso box cannot be found locally ----
+
+QUADRANTS = {
+    'tl': ('Open, with the meso amount in the top-left quarter of the screen', (0.0, 0.0, .6, .6)),
+    'tr': ('Open, with the meso amount in the top-right quarter of the screen', (.4, 0.0, 1.0, .6)),
+    'bl': ('Open, with the meso amount in the bottom-left quarter of the screen', (0.0, .4, .6, 1.0)),
+    'br': ('Open, with the meso amount in the bottom-right quarter of the screen', (.4, .4, 1.0, 1.0)),
+}
+HINT_PROBABILITY = .6   # a wrong hint only narrows a second search, so a lower bar is safe
+CLOSED_PROBABILITY = jev.MIN_PROBABILITY  # "closed" is shown to the user, so it keeps the usual bar
+
+
+def ask_inventory(frame):
+    """A QUADRANTS key for where the inventory meso amount is, 'closed', or None.
+
+    In tests on real screens JEV pointed at the right quarter at 41-79%, below the
+    usual bar, so a quarter is accepted from HINT_PROBABILITY.
+    """
+    choices = [(key, text) for key, (text, _) in QUADRANTS.items()]
+    choices.append(('closed', 'No item inventory window is open'))
+    value, probability = jev.ask(
+        [('Game screen', frame)],
+        'Is the ITEM INVENTORY window (item grid with a meso amount at its bottom) open on screen? '
+        'Where is its meso amount?',
+        choices, context='JEV 인벤토리 위치', minimum=HINT_PROBABILITY, scored=True)
+    if value == 'closed' and probability < CLOSED_PROBABILITY:
+        return None
+    return value
+
+
+def quadrant_region(key):
+    """Normalized (left, top, right, bottom) of a quarter, overlapping the middle of the screen."""
+    return QUADRANTS[key][1]
