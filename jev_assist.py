@@ -18,7 +18,8 @@ STALL_SECONDS = 60.0  # EXP unchanged this long while measuring
 SCREEN_SECONDS = 15.0  # HUD not found this long before asking what is on screen
 BUFF_SECONDS = 120.0  # one JEV look per buff kind in this many seconds
 MESO_MISSING_SECONDS = 6.0   # meso box not found this long before asking where the inventory is
-MESO_CLOSED_SECONDS = 600.0  # after JEV saw no inventory, wait this long before asking again
+MESO_CLOSED_SECONDS = 600.0  # after JEV saw no inventory (or was unsure), wait this long before asking again
+SCREEN_REPEAT_SECONDS = 300.0  # ask again about the same missing HUD at most this often
 
 
 class FrameRing:

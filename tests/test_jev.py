@@ -40,6 +40,20 @@ class ArbiterTests(unittest.TestCase):
         clock[0] += 10
         self.assertTrue(arbiter.submit('b', lambda: 2))
 
+    def test_unavailable_question_is_asked_again_after_the_retry_wait(self):
+        clock = [0.0]
+        arbiter = jev.Arbiter(cooldown=10, clock=lambda: clock[0], runner=lambda work: work())
+
+        def no_key():
+            raise jev.Unavailable('JEV API 키 없음')
+        self.assertTrue(arbiter.submit('a', no_key))
+        self.assertEqual(arbiter.answer('a'), (False, None))
+        clock[0] = jev.RETRY_SECONDS - 1
+        self.assertFalse(arbiter.submit('a', lambda: 'yes'))
+        clock[0] = jev.RETRY_SECONDS
+        self.assertTrue(arbiter.submit('a', lambda: 'yes'))
+        self.assertEqual(arbiter.answer('a'), (True, 'yes'))
+
     def test_a_failing_question_is_answered_with_none(self):
         arbiter = sync_arbiter()
         with patch('tracker.log_error'):
@@ -67,14 +81,16 @@ class AskTests(unittest.TestCase):
             request.return_value = self.reply('7', .99)
             self.assertIsNone(jev.ask([('Crop', picture)], 'q', [('0', 'a'), ('1', 'b')]))
 
-    def test_no_key_or_network_failure_gives_no_answer(self):
+    def test_no_key_or_network_failure_is_unavailable_not_unsure(self):
         picture = Image.new('RGB', (40, 10))
         with patch('map_name.gateway_key', return_value=None), patch('jev.request') as request:
-            self.assertIsNone(jev.ask([('Crop', picture)], 'q', [('0', 'a')]))
+            with self.assertRaises(jev.Unavailable):
+                jev.ask([('Crop', picture)], 'q', [('0', 'a')])
             request.assert_not_called()
         with patch('map_name.gateway_key', return_value='k'), \
                 patch('jev.request', side_effect=OSError('offline')), patch('tracker.log_error'):
-            self.assertIsNone(jev.ask([('Crop', picture)], 'q', [('0', 'a')]))
+            with self.assertRaises(jev.Unavailable):
+                jev.ask([('Crop', picture)], 'q', [('0', 'a')])
 
     def test_image_is_sent_as_a_square(self):
         url = jev.image_url(Image.new('RGB', (300, 20)))
@@ -303,6 +319,18 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(ask.call_count, 2)
         self.assertEqual(c.meso_reader.hint, jev_assist.quadrant_region('br'))
         self.assertFalse(c.meso_inventory_closed)
+
+    def test_unsure_inventory_answer_also_waits_ten_minutes(self):
+        c = self.c
+        c.jev_enabled = True
+        frame = Image.new('RGB', (100, 60))
+        source = (c.generation, 7)
+        with patch('jev_assist.ask_inventory', return_value=None) as ask:
+            for stamp in (0.0, 7.0, 9.0, 70.0, 300.0, 606.0):
+                c.locate_inventory(source, stamp, frame)
+            self.assertEqual(ask.call_count, 1)
+            c.locate_inventory(source, 607.0, frame)
+        self.assertEqual(ask.call_count, 2)
 
     def test_unread_nickname_is_matched_to_a_known_name(self):
         c = self.c

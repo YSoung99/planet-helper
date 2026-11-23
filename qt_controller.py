@@ -1590,7 +1590,7 @@ class SharedController(tracker.MeasurementCore):
         return readings
 
     def note_missing_hud(self, generation, full):
-        """Worker thread: once the HUD stays missing, ask (at most once a minute) what the window shows."""
+        """Worker thread: once the HUD stays missing, ask (at most every 5 minutes) what the window shows."""
         now = time.monotonic()
         if not self.running or self.session.first is not None:
             self.jev_hud_missing = None
@@ -1601,7 +1601,7 @@ class SharedController(tracker.MeasurementCore):
             return
         if full is None or now - missing[1] < jev_assist.SCREEN_SECONDS:
             return
-        question = ('screen', generation, int(now // 60))
+        question = ('screen', generation, int(now // jev_assist.SCREEN_REPEAT_SECONDS))
         if self.jev_arbiter.submit(question, lambda: jev_assist.ask_screen(full)):
             self.jev_hud_missing = (generation, missing[1], question)
 
@@ -1630,7 +1630,7 @@ class SharedController(tracker.MeasurementCore):
                 self.meso_inventory_closed = False
                 return
             self.meso_inventory_closed = answer == 'closed'
-            if stamp - asked_at < (jev_assist.MESO_CLOSED_SECONDS if answer else 60.0):
+            if stamp - asked_at < jev_assist.MESO_CLOSED_SECONDS:
                 return
         elif stamp - since < jev_assist.MESO_MISSING_SECONDS:
             return
