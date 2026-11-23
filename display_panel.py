@@ -32,46 +32,50 @@ def build(c, config, application, level_value, repeat_bridge=KeyRepeatBridge):
     c.window.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
     c.window.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, c.always_on_top)
     c.window.setStyleSheet("""
-        QWidget { color:#e4ecf4; font-size:12px; }
+        QWidget { color:#eef2f7; font-size:12px; }
         QWidget#panel, QWidget#body { background:transparent; border:none; }
         QWidget#summaryCard {
-            background:#15292d; border:1px solid #365252; border-radius:11px;
+            background:rgba(110,231,183,22); border:1px solid rgba(110,231,183,52); border-radius:14px;
         }
         QWidget#metricsCard, QWidget#recognitionCard {
-            background:#182535; border:1px solid #2b394a; border-radius:11px;
+            background:rgba(255,255,255,16); border:1px solid rgba(255,255,255,26); border-radius:14px;
         }
-        QLabel#sectionTitle { color:#eef3f7; font-size:13px; font-weight:700; }
+        QLabel#sectionTitle { color:#f5f7fa; font-size:13px; font-weight:700; }
         QLabel { background:transparent; border:none; }
-        QLabel#muted { color:#a5b7ca; }
-        QLabel#statCaption { color:#b0c2d3; font-size:11px; font-weight:600; }
-        QLabel#metric { color:#e4ecf4; font-size:19px; font-weight:600; }
-        QLabel#primaryStat { color:#baf5dd; font-size:23px; font-weight:700; }
-        QLabel#statValue { color:#f1f6fa; font-size:20px; font-weight:650; }
+        QLabel#muted { color:rgba(235,241,247,165); }
+        QLabel#statCaption { color:rgba(235,241,247,150); font-size:11px; font-weight:600; }
+        QLabel#metric { color:#f2f5f9; font-size:19px; font-weight:600; }
+        QLabel#primaryStat { color:#a7f3d0; font-size:24px; font-weight:700; }
+        QLabel#statValue { color:#f8fafc; font-size:20px; font-weight:650; }
         QPushButton {
-            background:#25364a; color:#e0eaf5; border:none;
-            border-radius:6px; padding:5px 9px;
+            background:rgba(255,255,255,22); color:#eef2f7; border:1px solid rgba(255,255,255,18);
+            border-radius:9px; padding:5px 11px;
         }
-        QPushButton:hover { background:#334c65; }
-        QPushButton:pressed { background:#3e5871; }
-        QPushButton:checked { background:#244c46; color:#b9f4dc; }
-        QPushButton:disabled { color:#8497ab; }
-        QPushButton#toggle { background:#83e5bb; color:#112a22; font-weight:700; }
-        QPushButton#toggle:hover { background:#a8f2d2; }
-        QPushButton#toggle[running="true"] { background:#f6cc92; color:#3d281a; }
-        QSpinBox { background:#24364a; color:#d3ecff; border:none; padding:3px; }
+        QPushButton:hover { background:rgba(255,255,255,36); }
+        QPushButton:pressed { background:rgba(255,255,255,50); }
+        QPushButton:checked { background:rgba(110,231,183,46); color:#c7f9e3; border-color:rgba(110,231,183,70); }
+        QPushButton:disabled { color:rgba(235,241,247,95); background:rgba(255,255,255,10); }
+        QPushButton#toggle { background:#6ee7b7; color:#052e21; font-weight:700; border:none; }
+        QPushButton#toggle:hover { background:#95f0cc; }
+        QPushButton#toggle[running="true"] { background:#fbbf77; color:#3b2408; }
+        QPushButton#close { background:transparent; border:none; color:rgba(235,241,247,150);
+                            border-radius:11px; padding:0; font-size:14px; }
+        QPushButton#close:hover { background:#ff5f57; color:#ffffff; }
+        QSpinBox { background:rgba(255,255,255,22); color:#eef2f7; border:none; border-radius:6px; padding:3px; }
+        QCheckBox { spacing:6px; }
         QMenu {
-            background:#1b2939; color:#e4ecf4; border:1px solid #394b60;
-            padding:4px;
+            background:#20252e; color:#eef2f7; border:1px solid rgba(255,255,255,30);
+            padding:5px;
         }
-        QMenu::item { padding:6px 27px 6px 24px; }
-        QMenu::item:selected { background:#334c65; }
-        QMenu::item:disabled { color:#8d9eb0; }
-        QMenu::separator { height:1px; background:#334356; margin:4px 8px; }
+        QMenu::item { padding:6px 26px 6px 22px; border-radius:6px; }
+        QMenu::item:selected { background:rgba(110,231,183,60); }
+        QMenu::item:disabled { color:rgba(235,241,247,110); }
+        QMenu::separator { height:1px; background:rgba(255,255,255,26); margin:4px 8px; }
     """)
     layout = QVBoxLayout(c.window)
-    layout.setContentsMargins(12,10,12,10); layout.setSpacing(6)
+    layout.setContentsMargins(14,12,14,12); layout.setSpacing(6)
     header = QHBoxLayout(); header.setSpacing(5); c.header_layout = header
-    title = c.label('플래닛 도우미');c.title_label=title;title.setStyleSheet('font-size:16px;font-weight:700;color:#f0f4f8;')
+    title = c.label('플래닛 도우미');c.title_label=title;title.setStyleSheet('font-size:15px;font-weight:700;color:#f8fafc;')
     title.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
     header.addWidget(title)
     c.version_label = c.label(__import__('tracker').APP_VERSION);header.addWidget(c.version_label)
@@ -100,7 +104,7 @@ def build(c, config, application, level_value, repeat_bridge=KeyRepeatBridge):
     c.options_button.clicked.connect(
         lambda: c.context_menu(c.options_button.geometry().bottomLeft()))
     header.addWidget(c.options_button)
-    close=QPushButton('×');c.close_button=close;close.setFixedWidth(22);close.setAccessibleName('종료')
+    close=QPushButton('✕');c.close_button=close;close.setObjectName('close');close.setFixedSize(22,22);close.setAccessibleName('종료')
     close.clicked.connect(c.close);header.addWidget(close);layout.addLayout(header)
 
     c.compact_body=QWidget();c.compact_body.setObjectName('metricsCard')
@@ -116,7 +120,7 @@ def build(c, config, application, level_value, repeat_bridge=KeyRepeatBridge):
     add_stat(c,grid,1,1,'직전 1분 획득',c.compact_recent_minute)
     c.compact_level_eta = c.label('레벨업 예상 —')
     c.compact_level_eta.setAccessibleName('레벨업 예상 시간')
-    c.compact_level_eta.setStyleSheet('color:#e8d9a8;font-size:10px;')
+    c.compact_level_eta.setStyleSheet('color:#fcd99a;font-size:10px;')
     layout.addWidget(c.compact_body)
     c.full_body = QWidget()
     c.full_body.setObjectName('body')
@@ -196,13 +200,10 @@ def build(c, config, application, level_value, repeat_bridge=KeyRepeatBridge):
     c.source_label.setWordWrap(True)
     side.addWidget(c.source_label)
     c.current_label = c.label(c.value.get())
-    c.current_label.setStyleSheet('color:#b4e9c6;')
+    c.current_label.setStyleSheet('color:#a7f3d0;')
     side.addWidget(c.current_label)
     c.ui_label = c.label('인식 UI: 확인 전')
-    c.ui_label.setWordWrap(True)
     c.ui_label.setAccessibleName('현재 인식 UI')
-    c.ui_label.setStyleSheet('font-size:10px;')
-    side.addWidget(c.ui_label)
     c.detail_label = c.label(c.status.get())
     c.detail_label.setWordWrap(True)
     c.detail_label.setStyleSheet('font-size:10px;')
@@ -229,7 +230,7 @@ def build(c, config, application, level_value, repeat_bridge=KeyRepeatBridge):
 
     c.level_eta = c.label('레벨업 예상 · 평균 집계 후 표시')
     c.level_eta.setWordWrap(True)
-    c.level_eta.setStyleSheet('color:#e8d9a8;')
+    c.level_eta.setStyleSheet('color:#fcd99a;')
     c.level_eta.setAccessibleName('시간당 경험치와 레벨업 예상 시간')
     detail.addWidget(c.level_eta)
     layout.addWidget(c.full_body)
@@ -247,7 +248,7 @@ def build(c, config, application, level_value, repeat_bridge=KeyRepeatBridge):
     c.buff_label = c.label('경험치 버프 · 아이콘 미등록')
     c.repeat_status = c.label('연타 꺼짐 · 준비 중')
     for widget in (c.minute_info, c.rate_info, c.baseline_label, c.table_label,
-                   c.activity_label, c.jev_status, c.buff_label, c.repeat_status):
+                   c.activity_label, c.jev_status, c.buff_label, c.repeat_status, c.ui_label):
         widget.setParent(diagnostics)
     c.preview = QLabel(diagnostics)
     c.preview.setFixedSize(290, 34)
@@ -255,7 +256,7 @@ def build(c, config, application, level_value, repeat_bridge=KeyRepeatBridge):
 
     c.change_prompt = QPushButton()
     c.change_prompt.hide()
-    c.change_prompt.setStyleSheet('QPushButton{background:#3a3322;color:#f0d98c;text-align:left;padding:4px 6px;}')
+    c.change_prompt.setStyleSheet('QPushButton{background:rgba(251,191,119,38);color:#fde3b5;border:1px solid rgba(251,191,119,70);text-align:left;padding:5px 9px;}')
     c.change_prompt.setAccessibleName('효율 변화 태그 달기')
     c.change_prompt.clicked.connect(c.answer_change_prompt)
     layout.addWidget(c.change_prompt)
@@ -303,11 +304,11 @@ def resize(c):
     c.pin_button.setText('맨 위 켬' if c.always_on_top else '맨 위 끔')
     c.version_label.setVisible(not c.compact)
     c.manual_controls.setVisible(not c.auto_hud)
-    c.window.layout().setContentsMargins(8 if c.compact else 12,8,8 if c.compact else 12,8)
+    c.window.layout().setContentsMargins(10 if c.compact else 14,10,10 if c.compact else 14,10)
     c.window.layout().setSpacing(5 if c.compact else 8)
-    for button in (c.jev_button,c.mode_button,c.pin_button,c.close_button,c.toggle_button,c.reset_button,c.recent_button,c.repeat_button,c.repeat_settings_button,c.history_button,c.options_button):
-        button.setStyleSheet('padding:3px 5px;font-size:10px;' if c.compact else '')
-    c.toggle_button.setStyleSheet('padding:4px 11px;' if c.compact else 'padding:6px 14px;')
+    for button in (c.jev_button,c.mode_button,c.pin_button,c.toggle_button,c.reset_button,c.recent_button,c.repeat_button,c.repeat_settings_button,c.history_button,c.options_button):
+        button.setStyleSheet('padding:3px 7px;font-size:10px;border-radius:8px;' if c.compact else '')
+    c.toggle_button.setStyleSheet('padding:4px 12px;border-radius:8px;' if c.compact else 'padding:6px 16px;border-radius:10px;')
     if c.header_layout.indexOf(c.pin_button) < 0:
         c.header_layout.insertWidget(c.header_layout.indexOf(c.mode_button), c.pin_button)
     if c.compact:

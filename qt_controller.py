@@ -5,7 +5,6 @@ override the hooks marked "Platform hook" below; every other change made here
 applies to both apps.
 """
 import argparse
-import csv
 import ctypes
 import json
 import math
@@ -108,11 +107,17 @@ class TrackerWindow(QWidget):
         self.controller = controller
         self.drag_origin = None
 
+    RADIUS = 16
+
     def paintEvent(self, event):
         painter = QPainter(self)
-        painter.fillRect(self.rect(), QColor(13, 23, 36, round(self.controller.window_opacity*255)))
-        painter.setPen(QPen(QColor('#35414d'), 1))
-        painter.drawRect(self.rect().adjusted(0, 0, -1, -1))
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        # Over a blurred background a lighter tint keeps the glass look; without blur
+        # the tint alone carries the chosen opacity.
+        strength = .62 if getattr(self.controller, 'glass', False) else 1.0
+        painter.setBrush(QColor(16, 22, 32, round(self.controller.window_opacity*255*strength)))
+        painter.setPen(QPen(QColor(255, 255, 255, 38), 1))
+        painter.drawRoundedRect(self.rect().adjusted(0, 0, -1, -1), self.RADIUS, self.RADIUS)
 
 
     def mousePressEvent(self, event):
@@ -261,6 +266,10 @@ class SharedController(tracker.MeasurementCore):
     def native_overlay(self, widget, level=3):
         """Keep a window above others / on all Spaces where the platform needs it."""
 
+    def apply_glass(self, widget):
+        """Blur what is behind the window; return True when the platform did it."""
+        return False
+
     def repeat_bridge_class(self):
         from key_repeat import KeyRepeatBridge
         return KeyRepeatBridge
@@ -273,6 +282,7 @@ class SharedController(tracker.MeasurementCore):
         if visible:
             self.window.show()
             self.native_overlay(self.window, 3 if enabled else 0)
+            self.glass = self.apply_glass(self.window)
         self.window.move(position)
         return enabled
 
@@ -392,7 +402,7 @@ class SharedController(tracker.MeasurementCore):
         self.window = TrackerWindow(self)
         from display_panel import build
         build(self, config, application, LevelValue, repeat_bridge=self.repeat_bridge_class())
-        self.source_label.setText('MapleStory Worlds · 게임 창 캡처')
+        self.update_capture_label()
         self.window.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.window.customContextMenuRequested.connect(self.context_menu)
         self.quit_shortcut = QShortcut(QKeySequence.StandardKey.Quit, self.window)
@@ -678,11 +688,6 @@ class SharedController(tracker.MeasurementCore):
                                 f'이미 있는 기록 {skipped}개는 그대로 두었어요.\n'
                                 f'사냥터·캐릭터 이름 {names}개를 합쳤어요.')
 
-    def open_backups(self):
-        folder = tracker.BASE/'records-backups'
-        folder.mkdir(parents=True, exist_ok=True)
-        self.open_path(folder)
-
     def run_auto_backup(self):
         """Daily copy of the records, in the background so startup stays quick."""
         def work():
@@ -767,6 +772,7 @@ class SharedController(tracker.MeasurementCore):
             QTimer.singleShot(5000, self.run_auto_backup)
         self.window.show()
         self.native_overlay(self.window, 3 if self.always_on_top else 0)
+        self.glass = self.apply_glass(self.window)
         self.window.raise_()
         self.window.activateWindow()
 
@@ -780,7 +786,6 @@ class SharedController(tracker.MeasurementCore):
     def build_context_menu(self):
         menu = QMenu(self.window)
         menu.addAction('사냥 기록 비교', self.show_history)
-        menu.addAction('이번 사냥터 메모', self.edit_memo)
         menu.addSeparator()
 
         def add_toggle(parent, title, checked, callback):
@@ -815,12 +820,10 @@ class SharedController(tracker.MeasurementCore):
 
         records = menu.addMenu('기록·백업')
         records.addAction('오늘·이번 주 요약', self.show_period_summary)
-        records.addAction('CSV 저장…', self.export)
         records.addAction('기록 폴더 열기', self.open_records)
         records.addSeparator()
         records.addAction('백업 파일로 내보내기…', self.export_records)
         records.addAction('백업 파일에서 가져오기 (합치기)…', self.import_records)
-        records.addAction('자동 백업 폴더 열기', self.open_backups)
         records.addSeparator()
         records.addAction('구글 드라이브 동기화 설정…', self.cloud_settings)
         if self.cloud_remote:
@@ -831,7 +834,6 @@ class SharedController(tracker.MeasurementCore):
 
         help_menu = menu.addMenu('도움말·권한')
         help_menu.addAction('인식 정보', self.show_information)
-        help_menu.addAction('시작 화면 폴더 열기', self.open_start_captures)
         self.extra_menu_actions(help_menu)
 
         menu.addSeparator()
@@ -1104,21 +1106,6 @@ class SharedController(tracker.MeasurementCore):
         self.update_jev_button()
         self.save_config()
 
-    def edit_memo(self):
-        from PySide6.QtWidgets import QInputDialog
-        from record_history import load_memos, save_memo
-        session_id = self.session.session_id
-        text, ok = QInputDialog.getText(self.window, '이번 사냥터 메모', '사냥터 (예: 하늘 정원 2층)',
-                                        text=load_memos().get(session_id, ''))
-        if not ok: return
-        try:
-            saved = save_memo(session_id, text)
-            import map_name
-            map_name.learn_correction(session_id, saved)
-            self.status.set(f'사냥터 메모 저장 · {saved}' if saved else '사냥터 메모 지움')
-        except OSError as exc:
-            tracker.log_error('사냥터 메모 저장', exc); self.status.set('사냥터 메모 저장 실패')
-
     def open_records(self):
         self.open_path(tracker.BASE/'records')
 
@@ -1183,7 +1170,7 @@ class SharedController(tracker.MeasurementCore):
         if not self.check_permission() or not self.reset(): return
         self.recent_permission = True
         self.running = True
-        self.source_label.setText('MapleStory Worlds · 게임 창 캡처')
+        self.update_capture_label()
         self.status.set('레벨·경험치 위치 자동 탐색 중' if self.auto_hud else '게임 창 연결 · 인식기 준비 중')
 
     def collect_recent(self):
@@ -1444,11 +1431,6 @@ class SharedController(tracker.MeasurementCore):
                 and (automatic is None or automatic.hud is None)):
             return min(self.target_seconds, self.DISCOVERY_PERIOD)
         return self.target_seconds
-
-    def open_start_captures(self):
-        folder = tracker.BASE/'records'/'start-captures'
-        folder.mkdir(parents=True, exist_ok=True)
-        self.open_path(folder)
 
     def save_start_milestones(self, before_first, before_started, observed_at, value, raw, score, details):
         full, frame = details.get('full_game_image'), details.get('image')
@@ -1775,7 +1757,7 @@ class SharedController(tracker.MeasurementCore):
 
     def update_capture_label(self):
         if not self.auto_hud:
-            self.source_label.setText('MapleStory Worlds · 수동 영역')
+            self.source_label.setText('수동 영역')
             return
         job, nickname = self.character_identity
         fields = [f'Lv. {self.session.level}'] if self.running else []
@@ -2090,23 +2072,6 @@ class SharedController(tracker.MeasurementCore):
             temporary.replace(tracker.BASE/'settings.json')
         except OSError as exc:
             tracker.log_error('설정 저장', exc); self.status.set('창 위치/영역 저장 실패')
-
-    def export(self):
-        target, _ = QFileDialog.getSaveFileName(self.window, 'CSV 저장', str(Path.home()/'Documents'/'planet-exp.csv'), 'CSV (*.csv)')
-        if not target: return
-        temporary = None
-        try:
-            destination = Path(target)
-            with tempfile.NamedTemporaryFile('w',newline='',encoding='utf-8-sig',dir=destination.parent,prefix='.planet-exp-',suffix='.tmp',delete=False) as stream:
-                temporary = Path(stream.name)
-                writer = csv.writer(stream)
-                writer.writerow(['관측 시각','현재 경험치','퍼센트','사냥 초','총 획득 경험치','상태'])
-                writer.writerows(self.session.rows)
-            temporary.replace(destination); self.status.set('CSV 저장 완료')
-        except OSError as exc:
-            tracker.log_error('CSV 저장',exc); self.status.set('CSV 저장 실패 · 저장 위치/권한 확인')
-        finally:
-            if temporary is not None: temporary.unlink(missing_ok=True)
 
     def close(self): self.window.close()
 

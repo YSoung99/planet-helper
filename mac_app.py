@@ -24,6 +24,32 @@ def native_overlay(widget, level=3):
                                   NSWindowCollectionBehaviorFullScreenAuxiliary)
 
 
+def apply_glass(widget, radius):
+    """Put a rounded NSVisualEffectView behind Qt's view so the window blurs what is under it."""
+    import objc
+    from AppKit import NSColor, NSVisualEffectView, NSWindowBelow
+    view = objc.objc_object(c_void_p=ctypes.c_void_p(int(widget.winId())))
+    window = view.window()
+    content = window.contentView()
+    frame = content.superview()
+    if frame is None:
+        return False
+    if not any(isinstance(sub, NSVisualEffectView) for sub in frame.subviews()):
+        effect = NSVisualEffectView.alloc().initWithFrame_(content.frame())
+        effect.setMaterial_(13)        # NSVisualEffectMaterialHUDWindow
+        effect.setBlendingMode_(0)     # behind the window
+        effect.setState_(1)            # always active, even when another app is in front
+        effect.setAutoresizingMask_(2 | 16)  # follow the window's width and height
+        effect.setWantsLayer_(True)
+        effect.layer().setCornerRadius_(radius)
+        effect.layer().setMasksToBounds_(True)
+        frame.addSubview_positioned_relativeTo_(effect, NSWindowBelow, content)
+    window.setOpaque_(False)
+    window.setBackgroundColor_(NSColor.clearColor())
+    window.setHasShadow_(True)
+    return True
+
+
 def open_privacy_settings(pane):
     subprocess.Popen(['open', f'x-apple.systempreferences:com.apple.preference.security?{pane}'])
 
@@ -59,6 +85,13 @@ class Controller(SharedController):
 
     def native_overlay(self, widget, level=3):
         native_overlay(widget, level)
+
+    def apply_glass(self, widget):
+        try:
+            return apply_glass(widget, TrackerWindow.RADIUS)
+        except Exception as exc:  # the plain tinted window still works
+            tracker.log_error('창 배경 흐림', exc)
+            return False
 
     def open_path(self, path):
         subprocess.Popen(['open', str(path)])

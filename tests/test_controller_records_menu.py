@@ -28,11 +28,14 @@ class RecordsMenuTests(unittest.TestCase):
         menu = self.c.build_context_menu()
         self.addCleanup(menu.deleteLater)
         actions = {action.text(): action for action in menu.actions() if not action.isSeparator()}
-        self.assertEqual(list(actions), ['사냥 기록 비교', '이번 사냥터 메모', '측정·화면', '게임 인식',
+        self.assertEqual(list(actions), ['사냥 기록 비교', '측정·화면', '게임 인식',
                                          '메소·버프', '기록·백업', '도움말·권한', '종료'])
         records = {a.text() for a in actions['기록·백업'].menu().actions()}
         self.assertTrue({'오늘·이번 주 요약', '백업 파일로 내보내기…',
-                         '백업 파일에서 가져오기 (합치기)…', 'CSV 저장…'} <= records)
+                         '백업 파일에서 가져오기 (합치기)…'} <= records)
+        self.assertFalse({'CSV 저장…', '자동 백업 폴더 열기'} & records)
+        help_menu = {a.text() for a in actions['도움말·권한'].menu().actions()}
+        self.assertNotIn('시작 화면 폴더 열기', help_menu)
         recognition = {a.text() for a in actions['게임 인식'].menu().actions()}
         self.assertTrue({'현재 캐릭터: 지정 안 함…', '현재 닉네임 등록·수정…',
                          '경험치 영역 지정…'} <= recognition)

@@ -1,4 +1,3 @@
-import csv
 import json
 import tempfile
 import unittest
@@ -35,31 +34,6 @@ class ResilienceTests(unittest.TestCase):
                     self.assertEqual(config['position'], [-200, 20])
                     self.assertEqual(config['level'], 169)
                     self.assertTrue(warning)
-
-    def test_failed_export_preserves_existing_file_and_reports_the_error(self):
-        with tempfile.TemporaryDirectory() as folder, patch.object(tracker, 'BASE', Path(folder)):
-            target = Path(folder)/'export.csv'
-            target.write_text('previous export')
-            messages = []
-            app = qt_controller.SharedController.__new__(qt_controller.SharedController)
-            app.window = None
-            app.status = SimpleNamespace(set=messages.append)
-            app.session = tracker.Session()
-            app.session.accept((1000, 10), -1)
-            app.session.accept((1000, 10), 0)
-            with patch.object(qt_controller.QFileDialog, 'getSaveFileName', return_value=(str(target), 'CSV (*.csv)')), \
-                    patch.object(Path, 'replace', side_effect=PermissionError('read only destination')):
-                app.export()
-            self.assertEqual(target.read_text(), 'previous export')
-            self.assertIn('CSV 저장 실패', messages[-1])
-            self.assertIn('PermissionError', (Path(folder)/'last-error.log').read_text())
-            self.assertEqual(list(Path(folder).glob('.planet-exp-*.tmp')), [])
-            with patch.object(qt_controller.QFileDialog, 'getSaveFileName', return_value=(str(target), 'CSV (*.csv)')):
-                app.export()
-            with target.open(encoding='utf-8-sig', newline='') as stream:
-                rows = list(csv.reader(stream))
-            self.assertEqual(rows[1][1:3], ['1000', '10'])
-            self.assertEqual(messages[-1], 'CSV 저장 완료')
 
     def test_failed_settings_replace_preserves_previous_settings(self):
         with tempfile.TemporaryDirectory() as folder, patch.object(tracker, 'BASE', Path(folder)):
