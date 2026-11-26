@@ -32,7 +32,11 @@ class WindowCapture:
         self.state_atom = self.display.intern_atom('_NET_WM_STATE')
 
     def game(self):
+        # MapleStory Worlds can own several msw.exe windows (e.g. a minimized
+        # launcher next to the game itself), so skip hidden ones and only report
+        # "minimized" when no visible msw.exe window is left.
         prop=self.root.get_full_property(self.display.intern_atom('_NET_CLIENT_LIST'),X.AnyPropertyType)
+        hidden=False
         for wid in ([] if prop is None else prop.value):
             window=self.display.create_resource_object('window',int(wid))
             classes=window.get_wm_class() or ()
@@ -40,9 +44,11 @@ class WindowCapture:
             state = window.get_full_property(self.state_atom, X.AnyPropertyType)
             if (window.get_attributes().map_state != X.IsViewable
                     or state is not None and self.hidden_atom in state.value):
-                raise RuntimeError('게임 최소화 · 판독 대기')
+                hidden=True
+                continue
             geo=window.get_geometry(); point=self.root.translate_coords(window,0,0)
             return window,dict(left=point.x,top=point.y,width=geo.width,height=geo.height)
+        if hidden: raise RuntimeError('게임 최소화 · 판독 대기')
         raise RuntimeError('MapleStory Worlds 게임 창을 찾을 수 없음')
 
     def check_active(self, window):
