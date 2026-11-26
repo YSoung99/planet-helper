@@ -64,6 +64,33 @@ class InputTests(unittest.TestCase):
         self.assertEqual(frame.size, (100, 10))
         self.assertEqual(frame.info['capture_backend'], 'xcomposite-game-window')
         self.assertIs(frame.info['full_game_image'], full)
+    def test_game_skips_minimized_msw_window_for_visible_one(self):
+        from Xlib import X
+        def fake(wid, viewable, hidden, size=(1562, 879)):
+            return SimpleNamespace(
+                id=wid, get_wm_class=lambda: ('msw.exe', 'msw.exe'),
+                get_full_property=lambda *a: SimpleNamespace(value=['HIDDEN'] if hidden else []),
+                get_attributes=lambda: SimpleNamespace(map_state=X.IsViewable if viewable else X.IsUnmapped),
+                get_geometry=lambda: SimpleNamespace(width=size[0], height=size[1]))
+        def capture_for(*windows):
+            capture = WindowCapture.__new__(WindowCapture)
+            by_id = {w.id: w for w in windows}
+            capture.display = SimpleNamespace(intern_atom=lambda name: name,
+                                              create_resource_object=lambda kind, wid: by_id[wid])
+            capture.root = SimpleNamespace(
+                get_full_property=lambda *a: SimpleNamespace(value=list(by_id)),
+                translate_coords=lambda w, x, y: SimpleNamespace(x=5, y=7))
+            capture.state_atom, capture.hidden_atom = 'STATE', 'HIDDEN'
+            return capture
+        launcher, game = fake(1, False, True, (1500, 844)), fake(2, True, False)
+        window, bounds = capture_for(launcher, game).game()
+        self.assertIs(window, game)
+        self.assertEqual(bounds, dict(left=5, top=7, width=1562, height=879))
+        with self.assertRaisesRegex(RuntimeError, '최소화'):
+            capture_for(launcher).game()
+        with self.assertRaisesRegex(RuntimeError, '찾을 수 없음'):
+            capture_for().game()
+
     def test_roi_tracks_geometry_and_rejects_changed_aspect(self):
         roi=dict(left=.1,top=.8,width=.5,height=.1,reference_aspect=2)
         self.assertEqual(pixel_rect(roi,1000,500),(100,400,500,50))
