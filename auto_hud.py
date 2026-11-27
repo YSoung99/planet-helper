@@ -182,6 +182,11 @@ class HudLocator:
 
     def _detector(self):
         if self.detector is None:
+            import map_name
+            if map_name.available():
+                self.detector = map_name.detect_boxes
+                return self.detector
+            import logging
             from rapidocr import RapidOCR, ModelType
             import tracker
             model = tracker.RESOURCES/'models'/'PP-OCRv6_det_tiny.onnx'
@@ -189,10 +194,12 @@ class HudLocator:
                 raise HudNotFound('자동 탐색 모델을 찾을 수 없어요')
             self.detector = RapidOCR(params={
                 'Global.use_det': True, 'Global.use_cls': False, 'Global.use_rec': False,
+                'Global.log_level': 'error',
                 'Det.model_type': ModelType.TINY, 'Det.model_path': str(model),
                 'Det.limit_type': 'max', 'Det.limit_side_len': 1600,
                 'EngineConfig.onnxruntime.intra_op_num_threads': 2,
                 'EngineConfig.onnxruntime.inter_op_num_threads': 1})
+            logging.getLogger('RapidOCR').setLevel(logging.ERROR)
         return self.detector
 
     def locate(self, image):

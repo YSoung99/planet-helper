@@ -124,13 +124,16 @@ class Arbiter:
     """
 
     def __init__(self, enabled=lambda: True, *, cooldown=10.0, limit=256,
-                 clock=time.monotonic, runner=None):
+                 clock=time.monotonic, runner=None, full_screen_enabled=lambda: True):
         self.enabled, self.cooldown, self.limit, self.clock = enabled, cooldown, limit, clock
+        self.full_screen_enabled = full_screen_enabled
         self.runner = runner or (lambda work: threading.Thread(target=work, name='jev', daemon=True).start())
         self.answers = OrderedDict()
         self.busy = None
         self.next_at = 0.0
         self.calls = 0
+        self.last_label = ''
+        self.last_outcome = ''
         self.lock = threading.Lock()
 
     def answer(self, key):
@@ -139,27 +142,49 @@ class Arbiter:
                 return True, self.answers[key]
         return False, None
 
-    def submit(self, key, question):
+    def summary_text(self):
+        with self.lock:
+            enabled = self.enabled()
+            full_ok = self.full_screen_enabled()
+            calls = self.calls
+            label = self.last_label
+            outcome = self.last_outcome
+        if not enabled:
+            return f'JEV · 꺼짐 (이번 실행 호출 {calls}회)' if calls else 'JEV · 꺼짐'
+        scope = '전체 허용' if full_ok else '숫자·일부 영역만'
+        base = f'JEV · 켬 ({scope}) · 호출 {calls}회'
+        if label:
+            base += f' · 최근 {label}: {outcome}'
+        return base
+
+    def submit(self, key, question, *, full_screen=False, label=''):
         with self.lock:
             if (key in self.answers or self.busy is not None or self.clock() < self.next_at
-                    or not self.enabled()):
+                    or not self.enabled() or (full_screen and not self.full_screen_enabled())):
                 return False
             self.busy = key
             self.calls += 1
 
         def work():
             value, wait, keep = None, self.cooldown, True
+            outcome = '보류'
             try:
                 value = question()
+                outcome = '확인 없음' if value is None else str(value)
             except Unavailable:
                 wait, keep = max(self.cooldown, RETRY_SECONDS), False
+                outcome = '연결·키 확인 필요'
             except Exception as exc:
                 tracker.log_error('JEV 판단', exc)
+                outcome = '오류'
             with self.lock:
                 if keep:
                     self.answers[key] = value
                     while len(self.answers) > self.limit:
                         self.answers.popitem(last=False)
+                if label:
+                    self.last_label = label
+                    self.last_outcome = outcome
                 self.busy = None
                 self.next_at = self.clock() + wait
 

@@ -129,7 +129,19 @@ def build_dialog(controller):
         update(exp, '\n'.join(filter(None, (controller.baseline_label.text(), controller.table_label.text()))))
         update(rates, '\n'.join(filter(None, (controller.minute_info.text(), controller.rate_info.text(),
                                              controller.activity_label.text()))))
-        update(effects_text, '\n'.join(filter(None, (controller.buff_label.text(), controller.jev_status.text(),
+        engine = getattr(controller, 'engine', None)
+        if engine is None:
+            engine_line = 'OCR 엔진 · 준비 중'
+        elif getattr(engine, 'read_exp', None) is not None:
+            engine_line = 'OCR 엔진 · Rust 가속'
+        elif getattr(engine, 'fast', None) is not None:
+            engine_line = 'OCR 엔진 · Python 2단계 경량'
+        else:
+            engine_line = 'OCR 엔진 · Python 기본'
+        arbiter = getattr(controller, 'jev_arbiter', None)
+        jev_summary = arbiter.summary_text() if arbiter is not None and hasattr(arbiter, 'summary_text') else ''
+        update(effects_text, '\n'.join(filter(None, (engine_line, controller.buff_label.text(),
+                                                    jev_summary, controller.jev_status.text(),
                                                     f'연타 · {controller.repeat_status.text()}'))))
         pixmap = controller.preview.pixmap()
         if pixmap is not None and not pixmap.isNull() and pixmap.cacheKey() != preview_key:

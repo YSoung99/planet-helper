@@ -68,6 +68,46 @@ def region_from_desktop(region, frame):
     return roi
 
 
+def _cgimage_raw_mode(bitmap_info):
+    """Map 32-bpp 8-bpc CoreGraphics bitmap info to a Pillow raw RGB mode, or None."""
+    byte_order = bitmap_info & 0x7000
+    alpha = bitmap_info & 0x1F
+    # 0 = default (32-bit big endian), 0x4000 = 32Big, 0x2000 = 32Little
+    if byte_order in (0, 0x4000):
+        if alpha in (1, 3, 5):  # PremultipliedLast, Last, NoneSkipLast -> R G B A/X
+            return 'RGBX'
+        if alpha in (2, 4, 6):  # PremultipliedFirst, First, NoneSkipFirst -> A/X R G B
+            return 'XRGB'
+    elif byte_order == 0x2000:
+        if alpha in (1, 3, 5):  # little-endian RGBA -> A/X B G R
+            return 'XBGR'
+        if alpha in (2, 4, 6):  # little-endian ARGB -> B G R A/X (standard SCK BGRA32)
+            return 'BGRX'
+    return None
+
+
+def cgimage_to_pil(captured, quartz, image_module):
+    """Convert an opaque CGImage directly from its pixel buffer without PNG round-trip."""
+    width = int(quartz.CGImageGetWidth(captured))
+    height = int(quartz.CGImageGetHeight(captured))
+    bpp = int(quartz.CGImageGetBitsPerPixel(captured))
+    bpc = int(quartz.CGImageGetBitsPerComponent(captured))
+    stride = int(quartz.CGImageGetBytesPerRow(captured))
+    mode = _cgimage_raw_mode(int(quartz.CGImageGetBitmapInfo(captured)))
+    if width <= 0 or height <= 0 or bpp != 32 or bpc != 8 or stride < width * 4 or mode is None:
+        return None
+    provider = quartz.CGImageGetDataProvider(captured)
+    if provider is None:
+        return None
+    data = quartz.CGDataProviderCopyData(provider)
+    if data is None:
+        return None
+    raw = bytes(data)
+    if len(raw) < stride * height:
+        return None
+    return image_module.frombytes('RGB', (width, height), raw, 'raw', mode, stride, 1)
+
+
 class WindowCapture:
     def __init__(self, bundle_id=BUNDLE_ID, preferred_id=None, expected_pid=None):
         if bundle_id is None and expected_pid is None:
@@ -142,9 +182,11 @@ class WindowCapture:
                     if not include_full:
                         captured=Quartz.CGImageCreateWithImageInRect(captured,((left,top),(crop_width,crop_height)))
                         if captured is None: raise RuntimeError('게임 경험치 영역 잘라내기 실패')
-                bitmap = NSBitmapImageRep.alloc().initWithCGImage_(captured)
-                encoded = bitmap.representationUsingType_properties_(NSBitmapImageFileTypePNG,{})
-                image = Image.open(io.BytesIO(bytes(encoded))).convert('RGB')
+                image = cgimage_to_pil(captured, Quartz, Image)
+                if image is None:
+                    bitmap = NSBitmapImageRep.alloc().initWithCGImage_(captured)
+                    encoded = bitmap.representationUsingType_properties_(NSBitmapImageFileTypePNG,{})
+                    image = Image.open(io.BytesIO(bytes(encoded))).convert('RGB')
             except Exception:
                 self.content = None
                 raise

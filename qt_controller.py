@@ -5,6 +5,7 @@ override the hooks marked "Platform hook" below; every other change made here
 applies to both apps.
 """
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 import ctypes
 import json
 import math
@@ -21,6 +22,9 @@ from PySide6.QtCore import Qt, QRect, QTimer, QObject, Signal
 from PySide6.QtGui import QAction, QColor, QImage, QPainter, QPen, QPixmap, QShortcut, QKeySequence, QIcon
 from PySide6.QtWidgets import (QApplication, QWidget, QLabel, QPushButton, QSpinBox,
     QVBoxLayout, QHBoxLayout, QGridLayout, QFrame, QFileDialog, QMessageBox, QMenu, QMenuBar, QDialog, QComboBox)
+from controller_jev import JevMixin
+from controller_menus import MenuAndSettingsMixin
+from controller_probes import MesoAndProbesMixin
 import character_hud
 import exp_buffs
 import hunt_activity
@@ -254,7 +258,7 @@ class WindowSelection(QDialog):
         self.move(available.center()-self.rect().center())
 
 
-class SharedController(tracker.MeasurementCore):
+class SharedController(MenuAndSettingsMixin, MesoAndProbesMixin, JevMixin, tracker.MeasurementCore):
     # ---- Platform hooks (override in linux_app.py / mac_app.py) ----
     APP_TITLE = f'플래닛 도우미 {tracker.APP_VERSION}'
     NATIVE_MENU_BAR = False
@@ -357,7 +361,10 @@ class SharedController(tracker.MeasurementCore):
         self.hunt_activity_cache = {}
         self.character_results = queue.SimpleQueue()
         # One JEV question at a time for every feature; nothing is sent while JEV is off.
-        self.jev_arbiter = jev.Arbiter(lambda: self.jev_enabled)
+        self.jev_arbiter = jev.Arbiter(
+            lambda: self.jev_enabled,
+            full_screen_enabled=lambda: self.jev_full_screen,
+        )
         self.jev_frames = jev_assist.FrameRing()
         self.jev_hud_missing = None
         self.jev_stall_saved = None
@@ -372,6 +379,8 @@ class SharedController(tracker.MeasurementCore):
         self.meso_visible = False
         self.meso_reader_source = None
         self.meso_last_flush = float('-inf')
+        self._probe_executor = None
+        self._probe_executor_lock = threading.Lock()
         self.character_candidate = (None, None)
         self.character_identity = (None, None)
         self.character_source = None
@@ -384,6 +393,7 @@ class SharedController(tracker.MeasurementCore):
         self.auto_measure = config.get('auto_measure', False)
         self.auto_start_hold = None
         self.jev_enabled = config.get('jev_enabled', False)
+        self.jev_full_screen = config.get('jev_full_screen', True)
         self.current_character = config.get('current_character')
         self.nickname_patterns = config.get('nickname_patterns', {})
         self.meso_trade_threshold = config.get('meso_trade_threshold', meso.TRADE_THRESHOLD)
@@ -435,6 +445,26 @@ class SharedController(tracker.MeasurementCore):
                 QTimer.singleShot(0, lambda: self.key_repeat.set_enabled(True))
         if start_worker: threading.Thread(target=self.worker, daemon=True).start()
 
+    def _monotonic(self):
+        return time.monotonic()
+
+    def _start_thread(self, *, target, name):
+        threading.Thread(target=target, name=name, daemon=True).start()
+
+    def submit_probe(self, fn, *args):
+        with self._probe_executor_lock:
+            if self.stop.is_set():
+                raise RuntimeError('Controller is stopping')
+            if self._probe_executor is None:
+                self._probe_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix='probe')
+            self._probe_executor.submit(fn, *args)
+
+    def _shutdown_probes(self):
+        with self._probe_executor_lock:
+            executor, self._probe_executor = self._probe_executor, None
+        if executor is not None:
+            executor.shutdown(wait=False, cancel_futures=True)
+
     def show_information(self):
         if self.info_dialog is not None:
             try:
@@ -461,14 +491,6 @@ class SharedController(tracker.MeasurementCore):
         self.status.set('자동 인식 준비 · 측정 시작을 눌러 주세요' if enabled else '수동 인식 · 영역과 레벨을 확인해 주세요')
         from display_panel import resize
         resize(self)
-
-    def opacity_settings(self):
-        from PySide6.QtWidgets import QInputDialog
-        value, ok = QInputDialog.getInt(self.window, '배경 투명도', '배경 불투명도 (%)', round(self.window_opacity*100), 20, 100)
-        if ok:
-            self.window_opacity = value/100
-            self.window.update()
-            self.save_config()
 
     def toggle_display(self):
         self.compact = not self.compact
@@ -601,49 +623,6 @@ class SharedController(tracker.MeasurementCore):
     def toggle_repeat(self):
         self.key_repeat.set_enabled(not self.key_repeat.state.get('enabled', False))
 
-    def repeat_settings(self):
-        dialog = QDialog(self.window)
-        dialog.setWindowTitle('연타 설정과 권한')
-        dialog.setStyleSheet('QDialog { background: #151b24; } QComboBox { background: #25303d; padding: 4px; }')
-        layout = QVBoxLayout(dialog)
-        layout.addWidget(QLabel('키를 누르는 동안 게임 창에서만 반복해요.'))
-        layout.addWidget(QLabel('설정을 저장하면 연타가 꺼져요.'))
-        grid = QGridLayout()
-        settings = self.key_repeat.settings
-        pickers = {}
-        for row, (key, label, low, high) in enumerate((
-                ('firstDelayMs', '첫 대기', 100, 2000),
-                ('minIntervalMs', '반복 최소 간격', 50, 1000),
-                ('maxIntervalMs', '반복 최대 간격', 50, 1000))):
-            picker = QSpinBox(); picker.setRange(low, high)
-            picker.setSuffix(' ms'); picker.setValue(settings[key]); picker.setAccessibleName(label)
-            grid.addWidget(QLabel(label), row, 0); grid.addWidget(picker, row, 1)
-            pickers[key] = picker
-        trigger = QComboBox()
-        trigger.addItem('A 키', 0); trigger.addItem('Z 키 → A 입력', 6)
-        trigger.setCurrentIndex(1 if settings['attackTriggerKeyCode'] == 6 else 0)
-        grid.addWidget(QLabel('공격 키'), 3, 0); grid.addWidget(trigger, 3, 1)
-        layout.addLayout(grid)
-        cleanup = self.add_repeat_permission_widgets(layout)
-        failure = QLabel(self.key_repeat.settings_error); failure.setWordWrap(True)
-        layout.addWidget(failure)
-        actions = QHBoxLayout()
-        save = QPushButton('저장'); cancel = QPushButton('닫기')
-        def save_settings():
-            selected = {key:picker.value() for key,picker in pickers.items()}
-            selected['attackTriggerKeyCode'] = trigger.currentData()
-            try:
-                self.key_repeat.configure(selected)
-            except (OSError, ValueError, RuntimeError) as exc:
-                failure.setText(str(exc)); return
-            dialog.accept()
-        save.clicked.connect(save_settings); cancel.clicked.connect(dialog.reject)
-        actions.addWidget(save); actions.addWidget(cancel); layout.addLayout(actions)
-        try:
-            dialog.exec()
-        finally:
-            cleanup()
-
     @staticmethod
     def label(text, name='muted'):
         label = QLabel(text); label.setObjectName(name)
@@ -654,114 +633,6 @@ class SharedController(tracker.MeasurementCore):
         line = QFrame(); line.setFrameShape(QFrame.Shape.HLine)
         line.setStyleSheet('color: #2b3542;'); return line
 
-    def export_records(self):
-        import records_backup
-        from datetime import datetime
-        suggested = str(Path.home()/f"planet-helper-records-{datetime.now():%Y%m%d}.zip")
-        path, _ = QFileDialog.getSaveFileName(self.window, '사냥 기록 내보내기', suggested, '백업 (*.zip)')
-        if not path: return
-        if not path.endswith('.zip'): path += '.zip'
-        try:
-            count = records_backup.export_zip(path)
-        except OSError as exc:
-            tracker.log_error('기록 내보내기', exc)
-            QMessageBox.warning(self.window, '사냥 기록 내보내기', f'내보내지 못했어요.\n{exc}'); return
-        QMessageBox.information(self.window, '사냥 기록 내보내기',
-                                f'기록 {count}개를 저장했어요.\n{path}\n\n'
-                                '다른 컴퓨터의 플래닛 도우미에서 "백업 파일에서 가져오기"로 합칠 수 있어요.')
-
-    def import_records(self):
-        import records_backup, zipfile
-        path, _ = QFileDialog.getOpenFileName(self.window, '사냥 기록 가져오기', str(Path.home()), '백업 (*.zip)')
-        if not path: return
-        try:
-            added, skipped, names = records_backup.import_zip(path)
-        except (OSError, ValueError, zipfile.BadZipFile) as exc:
-            tracker.log_error('기록 가져오기', exc)
-            QMessageBox.warning(self.window, '사냥 기록 가져오기', f'가져오지 못했어요.\n{exc}'); return
-        QMessageBox.information(self.window, '사냥 기록 가져오기',
-                                f'새 기록 {added}개를 추가했어요.\n'
-                                f'이미 있는 기록 {skipped}개는 그대로 두었어요.\n'
-                                f'사냥터·캐릭터 이름 {names}개를 합쳤어요.')
-
-    def run_auto_backup(self):
-        """Daily copy of the records, in the background so startup stays quick."""
-        def work():
-            try:
-                import records_backup
-                records_backup.auto_backup()
-            except Exception as exc:
-                tracker.log_error('자동 백업', exc)
-            if self.cloud_remote:
-                self.cloud_work(push_only=False, manual=False)
-        threading.Thread(target=work, name='records-backup', daemon=True).start()
-
-    def cloud_settings(self):
-        from PySide6.QtWidgets import QInputDialog
-        import cloud_sync
-        if cloud_sync.rclone() is None:
-            QMessageBox.information(self.window, '구글 드라이브 동기화',
-                'rclone이 필요해요.\n\n리눅스: 패키지 관리자에서 rclone 설치\n맥: brew install rclone\n\n'
-                '설치한 뒤 다시 열어 주세요.')
-            return
-        remotes = cloud_sync.remotes()
-        if not remotes:
-            QMessageBox.information(self.window, '구글 드라이브 동기화',
-                '먼저 rclone에 구글 드라이브를 한 번 연결해야 해요. 터미널에서 실행하세요:\n\n'
-                '    rclone config create gdrive drive scope=drive.file\n\n'
-                '브라우저가 열리면 구글 계정으로 로그인하고 허용을 누르면 돼요.\n'
-                '(drive.file 권한: 이 앱이 올린 파일만 볼 수 있어요.)\n\n'
-                '끝나면 이 메뉴를 다시 열어 주세요.')
-            return
-        off = '동기화 끄기'
-        current = (self.cloud_remote or '').split(':', 1)[0] + ':' if self.cloud_remote else None
-        options = ([current] if current in remotes else []) + [r for r in remotes if r != current] + [off]
-        choice, ok = QInputDialog.getItem(
-            self.window, '구글 드라이브 동기화',
-            '사용할 rclone 연결 (그 안의 planet-helper 폴더에 컴퓨터별 백업을 올려요)', options, 0, False)
-        if not ok: return
-        if choice == off:
-            self.cloud_remote = None
-            self.save_config(); self.status.set('구글 드라이브 동기화 꺼짐'); return
-        self.cloud_remote = choice + 'planet-helper'
-        self.save_config()
-        self.start_cloud_sync(manual=True)
-
-    def start_cloud_sync(self, manual=False, push_only=False):
-        if not self.cloud_remote: return
-        if manual: self.status.set('구글 드라이브 동기화 중…')
-        threading.Thread(target=self.cloud_work, args=(push_only, manual),
-                         name='cloud-sync', daemon=True).start()
-
-    def cloud_work(self, push_only, manual):
-        """Runs off the UI thread; reports through a queued signal."""
-        import cloud_sync
-        remote = self.cloud_remote
-        if not remote: return
-        if not self.cloud_lock.acquire(blocking=False):
-            if manual: self.cloud_signals.done.emit('이미 동기화 중이에요')
-            return
-        try:
-            if push_only:
-                cloud_sync.push(remote)
-                text = '구글 드라이브에 기록 올림'
-            else:
-                text = '구글 드라이브 ' + cloud_sync.describe(cloud_sync.sync(remote))
-        except Exception as exc:
-            tracker.log_error('구글 드라이브 동기화', exc)
-            try:
-                cloud_sync.save_state(dict(time=time.time(), ok=False, error=str(exc)[:120]))
-            except OSError:
-                pass
-            text = '구글 드라이브 동기화 실패 · last-error.log 확인'
-        finally:
-            self.cloud_lock.release()
-        if manual or not push_only:
-            self.cloud_signals.done.emit(text)
-
-    def cloud_finished(self, text):
-        self.status.set(text)
-
     def show(self):
         if not getattr(self, 'auto_backup_started', False):
             self.auto_backup_started = True
@@ -771,339 +642,6 @@ class SharedController(tracker.MeasurementCore):
         self.glass = self.apply_glass(self.window)
         self.window.raise_()
         self.window.activateWindow()
-
-    def context_menu(self, point):
-        menu = self.build_context_menu()
-        try:
-            menu.exec(self.window.mapToGlobal(point))
-        finally:
-            menu.deleteLater()
-
-    def build_context_menu(self):
-        menu = QMenu(self.window)
-        menu.addAction('사냥 기록 비교', self.show_history)
-        menu.addSeparator()
-
-        def add_toggle(parent, title, checked, callback):
-            action = parent.addAction(title)
-            action.setCheckable(True)
-            action.setChecked(checked)
-            action.toggled.connect(callback)
-
-        measurement = menu.addMenu('측정·화면')
-        add_toggle(measurement, '항상 맨 위', self.always_on_top, self.toggle_pin)
-        measurement.addAction('배경 투명도', self.opacity_settings)
-        measurement.addSeparator()
-        add_toggle(measurement, '경험치 증가 시 자동 측정', self.auto_measure, self.set_auto_measure)
-        add_toggle(measurement, '대기 중 최근 경험치 모으기', self.recent_recording, self.set_recent_recording)
-        add_toggle(measurement, '플래닛 버닝 적용', self.burning, self.set_burning)
-        measurement.addAction('연타 설정', self.repeat_settings)
-
-        recognition = menu.addMenu('게임 인식')
-        recognition.addAction(f"현재 캐릭터: {self.current_character or '지정 안 함'}…", self.choose_character)
-        recognition.addAction('현재 닉네임 등록·수정…', self.register_nickname)
-        recognition.addSeparator()
-        recognition.addAction('경험치 영역 지정…', self.select)
-        recognition.addAction('JEV API 키 설정', self.api_key_settings)
-
-        gains = menu.addMenu('메소·버프')
-        gains.addAction('메소 큰 변동 기준 금액', self.meso_threshold_settings)
-        gains.addAction('이번 측정의 큰 메소 변동 분류…', self.classify_meso_change)
-        gains.addSeparator()
-        for kind, label in exp_buffs.LABELS.items():
-            gains.addAction(f'{label} 아이콘 등록…',
-                            lambda checked=False, key=kind: self.register_buff_icon(key))
-
-        records = menu.addMenu('기록·백업')
-        records.addAction('오늘·이번 주 요약', self.show_period_summary)
-        records.addAction('기록 폴더 열기', self.open_records)
-        records.addSeparator()
-        records.addAction('백업 파일로 내보내기…', self.export_records)
-        records.addAction('백업 파일에서 가져오기 (합치기)…', self.import_records)
-        records.addSeparator()
-        records.addAction('구글 드라이브 동기화 설정…', self.cloud_settings)
-        if self.cloud_remote:
-            records.addAction('지금 동기화', lambda: self.start_cloud_sync(manual=True))
-            import cloud_sync
-            info = records.addAction(cloud_sync.describe(cloud_sync.load_state()))
-            info.setEnabled(False)
-
-        help_menu = menu.addMenu('도움말·권한')
-        help_menu.addAction('인식 정보', self.show_information)
-        self.extra_menu_actions(help_menu)
-
-        menu.addSeparator()
-        menu.addAction('종료', self.close)
-        return menu
-
-    def register_buff_icon(self, kind):
-        label = exp_buffs.LABELS[kind]
-        path, _ = QFileDialog.getOpenFileName(
-            self.window, f'{label} 아이콘 한 칸을 자른 이미지 선택', '', '이미지 (*.png *.jpg *.jpeg *.webp)')
-        if not path:
-            return
-        try:
-            exp_buffs.register(tracker.BASE, kind, path)
-        except (OSError, ValueError) as exc:
-            QMessageBox.warning(self.window, '버프 아이콘 등록', str(exc))
-            return
-        self.buff_has_templates = True
-        self.buff_revision += 1
-        self.buff_confirmation = exp_buffs.Confirmation()
-        self.buff_label.setText(f'{label} 등록 완료 · 측정 중 확인')
-
-    def register_nickname(self):
-        from PySide6.QtWidgets import QInputDialog, QMessageBox
-        sample = self.nickname_sample
-        if sample is None or not sample[2] or sample[0] != self.character_source or time.monotonic() - sample[1] > 15:
-            self.status.set('자동 인식으로 게임 HUD가 표시되면 닉네임을 등록할 수 있어요')
-            return
-        source, _, key = sample
-        text, ok = QInputDialog.getText(
-            self.window, '현재 닉네임 등록·수정', '게임 HUD에 보이는 닉네임을 입력해 주세요.',
-            text=self.nickname_patterns.get(key) or self.character_identity[1] or self.current_character or '')
-        if not ok:
-            return
-        name = text.strip()
-        if not character_hud.valid_nickname(name):
-            QMessageBox.warning(self.window, '닉네임 확인', '한글·영문·숫자 2~16자를 입력해 주세요.')
-            return
-        self.nickname_patterns = {**self.nickname_patterns, key: name}
-        self.save_config()
-        if self.nickname_sample and self.nickname_sample[0] == source and self.nickname_sample[2] == key:
-            self.character_candidate = (self.character_candidate[0], name)
-            self.set_detected_character((self.character_identity[0], name))
-
-    def meso_threshold_settings(self):
-        from PySide6.QtWidgets import QInputDialog, QMessageBox
-        text, ok = QInputDialog.getText(
-            self.window, '메소 큰 변동 기준',
-            '잔액 차이가 이 금액을 넘으면 큰 변동으로 표시합니다.',
-            text=f'{self.meso_trade_threshold:,}')
-        if not ok:
-            return
-        try:
-            value = int(text.strip().replace(',', ''))
-            if not meso.MIN_THRESHOLD <= value <= meso.MAX_THRESHOLD:
-                raise ValueError
-        except ValueError:
-            QMessageBox.warning(self.window, '메소 큰 변동 기준', '1~1조 사이의 정수를 입력해 주세요.')
-            return
-        self.meso_trade_threshold = value
-        self.save_config()
-
-    def classify_meso_change(self):
-        from PySide6.QtWidgets import QInputDialog
-        balance = self.session.meso
-        if not self.running or not balance.large_changes:
-            self.status.set('이번 측정에서 분류할 큰 메소 변동이 없어요')
-            return
-        options = [f'{i + 1}. {amount:+,} · ' + ('거래·구매' if i in balance.marked else '미분류')
-                   for i, amount in enumerate(balance.large_changes)]
-        choice, ok = QInputDialog.getItem(
-            self.window, '메소 큰 변동 분류', '거래·구매 표시를 켜거나 끌 변동을 고르세요.',
-            options, 0, False)
-        if ok and self.session.meso is balance and self.running:
-            balance.toggle_trade(options.index(choice))
-            self.session.meso_dirty = True
-
-    def meso_character(self):
-        if self.session.character_conflict:
-            return None
-        return self.session.character_name or self.current_character or ''
-
-    def clear_meso_confirmation(self, source):
-        self.meso_source = source
-        self.meso_visible = False
-        self.meso_confirmation = meso.Confirmation()
-        self.meso_rechecking = False
-
-    def apply_meso_results(self, now, *, finishing=False):
-        session = self.session
-        character = self.meso_character()
-        pending_start = session.meso_start_frame
-        if pending_start is not None:
-            stamp, frame, window = pending_start
-            if finishing or not self.running or now - stamp > meso.END_WINDOW:
-                session.meso_start_frame = None
-            elif self.queue_meso_frame(self.generation, stamp, frame, window):
-                session.meso_start_frame = None
-        if self.meso_source is not None and self.meso_source[:2] != (self.generation, character):
-            self.clear_meso_confirmation(None)
-        if session.meso.source is not None and session.meso.source[:2] != (self.generation, character):
-            session.meso.check_source(None)
-        while not self.meso_results.empty():
-            generation, window, stamp, observed_character, value = self.meso_results.get_nowait()
-            if (not self.running or generation != self.generation or character is None
-                    or observed_character != character or window is None or session.meso_start_at is None
-                    or stamp < session.meso_start_at or stamp < now - meso.END_WINDOW):
-                continue
-            source = generation, character, window
-            session.meso.check_source(source)
-            if source != self.meso_source:
-                self.clear_meso_confirmation(source)
-            if value is meso.RECHECK:
-                self.meso_rechecking = True
-                self.meso_confirmation.observe(None, stamp)
-                continue
-            if value is None:
-                self.meso_visible = False
-            elif not self.meso_visible:
-                self.meso_opening += 1
-                self.meso_visible = True
-            confirmed = self.meso_confirmation.observe(value, stamp)
-            if confirmed is None:
-                if value is not None and session.meso.end is not None:
-                    self.meso_rechecking = True
-                continue
-            self.meso_rechecking = False
-            try:
-                self.meso_log.record(tracker.BASE, character, confirmed, datetime.now())
-            except OSError as exc:
-                tracker.log_error('메소 기록 저장', exc)
-            session.meso_dirty |= session.meso.sample(
-                confirmed, source, stamp, self.meso_opening, session.meso_start_at,
-                self.meso_trade_threshold, first_seen=self.meso_confirmation.first_seen)
-        if (not finishing and self.running and session.meso_dirty and session.rows and not session.ledger_dirty
-                and now - self.meso_last_flush >= 10):
-            self.meso_last_flush = now
-            try:
-                self.save_summary()
-            except OSError as exc:
-                tracker.log_error('메소 기록 저장', exc)
-        text = self.meso_text()
-        if text != self.meso_label.text():
-            self.meso_label.setText(text)
-        ready = self.meso_status(now)
-        if self.meso_status_label.text() != ready:
-            self.meso_status_label.setText(ready)
-        delta = session.meso.hunted()
-        if (self.running and not session.meso.source_changed
-                and session.meso.source == self.meso_source):
-            delta = session.meso.observed_delta()
-        amount = '—' if delta is None else f'{delta:+,}'
-        if self.meso_delta_label.text() != amount:
-            self.meso_delta_label.setText(amount)
-
-    def meso_status(self, now):
-        balance = self.session.meso
-        if balance.source_changed:
-            return '시작·종료 잔액 확인 불가 · 캐릭터 또는 게임 창 변경'
-        start = '시작 잔액 확인' if balance.start is not None else '시작 잔액 대기'
-        if (self.running and balance.start is None and self.session.meso_start_at is not None
-                and now - self.session.meso_start_at > meso.START_WINDOW):
-            start = '시작 잔액 확인 시간 지남'
-        end = balance.complete
-        if self.running:
-            end = not self.meso_rechecking and balance.end_ready(self.meso_source, now)
-        return start + (' · 종료 잔액 확인' if end else ' · 종료 잔액 대기')
-
-    def meso_text(self):
-        current = self.meso_confirmation.current
-        if self.running and self.meso_rechecking:
-            if self.session.meso.end is not None:
-                current = self.session.meso.end
-            return ('메소' if current is None else f'메소 {current:,}') + ' · 잔액 재확인 중'
-        if current is None:
-            if self.running and getattr(self, 'meso_inventory_closed', False) and self.jev_enabled:
-                return '메소 · JEV: 인벤토리가 닫혀 있어요 · 열면 기록'
-            return '메소 · 측정 중 인벤토리를 열면 기록'
-        text = f'메소 {current:,}'
-        balance = self.session.meso
-        if self.running:
-            if balance.source_changed:
-                return text + ' · 캐릭터 또는 게임 창 변경 · 이번 잔액 차이 확인 안 됨'
-            if balance.readings < 2 or balance.source != self.meso_source:
-                if balance.start is None:
-                    return text + ' · 시작 후 30초 안의 잔액 필요'
-                return text + ' · 종료 직전에 인벤토리를 다시 열어 주세요'
-            if balance.large_changes:
-                text += f' · 큰 변동 {len(balance.large_changes)}건'
-            excluded = balance.excluded_trade()
-            if excluded:
-                text += f' · 거래·구매 {excluded:+,} 제외'
-            return text
-        today = self.meso_log.change(self.meso_character())
-        return text + (f' · 오늘 {today:+,}' if today is not None else '')
-
-    def show_history(self):
-        from record_history import build_dialog
-        self.history_dialog = build_dialog(self)
-        self.history_dialog.show(); self.history_dialog.raise_()
-
-    def choose_character(self):
-        """New records carry this name unless OCR reads one or the record is edited later."""
-        from PySide6.QtWidgets import QInputDialog
-        import record_history
-        known = record_history.known_characters()
-        current = self.current_character or ''
-        options = [current] + [name for name in known if name != current] if current else ([''] + known)
-        text, ok = QInputDialog.getItem(
-            self.window, '현재 캐릭터',
-            '지금 사냥하는 캐릭터 (새 기록에 붙어요 · 비우면 지정 해제)', options, 0, True)
-        if not ok: return
-        name = ' '.join(text.split())[:24] or None
-        self.current_character = name
-        self.save_config()
-        if self.session.rows:
-            try:
-                self.save_summary()  # the record being measured gets the name too
-            except OSError as exc:
-                tracker.log_error('현재 캐릭터 저장', exc)
-        self.status.set(f'현재 캐릭터 · {name}' if name else '현재 캐릭터 지정 해제')
-
-    def show_period_summary(self):
-        import record_history
-        try:
-            text = record_history.period_text(record_history.collect())
-        except Exception as exc:
-            tracker.log_error('사냥 요약', exc)
-            text = '요약을 만들지 못했어요. last-error.log를 확인해 주세요.'
-        QMessageBox.information(self.window, '오늘·이번 주 요약', text)
-
-    def api_key_settings(self):
-        """Enter the LLM Gateway key used by JEV; it is kept only in the OS key store."""
-        from PySide6.QtWidgets import QInputDialog, QLineEdit
-        import map_name
-        has_key = map_name.gateway_key() is not None
-        text, ok = QInputDialog.getText(
-            self.window, 'JEV API 키',
-            ('현재: 저장됨' if has_key else '현재: 없음') + '\n\n'
-            'LLM Gateway API 키를 붙여넣어 주세요.\n'
-            '이 컴퓨터의 키 저장소(맥 키체인 / 리눅스 키링)에만 저장되고,\n'
-            '파일이나 GitHub에는 올라가지 않아요.\n'
-            '비워 두고 확인하면 저장된 키를 지워요.',
-            QLineEdit.EchoMode.Password)
-        if not ok: return
-        if not text.strip() and not has_key: return
-        try:
-            map_name.store_key(text)
-        except OSError as exc:
-            tracker.log_error('JEV API 키 저장', exc)
-            QMessageBox.warning(self.window, 'JEV API 키', f'저장하지 못했어요.\n{exc}')
-            return
-        saved = map_name.gateway_key() is not None
-        self.status.set('JEV API 키 저장됨' if saved else 'JEV API 키 삭제됨')
-
-    def update_jev_button(self):
-        self.jev_button.setChecked(self.jev_enabled)
-        self.jev_button.setText('JEV 켬' if self.jev_enabled else 'JEV 끔')
-        self.jev_button.setToolTip(
-            'OCR이 헷갈리거나 상황 판단이 필요할 때만 게임 화면 일부를 JEV에 보내 확인\n'
-            '사냥터 이름 · 메소/경험치 판독 · 닉네임 · 버프 · 경험치가 멈춘 이유 · 효율 변화 태그 · 화면 상태\n'
-            '우클릭 메뉴에서 API 키 설정'
-            if self.jev_enabled else 'JEV를 켜면 판독이 헷갈릴 때와 상황 판단에 JEV를 사용 (게임 화면 일부를 전송)')
-
-    def toggle_jev(self, enabled):
-        self.jev_enabled = enabled
-        self.jev_revision += 1
-        self.jev_status_session = None
-        self.set_jev_status('')
-        self.update_jev_button()
-        self.save_config()
-
-    def open_records(self):
-        self.open_path(tracker.BASE/'records')
 
     def select(self):
         if not self.finish_measurement('영역 재지정'): return
@@ -1326,8 +864,7 @@ class SharedController(tracker.MeasurementCore):
                 self.capture_clients.meso_generation = generation
                 waiting_for_start = (session.meso.start is None
                                      and stamp - session.meso_start_at <= meso.START_WINDOW)
-                interval = 1.0 if waiting_for_start else hunt_activity.SCAN_INTERVAL
-                self.capture_clients.next_meso_scan = stamp + interval
+                self.capture_clients.next_meso_scan = stamp + self.meso_scan_interval(waiting_for_start)
         if probe:
             self.capture_clients.next_activity_scan = stamp + hunt_activity.SCAN_INTERVAL
             if full is not None and self.hunt_activity_lock.acquire(blocking=False):
@@ -1336,87 +873,14 @@ class SharedController(tracker.MeasurementCore):
                     style = image.info.get('ui_kind')
                     if not self.character_read_needed(generation, window, stamp):
                         level_roi = None
-                    threading.Thread(target=self.read_hunt_activity,
-                                     args=(generation, observed_at, full, window, level_roi, style, recent),
-                                     name='hunt-activity', daemon=True).start()
+                    self.submit_probe(self.read_hunt_activity,
+                                      generation, observed_at, full, window, level_roi, style, recent)
                 except RuntimeError as exc:
                     self.hunt_activity_lock.release()
                     tracker.log_error('사냥 신호 판독 시작', exc)
         if not starting:
             image.info.pop('full_game_image', None)
         return image
-
-    def start_meso_capture(self, generation, stamp, details):
-        full = details.get('full_game_image')
-        window = details.get('window_id')
-        if full is not None and window is not None and map_name.available():
-            if not self.queue_meso_frame(generation, stamp, full, window):
-                self.session.meso_start_frame = stamp, full, window
-        self.session.meso_start_at = stamp
-
-    def queue_meso_frame(self, generation, stamp, frame, window):
-        if not self.meso_capture_lock.acquire(blocking=False):
-            return False
-        try:
-            threading.Thread(target=self.read_meso_frame,
-                             args=(generation, stamp, frame, window, self.meso_character()),
-                             name='meso-reader', daemon=True).start()
-        except RuntimeError as exc:
-            self.meso_capture_lock.release()
-            tracker.log_error('메소 판독 시작', exc)
-            return False
-        return True
-
-    def read_meso_frame(self, generation, stamp, frame, window, character):
-        try:
-            if generation == self.generation:
-                source = generation, window
-                if self.meso_reader_source != source:
-                    self.meso_reader = meso.Reader(self.jev_arbiter)
-                    self.meso_reader_source = source
-                value = self.meso_reader.read(frame, stamp)
-                if self.meso_reader.needs_recheck:
-                    value = meso.RECHECK
-                self.locate_inventory(source, stamp, frame)
-                self.meso_results.put((generation, window, stamp, character, value))
-        except Exception as exc:
-            tracker.log_error('메소 판독', exc)
-        finally:
-            self.meso_capture_lock.release()
-
-    def read_hunt_activity(self, generation, stamp, frame, window, level_roi, style, recent=False):
-        try:
-            try:
-                if level_roi is not None and window is not None and map_name.available():
-                    job, nickname, key = character_hud.inspect(frame, level_roi, style, self.nickname_patterns)
-                    if nickname is None and key is not None:
-                        nickname = self.jev_nickname(frame, level_roi, style, key)
-                    self.character_results.put((generation, window, stamp, job, nickname, key))
-            except Exception as exc:
-                tracker.log_error('캐릭터 HUD 판독', exc)
-            if recent:
-                return
-            self.jev_frames.remember(stamp, frame)
-            try:
-                if window is not None and self.buff_has_templates:
-                    revision = self.buff_revision
-                    readings = self.jev_buff_readings(frame, stamp, self.buff_detector.read(frame, tracker.BASE))
-                    self.buff_results.put((generation, window, revision, stamp, readings))
-            except Exception as exc:
-                tracker.log_error('경험치 버프 판독', exc)
-            try:
-                if map_name.available():
-                    observation = hunt_activity.read(frame, self.hunt_activity_cache)
-                    self.hunt_activity_results.put((generation, stamp, observation))
-            except Exception as exc:
-                tracker.log_error('사냥 신호 판독', exc)
-        finally:
-            self.hunt_activity_lock.release()
-
-    CHARACTER_RECHECK_SECONDS = 8.0
-
-    def character_read_needed(self, generation, window, now):
-        return (generation, window) != self.character_source or now >= self.character_recheck_at
 
     DISCOVERY_PERIOD = 1.0
 
@@ -1459,283 +923,6 @@ class SharedController(tracker.MeasurementCore):
         if session.started is not None:
             self.start_map_reading(session.session_id, full)
 
-    def start_map_reading(self, session_id, full):
-        """Read the minimap name once per measurement, off the UI thread."""
-        if getattr(self, 'map_read_for', None) == session_id or not map_name.available():
-            return
-        self.map_read_for = session_id
-        revision = self.jev_revision if self.jev_enabled else None
-
-        def can_request():
-            return (revision is not None and revision == self.jev_revision
-                    and session_id == self.session.session_id and not self.stop.is_set())
-
-        def on_request(has_key):
-            if not can_request():
-                return False
-            status = 'JEV 확인 중…' if has_key else 'JEV API 키 필요 · 우클릭 메뉴에서 설정'
-            self.map_results.put((session_id, revision, status))
-            return True
-
-        def work():
-            raw = picked = None
-            try:
-                title = map_name.title_area(full)
-                raw = map_name.read_title(title)
-                if can_request():
-                    picked = map_name.choose(raw, title, on_request=on_request)
-            except Exception as exc:
-                tracker.log_error('사냥터 이름 인식', exc)
-            self.map_results.put((session_id, revision, (raw, picked)))
-        threading.Thread(target=work, name='map-name', daemon=True).start()
-
-    def set_card_line(self, label, text, visible=None):
-        """Show a recognition-card line only while it has text; refit the window when it appears or goes."""
-        visible = bool(text) if visible is None else visible
-        if label.text() != text:
-            label.setText(text)
-        if label.isHidden() == visible:
-            label.setVisible(visible)
-            if not self.compact:
-                from display_panel import resize
-                resize(self)
-
-    def set_jev_status(self, text):
-        if self.jev_status.text() != text:
-            self.jev_button.setAccessibleDescription(text)
-        self.set_card_line(self.jev_status, text)
-
-    def apply_map_results(self):
-        from record_history import load_memos, save_memo
-        current_session = self.session.session_id
-        if self.jev_status_session is not None and self.jev_status_session != current_session:
-            self.jev_status_session = None
-            self.set_jev_status('')
-        while True:
-            try: session_id, revision, result = self.map_results.get_nowait()
-            except queue.Empty: return
-            current_request = self.jev_enabled and revision == self.jev_revision
-            if isinstance(result, str):
-                if current_request and session_id == current_session:
-                    self.jev_status_session = session_id
-                    self.set_jev_status(result)
-                continue
-            raw, picked = result
-            if not current_request:
-                picked = None
-            if (current_request and session_id == self.jev_status_session
-                    and self.jev_status.text() == 'JEV 확인 중…'):
-                self.set_jev_status(f'JEV로 확인 · {picked}' if picked else 'JEV 결과 없음')
-            if not (raw or picked) or load_memos().get(session_id):
-                continue  # never overwrite a memo the user already wrote
-            try:
-                name = save_memo(session_id, picked or map_name.resolve(raw))
-                if raw:
-                    if picked: map_name.learn_alias(raw, picked)  # same misread next time needs no JEV call
-                    map_name.remember_auto(session_id, raw)
-                if session_id == current_session:
-                    self.status.set(f'사냥터 자동 인식 · {name}')
-            except OSError as exc:
-                tracker.log_error('사냥터 자동 메모 저장', exc)
-
-    # ---- JEV: ask once per situation; keep the local result whenever JEV is unsure ----
-
-    def jev_nickname(self, frame, level_roi, style, key):
-        """Worker thread: a known character name JEV recognised in the nickname line, or None."""
-        found, name = self.jev_arbiter.answer(('nick', key))
-        if found:
-            return name
-        crops = character_hud.lines(frame, level_roi, style)
-        if crops is not None:
-            def question():
-                import record_history
-                names = [*([self.current_character] if self.current_character else []),
-                         *self.nickname_patterns.values(), *record_history.known_characters()]
-                return jev_assist.ask_nickname(crops[1], names)
-            self.jev_arbiter.submit(('nick', key), question)
-        return None
-
-    def jev_buff_readings(self, frame, stamp, readings):
-        """Worker thread: settle 'unknown' buff readings with one JEV look per kind and period."""
-        readings = dict(readings)
-        bucket = int(stamp // jev_assist.BUFF_SECONDS)
-        for kind, value in readings.items():
-            if value != 'unknown':
-                continue
-            question = ('buff', kind, bucket)
-            found, verdict = self.jev_arbiter.answer(question)
-            if found:
-                if verdict:
-                    readings[kind] = verdict
-                continue
-            corner = exp_buffs.buff_corner(frame)
-
-            def ask(kind=kind, corner=corner):
-                from PIL import Image
-                with Image.open(exp_buffs.template_path(tracker.BASE, kind)) as icon:
-                    return jev_assist.ask_buff(icon.convert('RGB'), corner)
-            self.jev_arbiter.submit(question, ask)
-        return readings
-
-    def note_missing_hud(self, generation, full):
-        """Worker thread: once the HUD stays missing, ask (at most every 5 minutes) what the window shows."""
-        now = time.monotonic()
-        if not self.running or self.session.first is not None:
-            self.jev_hud_missing = None
-            return
-        missing = self.jev_hud_missing
-        if missing is None or missing[0] != generation:
-            self.jev_hud_missing = (generation, now, None)
-            return
-        if full is None or now - missing[1] < jev_assist.SCREEN_SECONDS:
-            return
-        question = ('screen', generation, int(now // jev_assist.SCREEN_REPEAT_SECONDS))
-        if self.jev_arbiter.submit(question, lambda: jev_assist.ask_screen(full)):
-            self.jev_hud_missing = (generation, missing[1], question)
-
-    def locate_inventory(self, source, stamp, frame):
-        """Meso thread: when the meso box stays missing, ask JEV where the inventory is.
-
-        A grid cell becomes a search hint for this game window; "closed" pauses the
-        question so a hunt with the inventory closed costs at most a few calls.
-        """
-        reader = self.meso_reader
-        if reader.located or reader.needs_recheck:
-            self.meso_missing = None
-            self.meso_inventory_closed = False
-            return
-        missing = getattr(self, 'meso_missing', None)
-        if missing is None or missing[0] != source:
-            self.meso_missing = (source, stamp, None, None)
-            return
-        _, since, asked, asked_at = missing
-        if asked is not None:
-            found, answer = self.jev_arbiter.answer(asked)
-            if not found:
-                return
-            if answer not in (None, 'closed'):
-                reader.hint = jev_assist.quadrant_region(answer)
-                self.meso_inventory_closed = False
-                return
-            self.meso_inventory_closed = answer == 'closed'
-            if stamp - asked_at < jev_assist.MESO_CLOSED_SECONDS:
-                return
-        elif stamp - since < jev_assist.MESO_MISSING_SECONDS:
-            return
-        question = ('inventory', source, stamp)
-        if self.jev_arbiter.submit(question, lambda: jev_assist.ask_inventory(frame)):
-            self.meso_missing = (source, since, question, stamp)
-
-    def change_suggestion(self, change):
-        """JEV's tag for an efficiency change, from frames before and after it, or None."""
-        if not self.jev_enabled or self.session.started is None:
-            return None
-        question = ('change', self.session.session_id, change['minute'])
-        found, tag = self.jev_arbiter.answer(question)
-        if found:
-            return tag
-        before = self.jev_frames.before(self.session.started + (change['minute']-1)*60)
-        after = self.jev_frames.latest(since=self.session.started + change['minute']*60)
-        if before is not None and after is not None:
-            self.jev_arbiter.submit(question, lambda: jev_assist.ask_change(before, after))
-        return None
-
-    def apply_jev_hints(self, now):
-        """Show JEV answers for the current measurement and start the questions that are due."""
-        session = self.session
-        enabled = self.jev_enabled and self.running
-        # What the window shows while the level and EXP display cannot be found.
-        missing = self.jev_hud_missing
-        hint = ''
-        if enabled and missing and missing[0] == self.generation and missing[2] and session.first is None:
-            hint = self.jev_arbiter.answer(missing[2])[1] or ''
-        if hint:
-            self.set_jev_status(f'JEV 화면 확인 · {hint}')
-        elif self.jev_status.text().startswith('JEV 화면 확인'):
-            self.set_jev_status('')
-        # Why EXP stopped: asked once per stall, saved with the record.
-        activity = self.hunt_activity
-        stall = ''
-        if (enabled and session.started is not None and activity.generation == self.generation
-                and activity.gained > float('-inf') and now - activity.gained >= jev_assist.STALL_SECONDS):
-            question = ('stall', session.session_id, activity.gained)
-            found, reason = self.jev_arbiter.answer(question)
-            if not found:
-                frame = self.jev_frames.latest(since=activity.gained + 30)
-                if frame is not None:
-                    self.jev_arbiter.submit(question, lambda: jev_assist.ask_stall(frame))
-            elif reason:
-                minutes = int(now - activity.gained) // 60
-                stall = f'경험치 멈춤 {minutes}분 · JEV 판단: {reason}'
-                suffix = f' · JEV: {reason}'
-                if not self.activity_label.text().endswith(suffix):
-                    self.activity_label.setText(self.activity_label.text() + suffix)
-                if self.jev_stall_saved != question:
-                    self.jev_stall_saved = question
-                    minute = int(max(0.0, activity.gained - session.started) // 60)
-                    try:
-                        jev_assist.save_stall(session.session_id, minute, reason)
-                    except OSError as exc:
-                        tracker.log_error('멈춘 이유 저장', exc)
-        self.set_card_line(self.stall_label, stall)
-        # Suggested tag for an efficiency change.
-        change = getattr(self, 'pending_change', None)
-        if change is not None and enabled:
-            suggestion = self.change_suggestion(change)
-            text = self.change_prompt_text + (f' · JEV 추천: {suggestion}' if suggestion else '')
-            if self.change_prompt.text() != text:
-                self.change_prompt.setText(text)
-
-    def check_efficiency_change(self):
-        """After each new minute, ask once about a confirmed change in efficiency."""
-        count = len(self.session.minute_snapshots)
-        key = (self.session.session_id, count)
-        if key == getattr(self, '_change_checked', None):
-            return
-        self._change_checked = key
-        pending = None
-        if self.running and count:
-            import segments
-            asked = segments.load_tags().get(self.session.session_id, {})
-            for change in segments.find_changes(self.session.minute_snapshots):
-                if str(change['minute']) not in asked:
-                    pending = change
-        self.pending_change = pending
-        if pending is None:
-            self.change_prompt.setVisible(False)
-        else:
-            direction = '▲' if pending['after'] > pending['before'] else '▼'
-            self.change_prompt_text = (
-                f"{direction} {pending['minute']}분째부터 분당 {short_exp(pending['before'])} → {short_exp(pending['after'])}"
-                ' · 뭐가 달라졌나요? (눌러서 태그)')
-            self.change_prompt.setText(self.change_prompt_text)
-            if self.change_prompt.isHidden():
-                self.change_prompt.setVisible(True)
-                from display_panel import resize
-                resize(self)
-
-    def answer_change_prompt(self):
-        change = getattr(self, 'pending_change', None)
-        if change is None: return
-        from PySide6.QtWidgets import QInputDialog
-        import segments
-        suggestion = self.change_suggestion(change)
-        text, ok = QInputDialog.getText(
-            self.window, '효율 변화',
-            f"{change['minute']}분째부터 분당 {change['before']:,.0f} → {change['after']:,.0f}\n"
-            '여기서 뭐가 달라졌나요? (예: 버프 끝, 파티 합류, 맵 이동)\n비워 두고 확인하면 다시 묻지 않아요.'
-            + ('\nJEV가 화면을 비교해 추천한 태그를 미리 넣어 뒀어요.' if suggestion else ''),
-            text=suggestion or '')
-        if not ok: return
-        try:
-            segments.save_tag(self.session.session_id, change['minute'], text)
-        except OSError as exc:
-            tracker.log_error('효율 변화 태그 저장', exc); return
-        self._change_checked = None
-        self.change_prompt.setVisible(False)
-        from display_panel import resize
-        resize(self)
-
     def continue_level_up(self, new_level):
         """Keep the running measurement when the HUD shows a higher level."""
         old = self.session.level
@@ -1755,87 +942,6 @@ class SharedController(tracker.MeasurementCore):
         self.selection_generation += 1
         for overlay in self.overlays: overlay.close()
         self.overlays = []
-
-    def set_character_source(self, source):
-        if source != self.character_source:
-            self.character_source = source
-            self.character_candidate = (None, None)
-            self.character_identity = (None, None)
-            self.character_recheck_at = 0.0
-            self.nickname_sample = None
-            self.update_capture_label()
-
-    def update_capture_label(self):
-        if not self.auto_hud:
-            self.source_label.setText('수동 영역')
-            return
-        job, nickname = self.character_identity
-        fields = [f'Lv. {self.session.level}'] if self.running else []
-        fields.append(f'접속 닉네임 {nickname}' if nickname else '접속 닉네임 확인 대기')
-        if job:
-            fields.append(job)
-        self.source_label.setText(' · '.join(fields))
-
-    def set_detected_character(self, identity):
-        self.character_identity = identity
-        self.update_capture_label()
-        nickname = identity[1]
-        session = self.session
-        if self.running and nickname and not session.character_conflict and nickname != session.character_name:
-            session.character_conflict = session.character_name is not None
-            session.character_name = None if session.character_conflict else nickname
-            if session.rows:
-                try:
-                    self.save_summary()
-                except OSError as exc:
-                    tracker.log_error('사냥 기록 캐릭터 저장', exc)
-
-    def apply_character_results(self, now):
-        while not self.character_results.empty():
-            generation, window, stamp, job, nickname, key = self.character_results.get_nowait()
-            source = generation, window
-            if source != self.character_source or generation != self.generation or now - stamp > 15:
-                continue
-            previous = self.nickname_sample
-            if previous and stamp <= previous[1]:
-                continue
-            self.nickname_sample = (source, stamp, key) if key else None
-            old_job, old_name = self.character_candidate
-            registered = self.nickname_patterns.get(key)
-            confirmed_name = registered or (nickname if nickname and nickname == old_name
-                                            and previous and previous[2] == key else None)
-            self.character_candidate = (job, nickname)
-            self.set_detected_character((job if job == old_job else None, confirmed_name))
-            self.character_recheck_at = now + (self.CHARACTER_RECHECK_SECONDS if confirmed_name else 2.0)
-        if self.nickname_sample and now - self.nickname_sample[1] > 15:
-            self.set_character_source(None)
-
-    def apply_buff_results(self, now):
-        session = self.session
-        while not self.buff_results.empty():
-            generation, window, revision, stamp, readings = self.buff_results.get_nowait()
-            if (not self.running or (generation, window) != self.buff_window
-                    or generation != self.generation or revision != self.buff_revision):
-                continue
-            start = self.buff_confirmation.observe((generation, window), stamp, readings)
-            if session.started is not None and start is not None:
-                session.exp_buffs_dirty |= exp_buffs.record(
-                    session.exp_buff_intervals, self.buff_confirmation.current,
-                    start - session.started, stamp - session.started)
-        if (self.running and session.exp_buffs_dirty and session.rows and not session.ledger_dirty
-                and now - self.buff_last_flush >= 10):
-            self.buff_last_flush = now
-            try:
-                self.save_summary()
-            except OSError as exc:
-                tracker.log_error('경험치 버프 구간 저장', exc)
-        if not self.buff_has_templates:
-            text = '경험치 버프 · 아이콘 미등록'
-        elif self.running:
-            text = self.buff_confirmation.text(self.generation, now)
-        else:
-            text = '경험치 버프 · 측정 대기'
-        self.set_card_line(self.buff_label, text, visible=self.buff_has_templates)
 
     def poll(self):
         if self.worker_ready and self.status.get().startswith('인식기 준비 실패'):
@@ -2073,7 +1179,8 @@ class SharedController(tracker.MeasurementCore):
                 'compact': self.compact, 'always_on_top': self.always_on_top,
                 'window_opacity': self.window_opacity, 'auto_hud': self.auto_hud,
                 'recent_recording': self.recent_recording, 'burning': self.burning,
-                'jev_enabled': self.jev_enabled, 'auto_measure': self.auto_measure,
+                'jev_enabled': self.jev_enabled, 'jev_full_screen': getattr(self, 'jev_full_screen', True),
+                'auto_measure': self.auto_measure,
                 'current_character': getattr(self, 'current_character', None),
                 'nickname_patterns': getattr(self, 'nickname_patterns', {}),
                 'cloud_remote': getattr(self, 'cloud_remote', None),
@@ -2089,6 +1196,7 @@ class SharedController(tracker.MeasurementCore):
         self.key_repeat.shutdown()
         if not self.finish_measurement('앱 종료'): return False
         self.save_config(); self.cancel_selection(); self.stop.set(); self.timer.stop()
+        self._shutdown_probes()
         self.start_captures.close()
         self.application.quit(); return True
 
@@ -2153,6 +1261,7 @@ def run_app(controller_class):
             if not controller.stop.is_set():
                 controller.stop.set()
                 controller.timer.stop()
+                controller._shutdown_probes()
                 controller.start_captures.close()
         lock.close()
         if diagnostic_data is not None:

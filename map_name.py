@@ -36,16 +36,25 @@ def _get_engine():
     global _engine
     with _engine_lock:
         if _engine is None:
+            import logging
             from rapidocr import RapidOCR, LangRec, ModelType, OCRVersion
             models = Path(tracker.RESOURCES)/'models'
             _engine = RapidOCR(params={
-                'Global.use_cls': False,
+                'Global.use_cls': False, 'Global.log_level': 'error',
                 'Det.model_path': str(models/DETECT_MODEL), 'Det.ocr_version': OCRVersion.PPOCRV6,
+                'Det.limit_type': 'max', 'Det.limit_side_len': 1600,
                 'Rec.lang_type': LangRec.KOREAN, 'Rec.ocr_version': OCRVersion.PPOCRV5,
                 'Rec.model_type': ModelType.MOBILE, 'Rec.model_path': str(models/KOREAN_MODEL),
                 'EngineConfig.onnxruntime.intra_op_num_threads': 1,
                 'EngineConfig.onnxruntime.inter_op_num_threads': 1})
+            logging.getLogger('RapidOCR').setLevel(logging.ERROR)
         return _engine
+
+
+def detect_boxes(rgb):
+    """Run text detection only, reusing the shared PP-OCRv6_det_tiny session."""
+    with _recognition_lock:
+        return _get_engine()(rgb, use_det=True, use_rec=False)
 
 
 def lines_to_name(lines):

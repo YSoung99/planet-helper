@@ -132,7 +132,7 @@ def load_settings(path):
     else:
         invalid.append('level')
     for key in ('compact', 'always_on_top', 'auto_hud', 'recent_recording', 'burning', 'jev_enabled',
-                'auto_measure'):
+                'jev_full_screen', 'auto_measure'):
         if key in payload:
             if type(payload[key]) is bool:
                 clean[key] = payload[key]
@@ -296,6 +296,16 @@ class KWinRegionCapture:
 
 _capture_state = threading.local()
 
+class TwoTierOcr:
+    """Wrap RapidOCR medium with an optional fast mobile recognizer for EXP lines."""
+    def __init__(self, medium, fast=None):
+        self.medium = medium
+        self.fast = fast
+
+    def __call__(self, rgb):
+        return self.medium(rgb)
+
+
 def create_ocr_engine(*, prefer_native=True):
     if prefer_native and sys.platform.startswith('linux'):
         try:
@@ -307,15 +317,31 @@ def create_ocr_engine(*, prefer_native=True):
         except (ImportError, OSError, RuntimeError) as exc:
             log_error('Rust OCR 초기화 · 기존 엔진 사용', exc)
 
-    from rapidocr import RapidOCR, ModelType
+    import logging
+    from rapidocr import RapidOCR, LangRec, ModelType, OCRVersion
     params = {'Rec.model_type': ModelType.MEDIUM,
               'EngineConfig.onnxruntime.intra_op_num_threads': 2,
               'EngineConfig.onnxruntime.inter_op_num_threads': 1,
-              'Global.use_det': False, 'Global.use_cls': False}
+              'Global.use_det': False, 'Global.use_cls': False, 'Global.log_level': 'error'}
     model = RESOURCES/'models'/'PP-OCRv6_rec_medium.onnx'
     if model.exists():
         params['Rec.model_path'] = str(model)
-    return RapidOCR(params=params)
+    medium = RapidOCR(params=params)
+    logging.getLogger('RapidOCR').setLevel(logging.ERROR)
+    fast_model = RESOURCES/'models'/'en_PP-OCRv4_rec_mobile.onnx'
+    if fast_model.is_file():
+        try:
+            fast = RapidOCR(params={
+                'Rec.lang_type': LangRec.EN, 'Rec.ocr_version': OCRVersion.PPOCRV4,
+                'Rec.model_type': ModelType.MOBILE, 'Rec.model_path': str(fast_model),
+                'EngineConfig.onnxruntime.intra_op_num_threads': 2,
+                'EngineConfig.onnxruntime.inter_op_num_threads': 1,
+                'Global.use_det': False, 'Global.use_cls': False, 'Global.log_level': 'error'})
+            logging.getLogger('RapidOCR').setLevel(logging.ERROR)
+            return TwoTierOcr(medium, fast)
+        except Exception as exc:
+            log_error('경량 OCR 초기화 · 기본 모델 사용', exc)
+    return medium
 
 def capture_image(capture, region):
     from PIL import Image
@@ -375,9 +401,13 @@ class LoadController:
 
 class LineReader:
     """Reuse a verified result only for byte-identical pixels, at most 5 seconds."""
+    FAST_MIN_SCORE = .90
+    CROSS_MIN_SCORE = .88
+
     def __init__(self, engine):
         self.engine = engine
         self.native = getattr(engine, 'read_exp', None)
+        self.fast = getattr(engine, 'fast', None)
         self.key = self.result = None
         self.cached_at = 0
         self.last_readings = []
@@ -401,7 +431,8 @@ class LineReader:
         if not found:
             import jev
             self.arbiter.submit(question, lambda: jev.pick_reading(
-                image, [f'{exp:,} [{pct:.2f}%]' for exp, pct in candidates], 'EXP number and percentage'))
+                image, [f'{exp:,} [{pct:.2f}%]' for exp, pct in candidates], 'EXP number and percentage'),
+                label='경험치 판독')
             return None
         if picked is None:
             return None
@@ -427,24 +458,76 @@ class LineReader:
                 self.key,self.result,self.cached_at = key,result,observed_at
                 self.cached_readings = list(self.last_readings)
             return (*result, False)
-        readings = []
-        def recognize(prepared):
-            prepared = ImageOps.expand(prepared.resize((image.width*4,image.height*4)),20,fill=0)
-            output = self.engine(np.asarray(prepared.convert('RGB')))
+        total = EXP_TABLE.get(level)
+        # Neutral RGB keeps white glyphs while suppressing the original green bar.
+        # The EXP-labelled HUD has green brackets: grayscale preserves those.
+        rgb_image = image if image.mode == 'RGB' else image.convert('RGB')
+        neutral = None
+        grayscale = None
+
+        def get_neutral():
+            nonlocal neutral
+            if neutral is None:
+                neutral = ImageOps.autocontrast(Image.fromarray(np.asarray(rgb_image).min(axis=2)))
+            return neutral
+
+        def get_grayscale():
+            nonlocal grayscale
+            if grayscale is None:
+                grayscale = ImageOps.autocontrast(ImageOps.grayscale(rgb_image))
+            return grayscale
+
+        def run_variant(ocr, prepared, scale=4, border=20):
+            prepared = ImageOps.expand(prepared.resize((image.width*scale, image.height*scale)), border, fill=0)
+            output = ocr(np.asarray(prepared if prepared.mode == 'RGB' else prepared.convert('RGB')))
             texts = output.txts if output.txts is not None else ()
             scores = output.scores if output.scores is not None else ()
             raw = ''.join(texts)
-            readings.append((parse(raw,EXP_TABLE.get(level)),min(scores) if len(scores) else 0,raw))
-        recognize(image)
-        # Neutral RGB keeps white glyphs while suppressing the original green bar.
-        # The EXP-labelled HUD has green brackets: grayscale preserves those.
-        neutral = Image.fromarray(np.asarray(image.convert('RGB')).min(axis=2))
-        grayscale = ImageOps.grayscale(image)
+            return (parse(raw, total), min(scores) if len(scores) else 0, raw)
+
+        fast_readings = []
+        if self.fast is not None and total:
+            first = run_variant(self.fast, rgb_image, scale=2, border=10)
+            fast_readings.append(first)
+            labelled = bool(re.match(r'^EXP[.:]?(?=\d)', re.sub(r'\s+', '', first[2]), re.IGNORECASE))
+            second_img, third_img = (get_grayscale, get_neutral) if labelled else (get_neutral, get_grayscale)
+            fast_readings.append(run_variant(self.fast, second_img(), scale=2, border=10))
+            fast_votes = Counter(v for v, s, _ in fast_readings
+                                 if v is not None and s >= self.FAST_MIN_SCORE and _agrees(v, total))
+            winner = fast_votes.most_common(1)
+            if not (winner and winner[0][1] >= 2):
+                fast_readings.append(run_variant(self.fast, third_img(), scale=2, border=10))
+                fast_votes = Counter(v for v, s, _ in fast_readings
+                                     if v is not None and s >= self.FAST_MIN_SCORE and _agrees(v, total))
+                winner = fast_votes.most_common(1)
+            if winner and winner[0][1] >= 2:
+                value = winner[0][0]
+                matching = [entry for entry in fast_readings if entry[0] == value and entry[1] >= self.FAST_MIN_SCORE]
+                self.last_readings = [entry[2] for entry in fast_readings]
+                result = (value, min(entry[1] for entry in matching), matching[0][2])
+                self.key, self.result, self.cached_at = key, result, observed_at
+                self.cached_readings = list(self.last_readings)
+                return (*result, False)
+
+        readings = []
+        def recognize(prepared):
+            readings.append(run_variant(self.engine, prepared))
+        recognize(rgb_image)
+        if fast_readings and total and readings[0][0] is not None and readings[0][1] >= self.CROSS_MIN_SCORE and _agrees(readings[0][0], total):
+            med_val, med_score, med_raw = readings[0]
+            cross = [entry for entry in fast_readings
+                     if entry[1] >= self.CROSS_MIN_SCORE and entry[0] == med_val]
+            if cross:
+                self.last_readings = [med_raw, *(entry[2] for entry in fast_readings)]
+                result = (med_val, min(med_score, max(entry[1] for entry in cross)), med_raw)
+                self.key, self.result, self.cached_at = key, result, observed_at
+                self.cached_readings = list(self.last_readings)
+                return (*result, False)
         labelled_hud = bool(re.match(r'^EXP[.:]?(?=\d)', re.sub(r'\s+', '', readings[0][2]), re.IGNORECASE))
-        recognize(ImageOps.autocontrast(grayscale if labelled_hud else neutral))
+        recognize(get_grayscale() if labelled_hud else get_neutral())
         initially_agreed = readings[0][0] is not None and readings[0][0]==readings[1][0] and min(readings[0][1],readings[1][1])>=.85
         if not initially_agreed:
-            recognize(ImageOps.autocontrast(neutral if labelled_hud else grayscale))
+            recognize(get_neutral() if labelled_hud else get_grayscale())
         self.last_readings = [entry[2] for entry in readings]
         votes = Counter(value for value,score,raw in readings if value is not None and score>=.85)
         winner = votes.most_common(1)
@@ -1203,8 +1286,9 @@ class MeasurementCore:
                             reason = f'화면 캡처 실패 (코드 {exc.returncode})'
                         else:
                             reason = str(exc)
-                        log_error('캡처/인식', exc)
-                        from auto_hud import HudLevelChanged
+                        from auto_hud import HudLevelChanged, HudNotFound
+                        if not isinstance(exc, (HudNotFound, HudLevelChanged)):
+                            log_error('캡처/인식', exc)
                         self.events.put((generation, None, '', 0, reason, time.monotonic(),
                                          {'level_changed':isinstance(exc,HudLevelChanged),
                                           'level_from':getattr(exc,'old',None),'level_to':getattr(exc,'level',None)}))

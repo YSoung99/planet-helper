@@ -47,8 +47,9 @@ def read(frame, cache=None):
         return lines
 
     width, height = frame.size
-    header = np.asarray(frame.crop((round(width*.43), round(height*.208),
-                                    round(width*.57), round(height*.253))).convert('RGB'))
+    header_crop = frame.crop((round(width*.43), round(height*.208),
+                              round(width*.57), round(height*.253)))
+    header = np.asarray(header_crop if header_crop.mode == 'RGB' else header_crop.convert('RGB'))
     # The dialog has a flat dark header with light text. Most frames can skip OCR here.
     edges = header[:, [0, -1], :]
     if edges.std() < 6 and 32 <= edges.mean() <= 64:

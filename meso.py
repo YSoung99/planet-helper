@@ -46,9 +46,9 @@ def white_boxes(frame):
     import cv2
     import numpy as np
 
-    pixels = np.asarray(frame.convert('RGB'))
+    rgb = frame if frame.mode == 'RGB' else frame.convert('RGB')
+    pixels = np.asarray(rgb)
     mask = cv2.inRange(pixels, (225, 225, 225), (255, 255, 255))
-    mask //= 255
     count, _, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=4)
     boxes = []
     for x, y, w, h, area in stats[1:count]:
@@ -56,7 +56,7 @@ def white_boxes(frame):
             continue
         # A box can touch other bright UI through a gap in its border; split at rows that are
         # mostly dark (the border lines) and keep each band that is shaped like a box.
-        region = mask[y:y + h, x:x + w]
+        region = mask[y:y + h, x:x + w] > 0
         top = None
         for index, bright in enumerate([*(region.mean(axis=1) >= .35), False]):
             if bright and top is None:
@@ -309,7 +309,8 @@ class Reader:
             return None if picked is None else readings[picked]
         import jev
         self.arbiter.submit(question,
-                            lambda: jev.pick_reading(glyphs, [f'{v:,}' for v in readings], 'meso amount'))
+                            lambda: jev.pick_reading(glyphs, [f'{v:,}' for v in readings], 'meso amount'),
+                            label='메소 판독')
         return None
 
 

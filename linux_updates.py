@@ -43,6 +43,25 @@ def launch(root, key, args=()):
     os.execve(executable, [executable, str(app / 'linux_app.py'), *args], env)
 
 
+def prune_old_versions(root):
+    """Remove staged Linux releases other than current and previous."""
+    root = Path(root)
+    versions_dir = root / VERSIONS
+    if not versions_dir.is_dir():
+        return 0
+    active = state(root)
+    keep = {active.get('current'), active.get('previous')}
+    removed = 0
+    for path in list(versions_dir.iterdir()):
+        if path.is_dir() and DIRECTORY.fullmatch(path.name) and path.name not in keep:
+            try:
+                shutil.rmtree(path)
+                removed += 1
+            except OSError:
+                pass
+    return removed
+
+
 def switch(root, expected, target):
     current = state(root)
     if current['current'] != expected:
@@ -52,6 +71,7 @@ def switch(root, expected, target):
         temporary = Path(stream.name)
         json.dump({'current': target, 'previous': expected}, stream)
     temporary.replace(root / STATE)
+    prune_old_versions(root)
 
 
 class LinuxUpdateBackend:
@@ -86,6 +106,12 @@ class LinuxUpdateBackend:
             with tarfile.open(archive, 'r:gz') as tar:
                 tar.extractall(destination, filter='data')
             archive.unlink()
+            native_ext = self.root / '_planet_ocr.so'
+            if native_ext.is_file() and not (destination / '_planet_ocr.so').exists():
+                try:
+                    shutil.copy2(native_ext, destination / '_planet_ocr.so')
+                except OSError:
+                    pass
             env = dict(os.environ, PLANET_HELPER_PYTHON=sys.executable)
             subprocess.run(['/bin/bash', str(destination / 'install-linux.sh'), '--prepare'],
                            check=True, capture_output=True, timeout=600, env=env)

@@ -1,6 +1,7 @@
 """Past measurements with hunting-spot memos, for comparing efficiency."""
 import json
-from datetime import datetime
+import threading
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import exp_buffs
@@ -9,6 +10,10 @@ import tracker
 MEMO_FILE = 'memos.json'
 # Character names typed by the user. They override OCR without touching the record files.
 CHARACTER_FILE = 'character-names.json'
+CACHE_FILE = '.summary-cache.json'
+CACHE_VERSION = 1
+_cache_lock = threading.Lock()
+_memory_cache = {}
 
 
 def memo_path(base=None):
@@ -101,12 +106,108 @@ def summarize(csv_path):
                 changes=segments.find_changes(session.minute_snapshots))
 
 
+def _record_stamp(csv_path):
+    """Return [csv_mtime_ns, csv_size, json_mtime_ns, json_size] for cache validation."""
+    csv_stat = csv_path.stat()
+    json_path = csv_path.with_suffix('.json')
+    try:
+        json_stat = json_path.stat()
+        return [csv_stat.st_mtime_ns, csv_stat.st_size, json_stat.st_mtime_ns, json_stat.st_size]
+    except OSError:
+        return [csv_stat.st_mtime_ns, csv_stat.st_size, 0, 0]
+
+
+def _encode_cached_row(row):
+    if row is None:
+        return None
+    encoded = dict(row)
+    started = encoded.get('started')
+    encoded['started'] = started.isoformat() if isinstance(started, datetime) else None
+    return encoded
+
+
+def _decode_cached_row(entry):
+    if entry is None:
+        return None
+    row = dict(entry)
+    started = row.get('started')
+    if isinstance(started, str):
+        try:
+            row['started'] = datetime.fromisoformat(started)
+        except ValueError:
+            row['started'] = None
+    row['changes'] = [dict(change) for change in row.get('changes') or ()]
+    row['exp_buff_intervals'] = {
+        key: [list(span) for span in spans]
+        for key, spans in (row.get('exp_buff_intervals') or {}).items()
+        if isinstance(spans, list)
+    }
+    return row
+
+
+def _load_summary_cache(folder):
+    key = str(folder.resolve()) if folder.exists() else str(folder)
+    with _cache_lock:
+        cached = _memory_cache.get(key)
+        if cached is not None:
+            return dict(cached)
+    path = folder / CACHE_FILE
+    try:
+        payload = json.loads(path.read_text(encoding='utf-8'))
+        if isinstance(payload, dict) and payload.get('version') == CACHE_VERSION and isinstance(payload.get('entries'), dict):
+            entries = payload['entries']
+            with _cache_lock:
+                _memory_cache[key] = dict(entries)
+            return dict(entries)
+    except (OSError, ValueError):
+        pass
+    return {}
+
+
+def _save_summary_cache(folder, entries):
+    key = str(folder.resolve()) if folder.exists() else str(folder)
+    with _cache_lock:
+        _memory_cache[key] = dict(entries)
+    path = folder / CACHE_FILE
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_suffix('.json.tmp')
+        temporary.write_text(json.dumps({'version': CACHE_VERSION, 'entries': entries}, ensure_ascii=False), encoding='utf-8')
+        temporary.replace(path)
+    except OSError:
+        pass
+
+
 def collect(base=None):
     folder = Path(base or tracker.BASE)/'records'
     rows = []
-    for path in sorted(folder.glob('[0-9]*.csv'), reverse=True):
-        row = summarize(path)
-        if row: rows.append(row)
+    cache = _load_summary_cache(folder) if folder.is_dir() else {}
+    dirty = False
+    seen = set()
+    if folder.is_dir():
+        for path in sorted(folder.glob('[0-9]*.csv'), reverse=True):
+            session_id = path.stem
+            seen.add(session_id)
+            try:
+                stamp = _record_stamp(path)
+            except OSError:
+                continue
+            cached = cache.get(session_id)
+            if isinstance(cached, dict) and cached.get('stamp') == stamp:
+                row = _decode_cached_row(cached.get('row'))
+            else:
+                row = summarize(path)
+                cache[session_id] = {'stamp': stamp, 'row': _encode_cached_row(row)}
+                dirty = True
+            if row:
+                rows.append(row)
+        stale = [sid for sid in cache if sid not in seen]
+        if stale:
+            for sid in stale:
+                cache.pop(sid, None)
+            dirty = True
+        if dirty:
+            _save_summary_cache(folder, cache)
     memos = load_memos(base)
     names = load_character_names(base)
     import segments
@@ -122,6 +223,34 @@ def collect(base=None):
         for change in row['changes']:
             change['tag'] = tags.get(row['session_id'], {}).get(str(change['minute']), '')
     return rows
+
+
+def filter_rows(all_rows, *, character=None, period=None, query='', now=None):
+    """Filter collected rows by character, time window, and search text."""
+    since = None
+    if period in ('today', '7d', '30d'):
+        current = now or datetime.now()
+        today = current.replace(hour=0, minute=0, second=0, microsecond=0)
+        since = today if period == 'today' else today - timedelta(days=6 if period == '7d' else 29)
+    needle = ' '.join(str(query or '').split()).casefold()
+    compact_needle = spot_key(needle) if needle else ''
+    result = []
+    for row in all_rows:
+        if character is not None and (row.get('character_name') or '') != character:
+            continue
+        if since is not None:
+            started = row.get('started')
+            if started is None or started < since:
+                continue
+        if needle:
+            memo = row.get('memo') or ''
+            char = row.get('character_name') or ''
+            level = f"lv.{row['level']}" if row.get('level') is not None else ''
+            haystack = f'{memo} {char} {level}'.casefold()
+            if needle not in haystack and (not compact_needle or compact_needle not in spot_key(memo)):
+                continue
+        result.append(row)
+    return result
 
 
 def spot_key(memo):
@@ -154,6 +283,29 @@ def by_memo(rows):
         groups[name] = (gained+row['rate_gain'], active+row['rate_seconds'], count+1)
     return sorted(((memo, gained*60/active, active, count) for memo, (gained, active, count) in groups.items()),
                   key=lambda item: -item[1])
+
+
+def by_memo_detailed(rows):
+    """Weighted per-minute EXP and hourly meso per hunting spot."""
+    rows = list(comparable(rows))
+    names = spot_spellings(row['memo'] for row in rows)
+    groups = {}
+    for row in rows:
+        if not row['memo']: continue
+        name = names[spot_key(row['memo'])]
+        gained, active, count, meso_sum, meso_sec, meso_count = groups.get(name, (0, 0.0, 0, 0, 0.0, 0))
+        meso_val = row.get('meso')
+        if meso_val is not None and row.get('active', 0) > 0:
+            meso_sum += meso_val
+            meso_sec += row['active']
+            meso_count += 1
+        groups[name] = (gained+row['rate_gain'], active+row['rate_seconds'], count+1,
+                        meso_sum, meso_sec, meso_count)
+    return sorted((
+        (memo, gained*60/active, active, count,
+         (meso_sum*3600/meso_sec if meso_sec > 0 else None), meso_count)
+        for memo, (gained, active, count, meso_sum, meso_sec, meso_count) in groups.items()
+    ), key=lambda item: -item[1])
 
 
 def known_characters(base=None):
@@ -444,6 +596,56 @@ def ranking_table(first_header):
     return table
 
 
+def spot_ranking_table():
+    """Rank / spot / per-minute EXP bar / hourly meso / hunting time / count."""
+    from PySide6.QtCore import Qt, QRectF
+    from PySide6.QtGui import QColor
+    from PySide6.QtWidgets import (QTableWidget, QHeaderView, QAbstractItemView, QStyledItemDelegate)
+
+    class BarDelegate(QStyledItemDelegate):
+        def paint(self, painter, option, index):
+            share = index.data(Qt.ItemDataRole.UserRole) or 0
+            box = QRectF(option.rect).adjusted(4, 6, -8, -6)
+            painter.save()
+            painter.fillRect(QRectF(box.left(), box.top(), box.width()*share, box.height()), QColor('#2a4a38'))
+            painter.setPen(QColor('#d5dee8'))
+            painter.drawText(box.adjusted(6, 0, 0, 0), Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+                             index.data())
+            painter.restore()
+
+    table = QTableWidget(0, 6)
+    table.setHorizontalHeaderLabels(['#', '사냥터', '분당 EXP', '시간당 메소', '순수 사냥', '횟수'])
+    table.verticalHeader().setVisible(False)
+    table.setAlternatingRowColors(True); table.setShowGrid(False)
+    table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+    table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+    table.setItemDelegateForColumn(2, BarDelegate(table))
+    header = table.horizontalHeader()
+    header.setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+    header.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+    return table
+
+
+def fill_spot_ranking(table, entries):
+    """entries: (name, per_minute, active, count, meso_per_hour, meso_count)."""
+    from PySide6.QtCore import Qt
+    from PySide6.QtWidgets import QTableWidgetItem
+    top = max((rate for _, rate, _, _, _, _ in entries), default=0) or 1
+    table.setRowCount(len(entries))
+    for index, (name, rate, active, count, meso_hour, meso_count) in enumerate(entries):
+        meso_text = '—' if meso_hour is None else f'{meso_hour:+,.0f}'
+        cells = [str(index+1), name, f'{rate:,.0f}', meso_text, clock(active), str(count)]
+        for column, text in enumerate(cells):
+            item = QTableWidgetItem(text)
+            if column == 2:
+                item.setData(Qt.ItemDataRole.UserRole, rate/top)
+            if column == 3 and meso_hour is not None:
+                item.setToolTip(f'메소 확인 기록 {meso_count}건 가중 평균 (시간당 {meso_hour:+,.0f} 메소)')
+            if column in (0, 3, 4, 5):
+                item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            table.setItem(index, column, item)
+
+
 def fill_ranking(table, entries):
     """entries: (name, per_minute, active seconds, count), best first."""
     from PySide6.QtCore import Qt
@@ -515,18 +717,27 @@ def build_dialog(controller):
     from PySide6.QtGui import QColor
     from PySide6.QtWidgets import (QDialog, QVBoxLayout, QLabel, QTableWidget, QTableWidgetItem,
                                    QHeaderView, QAbstractItemView, QComboBox, QHBoxLayout,
-                                   QInputDialog, QMenu, QTabWidget, QWidget)
+                                   QInputDialog, QLineEdit, QMenu, QTabWidget, QWidget)
     from qt_controller import short_exp
     dialog = QDialog(controller.window)
     dialog.setWindowTitle('사냥 기록 비교')
     dialog.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
-    dialog.resize(1000, 760)
-    dialog.setStyleSheet(STYLE)
+    dialog.resize(1040, 760)
+    dialog.setStyleSheet(STYLE + 'QLineEdit, QComboBox {background:#25303d; color:#e8f0f6; border:1px solid #35465b; border-radius:6px; padding:4px 8px;}')
     layout = QVBoxLayout(dialog); layout.setContentsMargins(16, 14, 16, 12); layout.setSpacing(10)
     all_rows = collect()
     character_names = []
     character_picker = QComboBox()
     character_picker.setAccessibleName('사냥 기록 캐릭터')
+    period_picker = QComboBox()
+    period_picker.setAccessibleName('사냥 기록 기간')
+    for label, value in (('전체 기간', None), ('오늘', 'today'), ('최근 7일', '7d'), ('최근 30일', '30d')):
+        period_picker.addItem(label, value)
+    search_input = QLineEdit()
+    search_input.setAccessibleName('사냥 기록 검색')
+    search_input.setPlaceholderText('사냥터·레벨·캐릭터 검색…')
+    search_input.setClearButtonEnabled(True)
+    search_input.setMinimumWidth(180)
 
     def populate_picker(selected):
         """Rebuild the filter after a rename; keep the chosen character if it still exists."""
@@ -547,8 +758,11 @@ def build_dialog(controller):
     top = QHBoxLayout()
     title = QLabel('사냥 기록'); title.setObjectName('title'); top.addWidget(title)
     top.addStretch(1)
+    top.addWidget(search_input)
     caption = QLabel('캐릭터'); caption.setObjectName('hint'); top.addWidget(caption)
-    character_picker.setMinimumWidth(180); top.addWidget(character_picker)
+    character_picker.setMinimumWidth(160); top.addWidget(character_picker)
+    period_caption = QLabel('기간'); period_caption.setObjectName('hint'); top.addWidget(period_caption)
+    top.addWidget(period_picker)
     layout.addLayout(top)
 
     cards = QHBoxLayout(); cards.setSpacing(12)
@@ -585,7 +799,7 @@ def build_dialog(controller):
     hint.setObjectName('hint'); hint.setWordWrap(True); records_layout.addWidget(hint)
     tabs.addTab(records_page, '기록')
 
-    spot_table = ranking_table('사냥터')
+    spot_table = spot_ranking_table()
     spot_page = QWidget(); spot_layout = QVBoxLayout(spot_page); spot_layout.setContentsMargins(0, 10, 0, 0)
     spot_layout.addWidget(spot_table, 1)
     spot_hint = QLabel('띄어쓰기만 다른 사냥터 이름은 하나로 묶어요. 사냥터 메모를 적은 기록만 나와요.')
@@ -598,15 +812,17 @@ def build_dialog(controller):
     layout.addWidget(tabs, 1)
 
     def refresh_spots():
-        ranked = by_memo(rows)
-        fill_ranking(spot_table, ranked)
+        ranked = by_memo_detailed(rows)
+        fill_spot_ranking(spot_table, ranked)
         tabs.setTabText(1, f'사냥터별 {len(ranked)}')
 
     def refresh_summary():
         now = datetime.now()
         today = now.replace(hour=0, minute=0, second=0, microsecond=0)
-        update_today(period_summary(rows, today))
-        update_week(period_summary(rows, today-timedelta(days=today.weekday())))
+        name = character_picker.currentData()
+        char_rows = [row for row in all_rows if name is None or (row['character_name'] or '') == name]
+        update_today(period_summary(char_rows, today))
+        update_week(period_summary(char_rows, today-timedelta(days=today.weekday())))
 
     def rename_characters(session_ids, name):
         try:
@@ -693,8 +909,8 @@ def build_dialog(controller):
 
     def render_records():
         nonlocal rows
-        name = character_picker.currentData()
-        rows = [row for row in all_rows if name is None or (row['character_name'] or '') == name]
+        rows = filter_rows(all_rows, character=character_picker.currentData(),
+                           period=period_picker.currentData(), query=search_input.text())
         if chart_layout.count():
             chart_layout.takeAt(0).widget().deleteLater()
         chart_layout.addWidget(build_chart(rows))
@@ -745,6 +961,8 @@ def build_dialog(controller):
 
     table.itemChanged.connect(edited)
     character_picker.currentIndexChanged.connect(render_records)
+    period_picker.currentIndexChanged.connect(render_records)
+    search_input.textChanged.connect(render_records)
     session_name = controller.session.character_name or getattr(controller, 'current_character', None)
     if session_name in character_names:
         character_picker.setCurrentIndex(character_picker.findData(session_name))
