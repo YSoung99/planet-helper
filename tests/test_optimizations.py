@@ -392,6 +392,39 @@ class JevControlsAndUpdatePruningTests(unittest.TestCase):
             self.assertEqual(len(emitted), 1)
             self.assertEqual(bridge.poll_timer.interval(), 10000)
 
+    def test_character_hud_caches_unchanged_lines_and_short_circuits_after_two_agreements(self):
+        import character_hud
+        character_hud._LINE_CACHE.clear()
+        line = Image.new('RGB', (120, 20), (20, 30, 40))
+        with patch('map_name.recognize_lines', return_value=[('곰곰스렁', 0.99)]) as rec:
+            self.assertEqual(character_hud._read_line(line, job=False), '곰곰스렁')
+            # Early short-circuit after 2 agreeing variants instead of 3!
+            self.assertEqual(rec.call_count, 2)
+            # Identical pixels hit cache with 0 OCR calls!
+            self.assertEqual(character_hud._read_line(line, job=False), '곰곰스렁')
+            self.assertEqual(rec.call_count, 2)
+
+    def test_exp_buffs_locks_matched_scale_for_resolution(self):
+        import exp_buffs
+        with tempfile.TemporaryDirectory() as tmp:
+            icon = Image.new('RGB', (36, 36), (30, 30, 30))
+            for y in range(6, 20):
+                for x in range(6, 30):
+                    icon.putpixel((x, y), (240, 200, 40))
+            src = Path(tmp) / 'src.png'
+            icon.save(src)
+            exp_buffs.register(tmp, 'coupon', src)
+            frame = Image.new('RGB', (1200, 750), (20, 20, 20))
+            frame.paste(icon, (900, 80))
+            det = exp_buffs.Detector()
+            self.assertEqual(det.read(frame, tmp)['coupon'], 'active')
+            self.assertIn(('coupon', (1200, 750)), det.locked_scales)
+            # When buff disappears at the same resolution, only 3 scales around locked scale are checked.
+            empty = Image.new('RGB', (1200, 750), (20, 20, 20))
+            with patch('cv2.matchTemplate', wraps=__import__('cv2').matchTemplate) as mt:
+                self.assertEqual(det.read(empty, tmp)['coupon'], 'unknown')
+                self.assertLessEqual(mt.call_count, 3)
+
 
 if __name__ == '__main__':
     unittest.main()

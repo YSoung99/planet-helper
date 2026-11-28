@@ -84,20 +84,40 @@ def fingerprint(line):
     return hashlib.blake2b(payload, digest_size=16).hexdigest()
 
 
+_LINE_CACHE = {}
+_LINE_CACHE_MAX = 64
+
+
 def _read_line(line, *, job):
+    rgb = line if line.mode == 'RGB' else line.convert('RGB')
+    cache_key = (job, rgb.size, hashlib.blake2b(rgb.tobytes(), digest_size=16).digest())
+    if cache_key in _LINE_CACHE:
+        return _LINE_CACHE[cache_key]
     readings = []
     if job:
         for resample in (Image.Resampling.BILINEAR, Image.Resampling.NEAREST):
-            scaled = line.resize((line.width * 2, line.height * 2), resample)
+            scaled = rgb.resize((rgb.width * 2, rgb.height * 2), resample)
             readings.extend(map_name.recognize_lines(scaled, detect=False))
-        return _confirmed(readings, job=True)
-    gray = ImageOps.grayscale(line)
-    for variant, resample in (
-            (line, Image.Resampling.LANCZOS),
-            (gray.point(lambda pixel: 255 if pixel >= 155 else 0), Image.Resampling.NEAREST),
-            (gray.point(lambda pixel: 255 if pixel >= 195 else 0), Image.Resampling.LANCZOS)):
-        scaled = variant.resize((variant.width * 3, variant.height * 3), resample)
-        lines = map_name.recognize_lines(ImageOps.expand(scaled, border=12, fill=0))
-        if len(lines) == 1:
-            readings.extend(lines)
-    return _confirmed(readings, job=False)
+        result = _confirmed(readings, job=True)
+    else:
+        gray = ImageOps.grayscale(rgb)
+        result = None
+        for idx, (variant, resample) in enumerate((
+                (rgb, Image.Resampling.LANCZOS),
+                (gray.point(lambda pixel: 255 if pixel >= 155 else 0), Image.Resampling.NEAREST),
+                (gray.point(lambda pixel: 255 if pixel >= 195 else 0), Image.Resampling.LANCZOS))):
+            scaled = variant.resize((variant.width * 3, variant.height * 3), resample)
+            found = map_name.recognize_lines(ImageOps.expand(scaled, border=12, fill=0))
+            if len(found) == 1:
+                readings.extend(found)
+            if idx == 1:
+                early = _confirmed(readings, job=False)
+                if early is not None:
+                    result = early
+                    break
+        if result is None:
+            result = _confirmed(readings, job=False)
+    if len(_LINE_CACHE) >= _LINE_CACHE_MAX:
+        _LINE_CACHE.pop(next(iter(_LINE_CACHE)))
+    _LINE_CACHE[cache_key] = result
+    return result

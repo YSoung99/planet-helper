@@ -67,6 +67,7 @@ class Detector:
         self.key = None
         self.last_result = None
         self.scales = {}
+        self.locked_scales = {}  # (kind, frame_size) -> matched scale
 
     def read(self, frame, base):
         matches = dict.fromkeys(LABELS, 'unregistered')
@@ -85,6 +86,7 @@ class Detector:
             return matches
 
         import cv2
+        import hashlib
         import numpy as np
 
         ratio = 750 / frame.height
@@ -92,17 +94,24 @@ class Detector:
         dimensions = (round(corner.width * ratio), round(corner.height * ratio))
         if min(dimensions) < 25:
             return matches
-        corner = corner.resize(dimensions, Image.Resampling.BILINEAR).convert('RGB')
+        corner = corner.resize(dimensions, Image.Resampling.BILINEAR)
+        if corner.mode != 'RGB':
+            corner = corner.convert('RGB')
+        digest = hashlib.blake2b(corner.tobytes(), digest_size=16).digest()
         key = (dimensions, tuple((kind, path, stamp) for kind, (path, stamp, _) in templates.items()),
-               corner.tobytes())
+               digest)
         if key == self.key:
             return self.last_result.copy()
 
         pixels = np.asarray(corner)
         locations = {}
         for kind, (_, _, patches) in templates.items():
-            previous = self.scales.get(kind, 37)
-            sizes = sorted(patches, key=lambda size: abs(size - previous))
+            locked = self.locked_scales.get((kind, frame.size))
+            if locked is not None:
+                sizes = [s for s in (locked, locked - 1, locked + 1) if s in patches]
+            else:
+                previous = self.scales.get(kind, 37)
+                sizes = sorted(patches, key=lambda size: abs(size - previous))
             for size in sizes:
                 patch = patches[size]
                 if patch.shape[0] > pixels.shape[0] or patch.shape[1] > pixels.shape[1]:
@@ -110,6 +119,7 @@ class Detector:
                 _, score, _, point = cv2.minMaxLoc(cv2.matchTemplate(pixels, patch, cv2.TM_CCOEFF_NORMED))
                 if score >= MIN_SCORE:
                     self.scales[kind] = size
+                    self.locked_scales[(kind, frame.size)] = size
                     matches[kind] = 'active'
                     locations[kind] = point
                     break

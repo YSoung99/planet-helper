@@ -8,6 +8,7 @@ Because matching uses only the potion artwork, moving the potion to a different 
 switching characters still tracks the exact same potion automatically—and if the potion is not
 on the quickslot bar, it is cleanly skipped instead of reading a different skill or item.
 """
+from functools import lru_cache
 import hashlib
 import math
 import re
@@ -132,6 +133,7 @@ def clean_slots(entries):
     return result
 
 
+@lru_cache(maxsize=32)
 def icon_mask(width, height):
     """3-channel mask keeping pure potion art while ignoring top-left hotkey text and bottom digits."""
     import cv2
@@ -145,7 +147,19 @@ def icon_mask(width, height):
     return cv2.merge([mask, mask, mask])
 
 
-def find_icon(frame, template_rgb, *, reference_height=None, threshold=ICON_MATCH_THRESHOLD):
+def _prepare_search(frame):
+    """Crop and convert the bottom-right quickslot search area once per frame."""
+    import numpy as np
+    fw, fh = frame.size
+    sx0 = int(fw * QUICKSLOT_SEARCH[0])
+    sy0 = int(fh * QUICKSLOT_SEARCH[1])
+    search_pil = frame.crop((sx0, sy0, fw, fh))
+    if search_pil.mode != 'RGB':
+        search_pil = search_pil.convert('RGB')
+    return np.asarray(search_pil), sx0, sy0
+
+
+def find_icon(frame, template_rgb, *, reference_height=None, threshold=ICON_MATCH_THRESHOLD, _search=None):
     """Locate `template_rgb` inside the bottom-right quickslot area, ignoring hotkey text & digits.
 
     Returns (x, y, w, h, score) in full-frame pixel coordinates, or None when not found.
@@ -155,12 +169,7 @@ def find_icon(frame, template_rgb, *, reference_height=None, threshold=ICON_MATC
     from PIL import Image
 
     fw, fh = frame.size
-    sx0 = int(fw * QUICKSLOT_SEARCH[0])
-    sy0 = int(fh * QUICKSLOT_SEARCH[1])
-    search_pil = frame.crop((sx0, sy0, fw, fh))
-    if search_pil.mode != 'RGB':
-        search_pil = search_pil.convert('RGB')
-    search = np.asarray(search_pil)
+    search, sx0, sy0 = _prepare_search(frame) if _search is None else _search
     sh_s, sw_s = search.shape[:2]
 
     tw, th = template_rgb.size
@@ -312,7 +321,7 @@ class Reader:
         self._templates[filename] = loaded
         return loaded
 
-    def _locate_slot_box(self, idx, frame, slot):
+    def _locate_slot_box(self, idx, frame, slot, search_cache):
         """Return pixel box (x, y, w, h) for a slot via icon matching (with fast cache) or ROI."""
         icon_file = slot.get('icon')
         if icon_file:
@@ -343,7 +352,10 @@ class Reader:
                     if score >= ICON_MATCH_THRESHOLD:
                         self._last_boxes[idx] = (frame.size, prev[1], digest)
                         return prev[1]
-            found = find_icon(frame, template, reference_height=slot.get('reference_height'))
+            if not search_cache:
+                search_cache.append(_prepare_search(frame))
+            found = find_icon(frame, template, reference_height=slot.get('reference_height'),
+                              _search=search_cache[0])
             if found is None:
                 self._last_boxes.pop(idx, None)
                 return None
@@ -364,8 +376,9 @@ class Reader:
     def read_slots(self, frame, slots):
         """Return list of (name, value_or_None) for each configured slot."""
         results = []
+        search_cache = []
         for idx, slot in enumerate(slots):
-            box = self._locate_slot_box(idx, frame, slot)
+            box = self._locate_slot_box(idx, frame, slot, search_cache)
             if box is None:
                 results.append((slot['name'], None))
                 continue

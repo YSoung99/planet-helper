@@ -15,7 +15,8 @@ import numpy as np
 def usable_image(image):
     if image.width < 40 or image.height < 8:
         return False
-    pixels = np.asarray(image.convert('RGB'))
+    rgb = image if image.mode == 'RGB' else image.convert('RGB')
+    pixels = np.asarray(rgb)
     # Measure spatial contrast within each channel, not differences between RGB.
     return int(np.ptp(pixels, axis=(0, 1)).max()) >= 20
 
