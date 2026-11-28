@@ -134,15 +134,16 @@ class MesoAndProbesMixin:
                 continue
             self.meso_rechecking = False
             self.idle_meso = (stamp, window, resolved_char, confirmed)
+            now_wall = datetime.now()
             try:
-                self.meso_log.record(tracker.BASE, resolved_char, confirmed, datetime.now())
+                self.meso_log.record(tracker.BASE, resolved_char, confirmed, now_wall)
             except OSError as exc:
                 tracker.log_error('메소 기록 저장', exc)
             active_sec = session.active_elapsed(stamp) if session.started is not None else 0.0
             session.meso_dirty |= session.meso.sample(
                 confirmed, source, stamp, self.meso_opening, session.meso_start_at,
                 self.meso_trade_threshold, first_seen=self.meso_confirmation.first_seen,
-                active_seconds=active_sec)
+                active_seconds=active_sec, when=now_wall)
         if (not finishing and self.running and session.meso_dirty and session.rows and not session.ledger_dirty
                 and now - self.meso_last_flush >= 10):
             self.meso_last_flush = now
@@ -179,6 +180,40 @@ class MesoAndProbesMixin:
                 self.compact_meso.setText(compact_text)
             if self.compact_meso.toolTip() != compact_tip:
                 self.compact_meso.setToolTip(compact_tip)
+        self.update_meso_change_prompt()
+
+    def update_meso_change_prompt(self):
+        prompt = getattr(self, 'meso_change_prompt', None)
+        if prompt is None:
+            return
+        session = self.session
+        if getattr(self, 'meso_prompt_session', None) != session.session_id:
+            self.meso_prompt_session = session.session_id
+            self.meso_prompt_reviewed = set()
+        balance = session.meso
+        unreviewed = [
+            idx for idx in range(len(balance.large_changes))
+            if idx not in self.meso_prompt_reviewed and idx not in balance.marked
+        ] if self.running and not balance.source_changed else []
+        if not unreviewed:
+            if not prompt.isHidden():
+                prompt.setVisible(False)
+                from display_panel import resize
+                resize(self)
+            return
+        idx = unreviewed[-1]
+        hint = self.meso_change_suggestion(idx, balance.large_changes[idx]) if hasattr(self, 'meso_change_suggestion') else None
+        text = f'큰 메소 변동 {balance.describe_change(idx)} · 눌러서 분류'
+        if len(unreviewed) > 1:
+            text += f' (+{len(unreviewed) - 1}건)'
+        if hint:
+            text += f' · JEV: {hint}'
+        if prompt.text() != text:
+            prompt.setText(text)
+        if prompt.isHidden():
+            prompt.setVisible(True)
+            from display_panel import resize
+            resize(self)
 
     def _current_meso_rate(self, now):
         session = self.session

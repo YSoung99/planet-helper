@@ -250,6 +250,37 @@ class ViewTests(unittest.TestCase):
         c.clear_meso_region()
         self.assertIsNone(c.meso_region)
 
+    def test_large_meso_change_prompt_and_meso_chart_mode(self):
+        import record_history
+        from datetime import datetime
+        c = self.c
+        c.running = True
+        c.current_character = '본캐'
+        c.session.meso_start_at = 100.0
+        for stamp, val in ((101, 5_000_000), (103, 5_000_000), (105, 2_360_000), (107, 2_360_000)):
+            c.meso_results.put((c.generation, 20, stamp, '본캐', val))
+            c.apply_meso_results(stamp)
+        self.assertFalse(c.meso_change_prompt.isHidden())
+        self.assertIn('-2,640,000', c.meso_change_prompt.text())
+        # Classifying via dialog hides the prompt and updates net delta.
+        with patch('record_history.classify_meso_dialog', return_value={0}):
+            c.classify_meso_change()
+        self.assertTrue(c.meso_change_prompt.isHidden())
+        self.assertEqual(c.meso_delta_label.text(), '+0')
+        # Meso chart mode handles both positive and negative hourly meso without error.
+        rows = [
+            dict(session_id='s1', started=datetime(2026, 11, 28, 10), level=180, active=1800,
+                 gained=100000, per_minute=5000.0, rate_gain=100000, rate_seconds=1800,
+                 blocked=False, meso=1_500_000, meso_seconds=1800, memo='성벽2'),
+            dict(session_id='s2', started=datetime(2026, 11, 28, 11), level=180, active=1800,
+                 gained=100000, per_minute=5000.0, rate_gain=100000, rate_seconds=1800,
+                 blocked=False, meso=-500_000, meso_seconds=1800, memo='성벽3'),
+        ]
+        chart = record_history.build_chart(rows, mode='meso')
+        self.addCleanup(chart.deleteLater)
+        chart.resize(400, 180)
+        chart.grab()
+
     def test_connected_nickname_registration_and_character_change(self):
         c = self.c
         c.set_character_source((c.generation, 20))

@@ -69,6 +69,98 @@ def save_character_names(entries, base=None):
     return _save_entries(character_path(base), entries, 24)
 
 
+def load_session_meso(session_id, base=None):
+    """Load SessionMeso directly from a saved session's JSON summary."""
+    import meso
+    path = Path(base or tracker.BASE) / 'records' / f'{session_id}.json'
+    try:
+        payload = json.loads(path.read_text(encoding='utf-8'))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(payload, dict) or not isinstance(payload.get('meso'), dict):
+        return None
+    return meso.SessionMeso(payload['meso'])
+
+
+def save_meso_marks(session_id, marked, base=None):
+    """Persist updated large-change trade exclusions back to a saved session JSON."""
+    import meso
+    path = Path(base or tracker.BASE) / 'records' / f'{session_id}.json'
+    payload = json.loads(path.read_text(encoding='utf-8'))
+    if not isinstance(payload, dict) or not isinstance(payload.get('meso'), dict):
+        raise ValueError('저장된 메소 기록이 없어요.')
+    balance = meso.SessionMeso(payload['meso'])
+    balance.marked = {i for i in marked if isinstance(i, int) and 0 <= i < len(balance.large_changes)}
+    updated = dict(payload['meso'])
+    updated['marked'] = sorted(balance.marked)
+    payload['meso'] = updated
+    temporary = path.with_suffix('.json.tmp')
+    temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding='utf-8')
+    temporary.replace(path)
+    return balance
+
+
+def classify_meso_dialog(parent, balance, *, title='큰 메소 변동 분류', suggestions=None):
+    """Modal checkbox dialog to toggle trade/purchase exclusions with live net-meso preview."""
+    from PySide6.QtWidgets import QCheckBox, QDialog, QHBoxLayout, QLabel, QPushButton, QVBoxLayout
+
+    suggestions = suggestions or {}
+    dialog = QDialog(parent)
+    dialog.setWindowTitle(title)
+    dialog.setStyleSheet(
+        'QDialog { background:#151b24; color:#e8f0f6; } '
+        'QLabel { color:#d5dee8; } QCheckBox { color:#e8f0f6; spacing:8px; padding:3px 0; }'
+    )
+    layout = QVBoxLayout(dialog)
+    layout.setContentsMargins(16, 14, 16, 14)
+    layout.setSpacing(8)
+    intro = QLabel('거래·구매·창고 이동에 해당하는 변동을 체크하면 사냥 메소 계산에서 제외돼요.')
+    intro.setWordWrap(True)
+    layout.addWidget(intro)
+
+    boxes = []
+    for idx in range(len(balance.large_changes)):
+        label = f'{idx + 1}. {balance.describe_change(idx)}'
+        if suggestions.get(idx):
+            label += f' · JEV: {suggestions[idx]}'
+        box = QCheckBox(label)
+        box.setChecked(idx in balance.marked)
+        layout.addWidget(box)
+        boxes.append(box)
+
+    preview = QLabel()
+    preview.setStyleSheet('color:#a7f3d0; font-weight:600; padding-top:4px;')
+    layout.addWidget(preview)
+
+    def refresh_preview():
+        if balance.start is None or balance.end is None:
+            preview.setText('')
+            return
+        excluded = sum(
+            balance.large_changes[i] for i, box in enumerate(boxes) if box.isChecked()
+        )
+        net = balance.end - balance.start - excluded
+        extra = f' (거래·구매 {excluded:+,} 제외)' if excluded else ''
+        preview.setText(f'적용 후 사냥 메소: {net:+,}{extra}')
+
+    for box in boxes:
+        box.toggled.connect(refresh_preview)
+    refresh_preview()
+
+    actions = QHBoxLayout()
+    actions.addStretch()
+    save = QPushButton('적용')
+    cancel = QPushButton('취소')
+    save.clicked.connect(dialog.accept)
+    cancel.clicked.connect(dialog.reject)
+    actions.addWidget(save)
+    actions.addWidget(cancel)
+    layout.addLayout(actions)
+    if dialog.exec() == QDialog.DialogCode.Accepted:
+        return {i for i, box in enumerate(boxes) if box.isChecked()}
+    return None
+
+
 def summarize(csv_path):
     """One row per record; None when it has no usable hunting time."""
     csv_path = Path(csv_path)
@@ -334,18 +426,31 @@ def period_summary(rows, since):
     rate_seconds = sum(row['rate_seconds'] for row in rated)
     spots = by_memo(chosen)
     characters = {}
+    meso_total = 0
+    meso_seconds = 0.0
+    meso_count = 0
     for row in chosen:
         name = row['character_name'] or '캐릭터 미확인'
         characters[name] = characters.get(name, 0) + row['gained']
+        if row.get('meso') is not None:
+            meso_total += row['meso']
+            meso_count += 1
+            dur = row.get('meso_seconds') or row.get('active', 0)
+            if dur > 0:
+                meso_seconds += dur
     return dict(count=len(chosen), active=active, gained=sum(row['gained'] for row in chosen),
                 level_ups=sum(row.get('level_ups', 0) for row in chosen),
                 per_minute=rate_gain*60/rate_seconds if rate_seconds else None,
+                meso_total=meso_total if meso_count else None,
+                meso_per_hour=(meso_total*3600/meso_seconds if meso_count and meso_seconds > 0 else None),
+                meso_count=meso_count,
                 best_spot=spots[0] if spots else None,
                 characters=sorted(characters.items(), key=lambda item: -item[1]))
 
 
 def period_text(rows, now=None):
     from datetime import timedelta
+    import meso
     now = now or datetime.now()
     today = now.replace(hour=0, minute=0, second=0, microsecond=0)
     week = today - timedelta(days=today.weekday())
@@ -358,6 +463,11 @@ def period_text(rows, now=None):
                      f"획득 {summary['gained']:,} EXP")
         details = []
         if summary['per_minute'] is not None: details.append(f"분당 평균 {summary['per_minute']:,.0f}")
+        if summary['meso_total'] is not None:
+            meso_part = f"메소 {meso.format_short(summary['meso_total'])}"
+            if summary['meso_per_hour'] is not None:
+                meso_part += f" (시급 {meso.format_short(summary['meso_per_hour'])})"
+            details.append(meso_part)
         if summary['level_ups']: details.append(f"레벨업 {summary['level_ups']}회")
         if summary['best_spot']:
             spot, rate, _, count = summary['best_spot']
@@ -382,36 +492,59 @@ def comparable(rows):
     return (row for row in rows if row['per_minute'] is not None and not row['blocked'])
 
 
-def build_chart(rows):
-    """Per-minute efficiency over time; hover a point for its details."""
+def build_chart(rows, mode='exp'):
+    """Per-minute EXP or hourly meso efficiency over time; hover a point for its details."""
     from PySide6.QtCore import Qt, QPointF, QRectF
     from PySide6.QtGui import QColor, QPainter, QPen, QPainterPath
     from PySide6.QtWidgets import QWidget, QToolTip
+    import meso as meso_mod
     from qt_controller import short_exp
 
     class EfficiencyChart(QWidget):
-        LEFT, RIGHT, TOP, BOTTOM = 52, 12, 14, 24
+        LEFT, RIGHT, TOP, BOTTOM = 58, 12, 14, 24
 
-        def __init__(self, points):
+        def __init__(self, points, chart_mode):
             super().__init__()
             self.points = points  # oldest first
+            self.chart_mode = chart_mode
             self.setMinimumHeight(170); self.setMouseTracking(True)
-            total_gain = sum(r['rate_gain'] for r in points); total_time = sum(r['rate_seconds'] for r in points)
-            self.average = total_gain*60/total_time if total_time else 0
+            if chart_mode == 'meso':
+                total_meso = sum(r['meso'] for r in points)
+                total_sec = sum(r.get('meso_seconds') or r['active'] for r in points)
+                self.average = total_meso * 3600 / total_sec if total_sec else 0
+            else:
+                total_gain = sum(r['rate_gain'] for r in points); total_time = sum(r['rate_seconds'] for r in points)
+                self.average = total_gain*60/total_time if total_time else 0
+
+        def _val(self, row):
+            if self.chart_mode == 'meso':
+                sec = row.get('meso_seconds') or row['active']
+                return row['meso'] * 3600 / sec if sec else 0.0
+            return row['per_minute']
 
         def plot(self):
             return QRectF(self.LEFT, self.TOP, self.width()-self.LEFT-self.RIGHT,
                           self.height()-self.TOP-self.BOTTOM)
 
         def scale(self):
-            values = [r['per_minute'] for r in self.points]
-            high = max(values)*1.1 if values else 1
-            return 0.0, high or 1
+            values = [self._val(r) for r in self.points]
+            if not values:
+                return 0.0, 1.0
+            low = min(0.0, min(values) * 1.1) if self.chart_mode == 'meso' else 0.0
+            high = max(0.0, max(values) * 1.1) if self.chart_mode == 'meso' else (max(values) * 1.1)
+            if high - low < 1:
+                high = low + 1.0
+            return low, high
 
         def position(self, index, value):
             area, (low, high) = self.plot(), self.scale()
             x = area.left()+(area.width()*index/(len(self.points)-1) if len(self.points) > 1 else area.width()/2)
             return QPointF(x, area.bottom()-(value-low)/(high-low)*area.height())
+
+        def _fmt_axis(self, value):
+            if self.chart_mode == 'meso':
+                return meso_mod.format_short(value, signed=value < 0)
+            return short_exp(value)
 
         def paintEvent(self, event):
             painter = QPainter(self); painter.setRenderHint(QPainter.RenderHint.Antialiasing)
@@ -422,13 +555,17 @@ def build_chart(rows):
                 value = low+(high-low)*step/4; y = area.bottom()-area.height()*step/4
                 painter.setPen(QPen(QColor('#2b3542'), 1)); painter.drawLine(QPointF(area.left(), y), QPointF(area.right(), y))
                 painter.setPen(QColor('#84919f'))
-                painter.drawText(QRectF(0, y-8, self.LEFT-6, 16), Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter, short_exp(value))
+                painter.drawText(QRectF(0, y-8, self.LEFT-6, 16), Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter, self._fmt_axis(value))
             if not self.points:
-                painter.drawText(area, Qt.AlignmentFlag.AlignCenter, '기록 없음'); return
+                empty_msg = '메소 확인 기록 없음' if self.chart_mode == 'meso' else '기록 없음'
+                painter.drawText(area, Qt.AlignmentFlag.AlignCenter, empty_msg); return
+            if self.chart_mode == 'meso' and low < 0 < high:
+                zero_y = self.position(0, 0).y()
+                painter.setPen(QPen(QColor('#5c6f82'), 1))
+                painter.drawLine(QPointF(area.left(), zero_y), QPointF(area.right(), zero_y))
             previous, last_label = None, -1e9
             for index, row in enumerate(self.points):  # level changes and date labels
                 x = self.position(index, 0).x()
-                # Skip level markers that would overlap the last one drawn.
                 if previous is not None and row['level'] != previous and x-last_label >= 56:
                     painter.setPen(QPen(QColor('#3d4b5a'), 1, Qt.PenStyle.DotLine))
                     painter.drawLine(QPointF(x, area.top()), QPointF(x, area.bottom()))
@@ -449,18 +586,26 @@ def build_chart(rows):
                 y = self.position(0, self.average).y()
                 painter.setPen(QPen(QColor('#e8d9a8'), 1, Qt.PenStyle.DashLine))
                 painter.drawLine(QPointF(area.left(), y), QPointF(area.right(), y))
-                label = QRectF(area.left()+4, y-17, 130, 15)
+                label = QRectF(area.left()+4, max(area.top(), y-17), 160, 15)
                 painter.fillRect(label, QColor(27, 35, 48, 220))
-                painter.drawText(label, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, f'전체 평균 {self.average:,.0f}')
+                avg_text = (f'평균 시급 {meso_mod.format_short(self.average)}' if self.chart_mode == 'meso'
+                            else f'전체 평균 {self.average:,.0f}')
+                painter.drawText(label, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, avg_text)
             path = QPainterPath()
             for index, row in enumerate(self.points):
-                point = self.position(index, row['per_minute'])
+                point = self.position(index, self._val(row))
                 path.moveTo(point) if index == 0 else path.lineTo(point)
-            painter.setPen(QPen(QColor('#8fe0a8'), 2)); painter.drawPath(path)
+            line_color = QColor('#fde68a') if self.chart_mode == 'meso' else QColor('#8fe0a8')
+            painter.setPen(QPen(line_color, 2)); painter.drawPath(path)
             for index, row in enumerate(self.points):
-                point = self.position(index, row['per_minute'])
-                short = row['active'] < 300  # under 5 minutes: noisy, draw faint
-                painter.setBrush(QColor('#4f6b5a' if short else '#b4e9c6')); painter.setPen(Qt.PenStyle.NoPen)
+                val = self._val(row)
+                point = self.position(index, val)
+                short = (row.get('meso_seconds') or row['active']) < 300
+                if self.chart_mode == 'meso':
+                    dot = QColor('#f59e0b' if val < 0 else '#7a6f45' if short else '#fde68a')
+                else:
+                    dot = QColor('#4f6b5a' if short else '#b4e9c6')
+                painter.setBrush(dot); painter.setPen(Qt.PenStyle.NoPen)
                 painter.drawEllipse(point, 3 if short else 4, 3 if short else 4)
 
         def mouseMoveEvent(self, event):
@@ -470,10 +615,21 @@ def build_chart(rows):
             row = self.points[index]
             when = row['started'].strftime('%m/%d %H:%M') if row['started'] else row['session_id']
             memo = f" · {row['memo']}" if row.get('memo') else ''
-            QToolTip.showText(event.globalPosition().toPoint(),
-                f"{when} · Lv.{row['level']}{memo}\n분당 {row['per_minute']:,.0f} · 순수 사냥 {clock(row['active'])}", self)
+            if self.chart_mode == 'meso':
+                sec = row.get('meso_seconds') or row['active']
+                hourly = self._val(row)
+                QToolTip.showText(
+                    event.globalPosition().toPoint(),
+                    f"{when} · Lv.{row['level']}{memo}\n"
+                    f"메소 {row['meso']:+,} · 시간당 {hourly:+,.0f} · 구간 {clock(sec)}", self)
+            else:
+                QToolTip.showText(event.globalPosition().toPoint(),
+                    f"{when} · Lv.{row['level']}{memo}\n분당 {row['per_minute']:,.0f} · 순수 사냥 {clock(row['active'])}", self)
 
-    return EfficiencyChart(list(reversed(list(comparable(rows)))))
+    if mode == 'meso':
+        meso_rows = [r for r in rows if r.get('meso') is not None and (r.get('meso_seconds') or r.get('active', 0)) > 0]
+        return EfficiencyChart(list(reversed(meso_rows)), 'meso')
+    return EfficiencyChart(list(reversed(list(comparable(rows)))), 'exp')
 
 
 def change_text(changes):
@@ -535,29 +691,41 @@ QHeaderView::section {background:#25303d; color:#b8c4d0; border:none; padding:6p
 def stat_card(title):
     """A summary card; returns (frame, update(summary, label)) for the filtered rows."""
     from PySide6.QtWidgets import QFrame, QGridLayout, QLabel, QVBoxLayout
+    import meso as meso_mod
     from qt_controller import short_exp
     frame = QFrame(); frame.setObjectName('card')
     layout = QVBoxLayout(frame); layout.setContentsMargins(14, 10, 14, 10); layout.setSpacing(4)
     heading = QLabel(); heading.setObjectName('cardTitle'); layout.addWidget(heading)
-    grid = QGridLayout(); grid.setHorizontalSpacing(24); grid.setVerticalSpacing(0)
+    grid = QGridLayout(); grid.setHorizontalSpacing(18); grid.setVerticalSpacing(0)
     values = []
-    for column, name in enumerate(('획득 EXP', '분당 평균', '순수 사냥', '레벨업')):
+    for column, name in enumerate(('획득 EXP', '분당 평균', '메소', '순수 사냥', '레벨업')):
         value = QLabel(); value.setObjectName('statMain' if column == 0 else 'stat')
+        if column == 2:
+            value.setStyleSheet('color:#fde68a; font-size:16px; font-weight:600;')
         caption = QLabel(name); caption.setObjectName('statName')
         grid.addWidget(value, 0, column); grid.addWidget(caption, 1, column); values.append(value)
-    grid.setColumnStretch(4, 1)
+    grid.setColumnStretch(5, 1)
     layout.addLayout(grid)
     best = QLabel(); best.setObjectName('best'); layout.addWidget(best)
 
     def update(summary):
         heading.setText(f"{title} · {summary['count']}회" if summary['count'] else f'{title} · 사냥 기록 없음')
         rate = summary['per_minute']
+        meso_total = summary.get('meso_total')
         texts = (short_exp(summary['gained']) if summary['count'] else '—',
                  f'{rate:,.0f}' if rate is not None else '—',
+                 meso_mod.format_short(meso_total) if meso_total is not None else '—',
                  clock(summary['active']) if summary['count'] else '—',
                  f"{summary['level_ups']}회" if summary['count'] else '—')
         for label, text in zip(values, texts): label.setText(text)
         values[0].setToolTip(f"{summary['gained']:,} EXP")
+        if meso_total is not None:
+            tip = f"{meso_total:+,} 메소 ({summary.get('meso_count', 0)}건)"
+            if summary.get('meso_per_hour') is not None:
+                tip += f" · 평균 시급 {summary['meso_per_hour']:+,.0f}"
+            values[2].setToolTip(tip)
+        else:
+            values[2].setToolTip('확인된 메소 기록 없음')
         if summary['best_spot']:
             spot, spot_rate, _, _ = summary['best_spot']
             best.setText(f'🏆 최고 효율 · {spot} (분당 {spot_rate:,.0f})')
@@ -721,19 +889,185 @@ def row_details(row, buff_times):
     return '\n'.join(lines)
 
 
+def show_session_detail(parent, row, *, base=None, on_meso_changed=None):
+    """Show a session's meso timeline chart and post-hunt large-change classifier."""
+    from PySide6.QtCore import Qt, QPointF, QRectF
+    from PySide6.QtGui import QColor, QPainter, QPainterPath, QPen
+    from PySide6.QtWidgets import QDialog, QHBoxLayout, QLabel, QPushButton, QVBoxLayout, QWidget, QToolTip
+    import meso as meso_mod
+    from qt_controller import short_exp
+
+    balance = load_session_meso(row['session_id'], base)
+    dialog = QDialog(parent)
+    dialog.setWindowTitle('세션 상세 · 메소 타임라인')
+    dialog.setStyleSheet(STYLE + 'QPushButton {background:#25303d; color:#e8f0f6; border:1px solid #35465b; border-radius:6px; padding:5px 12px;}')
+    dialog.resize(620, 400)
+    layout = QVBoxLayout(dialog)
+    layout.setContentsMargins(16, 14, 16, 14)
+    layout.setSpacing(10)
+
+    when = row['started'].strftime('%Y-%m-%d %H:%M') if row.get('started') else row['session_id']
+    spot = f" · {row['memo']}" if row.get('memo') else ''
+    char = row.get('character_name') or '캐릭터 미확인'
+    header = QLabel(f"{when} · {char} · Lv.{row.get('level') or '—'}{spot}")
+    header.setObjectName('title')
+    layout.addWidget(header)
+
+    summary_label = QLabel()
+    summary_label.setWordWrap(True)
+    layout.addWidget(summary_label)
+
+    class MesoTimelineChart(QWidget):
+        LEFT, RIGHT, TOP, BOTTOM = 62, 16, 16, 26
+
+        def __init__(self, bal):
+            super().__init__()
+            self.balance = bal
+            self.setMinimumHeight(200)
+            self.setMouseTracking(True)
+
+        def points(self):
+            if self.balance is None or len(self.balance.checkpoints) < 2:
+                return []
+            base_val = self.balance.checkpoints[0][1]
+            return [(t, v - base_val, v) for t, v in self.balance.checkpoints]
+
+        def plot(self):
+            return QRectF(self.LEFT, self.TOP, self.width() - self.LEFT - self.RIGHT,
+                          self.height() - self.TOP - self.BOTTOM)
+
+        def scale(self, pts):
+            ys = [d for _, d, _ in pts]
+            low, high = min(0.0, min(ys) * 1.1), max(0.0, max(ys) * 1.1)
+            if high - low < 1:
+                high = low + 1.0
+            max_t = max(pts[-1][0] - pts[0][0], 1.0)
+            return pts[0][0], max_t, low, high
+
+        def paintEvent(self, event):
+            painter = QPainter(self)
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+            area = self.plot()
+            painter.fillRect(self.rect(), QColor('#1b2330'))
+            pts = self.points()
+            if not pts:
+                painter.setPen(QColor('#84919f'))
+                painter.drawText(area, Qt.AlignmentFlag.AlignCenter,
+                                 '이 기록에는 저장된 메소 타임라인이 없어요 (1.4.36 이후 기록부터 저장)')
+                return
+            t0, span, low, high = self.scale(pts)
+            for step in range(5):
+                val = low + (high - low) * step / 4
+                y = area.bottom() - area.height() * step / 4
+                painter.setPen(QPen(QColor('#2b3542'), 1))
+                painter.drawLine(QPointF(area.left(), y), QPointF(area.right(), y))
+                painter.setPen(QColor('#84919f'))
+                painter.drawText(QRectF(0, y - 8, self.LEFT - 6, 16),
+                                 Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
+                                 meso_mod.format_short(val))
+            if low < 0 < high:
+                zero_y = area.bottom() - (0 - low) / (high - low) * area.height()
+                painter.setPen(QPen(QColor('#5c6f82'), 1))
+                painter.drawLine(QPointF(area.left(), zero_y), QPointF(area.right(), zero_y))
+            # Draw large-change markers.
+            for idx, detail in enumerate(self.balance.large_change_details):
+                when_active = detail.get('active')
+                if isinstance(when_active, (int, float)):
+                    x = area.left() + max(0.0, min(1.0, (when_active - t0) / span)) * area.width()
+                    color = '#84919f' if idx in self.balance.marked else '#f59e0b'
+                    painter.setPen(QPen(QColor(color), 1, Qt.PenStyle.DashLine))
+                    painter.drawLine(QPointF(x, area.top()), QPointF(x, area.bottom()))
+            path = QPainterPath()
+            for i, (t, delta, _) in enumerate(pts):
+                x = area.left() + (t - t0) / span * area.width()
+                y = area.bottom() - (delta - low) / (high - low) * area.height()
+                path.moveTo(x, y) if i == 0 else path.lineTo(x, y)
+            painter.setPen(QPen(QColor('#fde68a'), 2))
+            painter.drawPath(path)
+            painter.setPen(QColor('#84919f'))
+            painter.drawText(QRectF(area.left(), area.bottom() + 4, 60, 16), Qt.AlignmentFlag.AlignLeft, clock(t0))
+            painter.drawText(QRectF(area.right() - 60, area.bottom() + 4, 60, 16), Qt.AlignmentFlag.AlignRight, clock(t0 + span))
+
+        def mouseMoveEvent(self, event):
+            pts = self.points()
+            if not pts:
+                return
+            area = self.plot()
+            t0, span, _, _ = self.scale(pts)
+            x = event.position().x()
+            nearest = min(pts, key=lambda p: abs(area.left() + (p[0] - t0) / span * area.width() - x))
+            QToolTip.showText(event.globalPosition().toPoint(),
+                              f"사냥 {clock(nearest[0])} · 잔액 {nearest[2]:,} ({nearest[1]:+,})", self)
+
+    chart = MesoTimelineChart(balance)
+    layout.addWidget(chart, 1)
+
+    def refresh_header():
+        exp_line = f"순수 사냥 {clock(row['active'])} · 획득 {short_exp(row['gained'])} EXP"
+        if row.get('per_minute'):
+            exp_line += f" (분당 {row['per_minute']:,.0f})"
+        if balance is not None and balance.hunted() is not None:
+            sec = balance.measured_seconds(row['active']) or row['active']
+            hunted = balance.hunted()
+            hourly = hunted * 3600 / sec if sec else 0
+            excluded = balance.excluded_trade()
+            meso_line = (f"메소 {hunted:+,} (시작 {balance.start:,} → 종료 {balance.end:,}) · "
+                         f"시간당 {meso_mod.format_short(hourly)}")
+            if excluded:
+                meso_line += f" · 거래·구매 {excluded:+,} 제외"
+        else:
+            meso_line = '메소 · 시작·종료 잔액 미확인'
+        summary_label.setText(exp_line + '\n' + meso_line)
+
+    refresh_header()
+
+    footer = QHBoxLayout()
+    classify_btn = QPushButton('큰 메소 변동 분류…')
+    classify_btn.setVisible(balance is not None and bool(balance.large_changes))
+
+    def do_classify():
+        nonlocal balance
+        if balance is None or not balance.large_changes:
+            return
+        result = classify_meso_dialog(dialog, balance, title='저장된 기록의 큰 메소 변동 분류')
+        if result is None:
+            return
+        try:
+            balance = save_meso_marks(row['session_id'], result, base)
+        except (OSError, ValueError) as exc:
+            tracker.log_error('저장된 메소 변동 분류', exc)
+            return
+        chart.balance = balance
+        chart.update()
+        refresh_header()
+        if on_meso_changed is not None:
+            on_meso_changed()
+
+    classify_btn.clicked.connect(do_classify)
+    footer.addWidget(classify_btn)
+    footer.addStretch()
+    close_btn = QPushButton('닫기')
+    close_btn.clicked.connect(dialog.accept)
+    footer.addWidget(close_btn)
+    layout.addLayout(footer)
+    dialog.exec()
+
+
 def build_dialog(controller):
     from datetime import timedelta
     from PySide6.QtCore import Qt, QTimer
     from PySide6.QtGui import QColor
     from PySide6.QtWidgets import (QDialog, QVBoxLayout, QLabel, QTableWidget, QTableWidgetItem,
                                    QHeaderView, QAbstractItemView, QComboBox, QHBoxLayout,
-                                   QInputDialog, QLineEdit, QMenu, QTabWidget, QWidget)
+                                   QInputDialog, QLineEdit, QMenu, QPushButton, QTabWidget, QWidget)
     from qt_controller import short_exp
     dialog = QDialog(controller.window)
     dialog.setWindowTitle('사냥 기록 비교')
     dialog.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
     dialog.resize(1040, 760)
-    dialog.setStyleSheet(STYLE + 'QLineEdit, QComboBox {background:#25303d; color:#e8f0f6; border:1px solid #35465b; border-radius:6px; padding:4px 8px;}')
+    dialog.setStyleSheet(STYLE + 'QLineEdit, QComboBox {background:#25303d; color:#e8f0f6; border:1px solid #35465b; border-radius:6px; padding:4px 8px;}'
+                         ' QPushButton#seg {background:#1f2937; color:#9aa8b6; border:1px solid #35465b; border-radius:6px; padding:3px 10px;}'
+                         ' QPushButton#seg:checked {background:#2a4a38; color:#e8f0f6; border-color:#8fe0a8;}')
     layout = QVBoxLayout(dialog); layout.setContentsMargins(16, 14, 16, 12); layout.setSpacing(10)
     all_rows = collect()
     character_names = []
@@ -785,6 +1119,12 @@ def build_dialog(controller):
     tabs = QTabWidget(); tabs.setDocumentMode(True); tabs.tabBar().setDrawBase(False)
     records_page = QWidget(); records_layout = QVBoxLayout(records_page)
     records_layout.setContentsMargins(0, 10, 0, 0); records_layout.setSpacing(8)
+    chart_mode = 'exp'
+    chart_bar = QHBoxLayout(); chart_bar.setSpacing(6)
+    chart_exp_btn = QPushButton('경험치 (분당)'); chart_exp_btn.setObjectName('seg'); chart_exp_btn.setCheckable(True); chart_exp_btn.setChecked(True)
+    chart_meso_btn = QPushButton('메소 (시간당)'); chart_meso_btn.setObjectName('seg'); chart_meso_btn.setCheckable(True)
+    chart_bar.addWidget(chart_exp_btn); chart_bar.addWidget(chart_meso_btn); chart_bar.addStretch()
+    records_layout.addLayout(chart_bar)
     chart_layout = QVBoxLayout(); records_layout.addLayout(chart_layout)
     headers = ['날짜', '캐릭터', 'Lv', '순수 사냥', '획득', '분당', '관측 중 사냥', '메소', '사냥터 메모']
     memo_column = len(headers)-1
@@ -804,13 +1144,18 @@ def build_dialog(controller):
     empty = QLabel('표시할 사냥 기록이 아직 없어요.'); empty.setObjectName('hint')
     records_layout.addWidget(empty)
     hint = QLabel('ⓘ 줄에 마우스를 올리면 휴식 · 인식 공백 · 시간당 · 효율 변화 · 경험치 버프가 보여요. '
-                  '캐릭터와 사냥터 메모는 두 번 눌러 고치고, 여러 줄을 고른 뒤 오른쪽 클릭하면 한꺼번에 바꿔요. '
-                  '인식 공백의 시간과 경험치는 효율에서 제외해요.')
+                  '캐릭터와 사냥터 메모는 두 번 눌러 고치고, 다른 칸을 두 번 누르거나 오른쪽 클릭하면 세션 상세·큰 메소 변동 분류를 열 수 있어요.')
     hint.setObjectName('hint'); hint.setWordWrap(True); records_layout.addWidget(hint)
     tabs.addTab(records_page, '기록')
 
+    spot_sort = 'exp'
     spot_table = spot_ranking_table()
-    spot_page = QWidget(); spot_layout = QVBoxLayout(spot_page); spot_layout.setContentsMargins(0, 10, 0, 0)
+    spot_page = QWidget(); spot_layout = QVBoxLayout(spot_page); spot_layout.setContentsMargins(0, 10, 0, 0); spot_layout.setSpacing(6)
+    spot_bar = QHBoxLayout(); spot_bar.setSpacing(6)
+    spot_exp_btn = QPushButton('분당 EXP순'); spot_exp_btn.setObjectName('seg'); spot_exp_btn.setCheckable(True); spot_exp_btn.setChecked(True)
+    spot_meso_btn = QPushButton('시간당 메소순'); spot_meso_btn.setObjectName('seg'); spot_meso_btn.setCheckable(True)
+    spot_bar.addWidget(spot_exp_btn); spot_bar.addWidget(spot_meso_btn); spot_bar.addStretch()
+    spot_layout.addLayout(spot_bar)
     spot_layout.addWidget(spot_table, 1)
     spot_hint = QLabel('띄어쓰기만 다른 사냥터 이름은 하나로 묶어요. 사냥터 메모를 적은 기록만 나와요.')
     spot_hint.setObjectName('hint'); spot_layout.addWidget(spot_hint)
@@ -823,8 +1168,31 @@ def build_dialog(controller):
 
     def refresh_spots():
         ranked = by_memo_detailed(rows)
+        if spot_sort == 'meso':
+            ranked = sorted(ranked, key=lambda item: (item[4] is None, -(item[4] or 0), -item[1]))
         fill_spot_ranking(spot_table, ranked)
         tabs.setTabText(1, f'사냥터별 {len(ranked)}')
+
+    def set_chart_mode(mode):
+        nonlocal chart_mode
+        chart_mode = mode
+        chart_exp_btn.setChecked(mode == 'exp')
+        chart_meso_btn.setChecked(mode == 'meso')
+        if chart_layout.count():
+            chart_layout.takeAt(0).widget().deleteLater()
+        chart_layout.addWidget(build_chart(rows, mode=chart_mode))
+
+    def set_spot_sort(mode):
+        nonlocal spot_sort
+        spot_sort = mode
+        spot_exp_btn.setChecked(mode == 'exp')
+        spot_meso_btn.setChecked(mode == 'meso')
+        refresh_spots()
+
+    chart_exp_btn.clicked.connect(lambda: set_chart_mode('exp'))
+    chart_meso_btn.clicked.connect(lambda: set_chart_mode('meso'))
+    spot_exp_btn.clicked.connect(lambda: set_spot_sort('exp'))
+    spot_meso_btn.clicked.connect(lambda: set_spot_sort('meso'))
 
     def refresh_summary():
         now = datetime.now()
@@ -884,6 +1252,29 @@ def build_dialog(controller):
         text, accepted = QInputDialog.getItem(dialog, title, label, options or [''], 0, True)
         return text if accepted else None
 
+    def reload_all_rows():
+        nonlocal all_rows
+        all_rows = collect()
+        populate_picker(character_picker.currentData())
+        render_records()
+
+    def classify_saved_meso(row):
+        balance = load_session_meso(row['session_id'])
+        if balance is None or not balance.large_changes:
+            return
+        result = classify_meso_dialog(dialog, balance, title='저장된 기록의 큰 메소 변동 분류')
+        if result is None:
+            return
+        try:
+            save_meso_marks(row['session_id'], result)
+        except (OSError, ValueError) as exc:
+            tracker.log_error('저장된 메소 변동 분류', exc)
+            return
+        reload_all_rows()
+
+    def open_detail(row):
+        show_session_detail(dialog, row, on_meso_changed=reload_all_rows)
+
     def context_menu(position):
         clicked = table.indexAt(position)
         if clicked.isValid() and not table.selectionModel().isRowSelected(clicked.row(), clicked.parent()):
@@ -893,13 +1284,25 @@ def build_dialog(controller):
         count = len(session_ids)
         chosen = [row for row in rows if row['session_id'] in session_ids]
         menu = QMenu(table)
+        detail_action = None
+        classify_action = None
+        if count == 1:
+            detail_action = menu.addAction('세션 상세 그래프 보기…')
+            if chosen[0].get('meso_large_changes'):
+                classify_action = menu.addAction(f"큰 메소 변동 분류 ({chosen[0]['meso_large_changes']}건)…")
+            if hasattr(menu, 'addSeparator'):
+                menu.addSeparator()
         character_action = menu.addAction(f'캐릭터 이름 바꾸기 ({count}개 기록)…')
         spot_action = menu.addAction(f'사냥터 메모 바꾸기 ({count}개 기록)…')
         reset_action = None
         if any(row['character_name'] != row['detected_character'] for row in chosen):
             reset_action = menu.addAction('캐릭터 이름을 자동 인식 값으로 되돌리기')
         action = menu.exec(table.viewport().mapToGlobal(position))
-        if action is character_action:
+        if detail_action is not None and action is detail_action:
+            open_detail(chosen[0])
+        elif classify_action is not None and action is classify_action:
+            classify_saved_meso(chosen[0])
+        elif action is character_action:
             current = chosen[0]['character_name'] or ''
             name = ask_name('캐릭터 이름', f'{count}개 기록의 캐릭터 이름 (비우면 자동 인식 값)',
                             character_names, current)
@@ -912,8 +1315,13 @@ def build_dialog(controller):
         elif reset_action is not None and action is reset_action:
             rename_characters(session_ids, '')
 
+    def double_clicked(row_index, column):
+        if column not in editable_columns and 0 <= row_index < len(rows):
+            open_detail(rows[row_index])
+
     table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
     table.customContextMenuRequested.connect(context_menu)
+    table.cellDoubleClicked.connect(double_clicked)
 
     rows = []
 
@@ -923,7 +1331,7 @@ def build_dialog(controller):
                            period=period_picker.currentData(), query=search_input.text())
         if chart_layout.count():
             chart_layout.takeAt(0).widget().deleteLater()
-        chart_layout.addWidget(build_chart(rows))
+        chart_layout.addWidget(build_chart(rows, mode=chart_mode))
         levels = level_ranking(rows)
         fill_ranking(level_table, levels)
         tabs.setTabText(0, f'기록 {len(rows)}')

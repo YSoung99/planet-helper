@@ -219,6 +219,20 @@ class JevMixin:
                                     full_screen=True, label='효율 변화')
         return None
 
+    def meso_change_suggestion(self, index, delta):
+        """JEV's cause hint for a large meso change ('거래·구매·창고' or '사냥 획득'), or None."""
+        if not self.jev_enabled or not self.running:
+            return None
+        question = ('meso_change', self.session.session_id, index)
+        found, verdict = self.jev_arbiter.answer(question)
+        if found:
+            return verdict
+        frame = self.jev_frames.latest()
+        if frame is not None:
+            self.jev_arbiter.submit(question, lambda: jev_assist.ask_meso_change(frame, delta),
+                                    full_screen=True, label='큰 메소 변동')
+        return None
+
     def apply_jev_hints(self, now):
         """Show JEV answers for the current measurement and start the questions that are due."""
         session = self.session

@@ -198,3 +198,23 @@ def ask_inventory(frame):
 def quadrant_region(key):
     """Normalized (left, top, right, bottom) of a quarter, overlapping the middle of the screen."""
     return QUADRANTS[key][1]
+
+
+# ---- large meso change cause: shop/trade/storage vs normal hunting ----
+
+MESO_CHANGE_CHOICES = [
+    ('A shop, NPC merchant, player trade window, storage, auction or item purchase UI is visible', '거래·구매·창고'),
+    ('Normal monster hunting in a field with no shop, trade or storage window open', '사냥 획득'),
+]
+
+
+def ask_meso_change(frame, delta):
+    """Ask JEV whether a large meso jump happened in a shop/trade/storage UI or while hunting."""
+    direction = f'+{delta:,}' if delta >= 0 else f'{delta:,}'
+    return _pick(
+        [('Game screen near the meso change', frame)],
+        f'The player meso balance changed suddenly by {direction}. '
+        'Does the screen show a shop, trade, storage or purchase window, or normal hunting?',
+        MESO_CHANGE_CHOICES,
+        'JEV 큰 메소 변동',
+    )

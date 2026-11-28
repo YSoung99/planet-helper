@@ -133,7 +133,7 @@ HANGUL = re.compile('[가-힣]')
 def recognize_amount(crop, *, allow_hangul=False):
     import map_name
 
-    lines = map_name.recognize_lines(crop, detect=False)
+    lines = map_name.recognize_lines(crop, detect=False, digits_only=not allow_hangul)
     if len(lines) != 1:
         return None
     text, score = lines[0]
@@ -266,6 +266,7 @@ class Reader:
         self.box = None
         self.cached = None
         self.last_glyphs = None
+        self.label_verified = None
         self.needs_recheck = False
         self.rejected = {}
         self.arbiter = arbiter
@@ -280,6 +281,7 @@ class Reader:
         self.box = None
         self.cached = None
         self.last_glyphs = None
+        self.label_verified = None
         self.rejected.clear()
         self.hinted = None
 
@@ -290,6 +292,20 @@ class Reader:
         region = frame.crop((max(0, x - reach), max(0, y - 3),
                              min(frame.width, x + w + reach), min(frame.height, y + h + 3)))
         return frame.size, hashlib.blake2b(region.tobytes(), digest_size=16).digest()
+
+    @staticmethod
+    def label_signature(frame, box):
+        """Hash only the left and right label strips outside the changing numeric field."""
+        x, y, w, h = box
+        reach = round(h * 2.6)
+        top, bottom = max(0, y - 3), min(frame.height, y + h + 3)
+        left_strip = frame.crop((max(0, x - reach), top, x, bottom))
+        right_strip = frame.crop((x + w, top, min(frame.width, x + w + reach), bottom))
+        digest = hashlib.blake2b(digest_size=16)
+        digest.update(left_strip.tobytes())
+        digest.update(b'|')
+        digest.update(right_strip.tobytes())
+        return frame.size, box, digest.digest()
 
     @staticmethod
     def preview_crop(frame, box):
@@ -442,30 +458,39 @@ class Reader:
         value = self.last_glyphs[1] if reuse else read_amount(frame, box)
         if value is None:
             value = read_gray_amount(glyphs)
-        if value is not None and (not require_label or has_label(frame, box)):
-            self.box = box
-            self.last_crop = self.preview_crop(frame, box)
-            if not reuse:
-                binary = read_binary_amount(glyphs)
-                if binary != value:
-                    judged = self.judge(glyphs, key, value, binary)
-                    if judged is None:
-                        self.needs_recheck = True
-                        b_text = '없음' if binary is None else f'{binary:,}'
-                        self.last_diag = {
-                            'mode': mode, 'status': 'recheck',
-                            'reason': f'원본({value:,}) / 흑백({b_text}) 불일치 · 재확인 중',
-                            'frame_size': frame.size, 'box': box, 'value': None,
-                            'candidates': (value, binary),
-                        }
-                        return None
-                    value = judged
-            self.last_glyphs = key, value
-            self.cached = signature, value
-            self.last_diag = {'mode': mode, 'status': 'ok',
-                              'reason': f'{"수동 영역" if mode == "manual" else "인벤토리"} 메소 인식 ({value:,})',
-                              'frame_size': frame.size, 'box': box, 'value': value}
-            return value
+        if value is not None:
+            label_ok = not require_label
+            if require_label:
+                label_sig = self.label_signature(frame, box)
+                if self.label_verified == label_sig:
+                    label_ok = True
+                elif has_label(frame, box):
+                    self.label_verified = label_sig
+                    label_ok = True
+            if label_ok:
+                self.box = box
+                self.last_crop = self.preview_crop(frame, box)
+                if not reuse:
+                    binary = read_binary_amount(glyphs)
+                    if binary != value:
+                        judged = self.judge(glyphs, key, value, binary)
+                        if judged is None:
+                            self.needs_recheck = True
+                            b_text = '없음' if binary is None else f'{binary:,}'
+                            self.last_diag = {
+                                'mode': mode, 'status': 'recheck',
+                                'reason': f'원본({value:,}) / 흑백({b_text}) 불일치 · 재확인 중',
+                                'frame_size': frame.size, 'box': box, 'value': None,
+                                'candidates': (value, binary),
+                            }
+                            return None
+                        value = judged
+                self.last_glyphs = key, value
+                self.cached = signature, value
+                self.last_diag = {'mode': mode, 'status': 'ok',
+                                  'reason': f'{"수동 영역" if mode == "manual" else "인벤토리"} 메소 인식 ({value:,})',
+                                  'frame_size': frame.size, 'box': box, 'value': value}
+                return value
         if require_label:
             self.rejected.pop(box, None)
             if len(self.rejected) >= self.MAX_REJECTED:
@@ -647,7 +672,21 @@ class SessionMeso:
             else:
                 self.start_active = self.end_active = None
         self.checkpoints = []
-        self.large_change_times = []
+        raw_timeline = data.get('timeline')
+        if isinstance(raw_timeline, list):
+            for pt in raw_timeline:
+                if (isinstance(pt, (list, tuple)) and len(pt) == 2
+                        and isinstance(pt[0], (int, float)) and type(pt[1]) is int and pt[0] >= 0 and pt[1] >= 0):
+                    self.checkpoints.append((float(pt[0]), pt[1]))
+        raw_details = data.get('large_change_details')
+        self.large_change_details = []
+        if isinstance(raw_details, list) and len(raw_details) == len(self.large_changes):
+            for entry in raw_details:
+                if isinstance(entry, dict) and type(entry.get('amount')) is int:
+                    self.large_change_details.append(dict(entry))
+        self.large_change_times = [
+            entry.get('active') for entry in self.large_change_details
+        ] if len(self.large_change_details) == len(self.large_changes) else []
         self.seeded = False
         self.source = self.last_seen = self.opening = None
         self.source_changed = False
@@ -700,19 +739,45 @@ class SessionMeso:
         self._record_checkpoint(active_seconds, value)
         return True
 
-    def observe(self, value, threshold=TRADE_THRESHOLD, *, active_seconds=None):
+    def observe(self, value, threshold=TRADE_THRESHOLD, *, active_seconds=None, when=None):
         if self.start is None:
             self.start = value
         elif abs(value - self.end) > threshold:
-            self.large_changes.append(value - self.end)
-            self.large_change_times.append(
-                max(0.0, float(active_seconds)) if active_seconds is not None else self.end_active)
+            delta = value - self.end
+            active_val = max(0.0, float(active_seconds)) if active_seconds is not None else self.end_active
+            self.large_changes.append(delta)
+            self.large_change_times.append(active_val)
+            if active_seconds is not None or when is not None:
+                while len(self.large_change_details) < len(self.large_changes) - 1:
+                    prev_idx = len(self.large_change_details)
+                    self.large_change_details.append({'amount': self.large_changes[prev_idx]})
+                detail = {'amount': delta, 'before': self.end, 'after': value}
+                if active_val is not None:
+                    detail['active'] = round(active_val, 1)
+                if when is not None:
+                    detail['at'] = when.strftime('%H:%M:%S') if hasattr(when, 'strftime') else str(when)
+                self.large_change_details.append(detail)
         self.end = value
         self.readings += 1
         self._record_checkpoint(active_seconds, value)
 
+    def describe_change(self, index):
+        """Human-readable label for a large change, using stored metadata when available."""
+        amount = self.large_changes[index]
+        detail = self.large_change_details[index] if index < len(self.large_change_details) else None
+        if isinstance(detail, dict) and 'before' in detail and 'after' in detail:
+            prefix_parts = []
+            if detail.get('at'):
+                prefix_parts.append(str(detail['at'])[:5])
+            if isinstance(detail.get('active'), (int, float)):
+                mins = int(detail['active'] // 60)
+                prefix_parts.append(f'{mins}분')
+            prefix = f"{' · '.join(prefix_parts)} | " if prefix_parts else ''
+            return f"{prefix}{amount:+,} ({format_short(detail['before'], signed=False)} → {format_short(detail['after'], signed=False)})"
+        return f'{amount:+,}'
+
     def sample(self, value, source, stamp, opening, started, threshold, *,
-               first_seen=None, active_seconds=None):
+               first_seen=None, active_seconds=None, when=None):
         if self.source is None:
             if started is not None and stamp < started:
                 return False
@@ -726,7 +791,7 @@ class SessionMeso:
         changed = (self.start is None or value != self.end or opening != self.opening
                    or continuous_ready)
         if changed:
-            self.observe(value, threshold, active_seconds=active_seconds)
+            self.observe(value, threshold, active_seconds=active_seconds, when=when)
         elif active_seconds is not None:
             self._record_checkpoint(active_seconds, value)
         self.last_seen, self.opening = stamp, opening
@@ -826,8 +891,16 @@ class SessionMeso:
         data = {'start': self.start, 'end': self.end, 'trade': self.trade, 'readings': self.readings}
         if not self.legacy:
             data.update(complete=self.complete, large_changes=self.large_changes, marked=sorted(self.marked))
+            if self.large_change_details and len(self.large_change_details) == len(self.large_changes):
+                data['large_change_details'] = [dict(d) for d in self.large_change_details]
             if self.start_active is not None and self.end_active is not None:
                 data['start_active'] = round(self.start_active, 2)
                 data['end_active'] = round(self.end_active, 2)
                 data['measured_seconds'] = round(max(0.0, self.end_active - self.start_active), 2)
+                if len(self.checkpoints) >= 2:
+                    pts = self.checkpoints
+                    if len(pts) > 120:
+                        step = max(1, (len(pts) - 2) // 118)
+                        pts = [pts[0]] + pts[1:-1:step] + [pts[-1]]
+                    data['timeline'] = [[round(t, 1), v] for t, v in pts]
         return data

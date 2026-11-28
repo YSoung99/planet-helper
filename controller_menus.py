@@ -333,17 +333,30 @@ class MenuAndSettingsMixin:
 
     def classify_meso_change(self):
         balance = self.session.meso
-        if not self.running or not balance.large_changes:
+        if not balance.large_changes:
             self.status.set('이번 측정에서 분류할 큰 메소 변동이 없어요')
             return
-        options = [f'{i + 1}. {amount:+,} · ' + ('거래·구매' if i in balance.marked else '미분류')
-                   for i, amount in enumerate(balance.large_changes)]
-        choice, ok = QInputDialog.getItem(
-            self.window, '메소 큰 변동 분류', '거래·구매 표시를 켜거나 끌 변동을 고르세요.',
-            options, 0, False)
-        if ok and self.session.meso is balance and self.running:
-            balance.toggle_trade(options.index(choice))
-            self.session.meso_dirty = True
+        import record_history
+        suggestions = {}
+        if hasattr(self, 'meso_change_suggestion'):
+            for idx, amount in enumerate(balance.large_changes):
+                hint = self.meso_change_suggestion(idx, amount)
+                if hint:
+                    suggestions[idx] = hint
+        result = record_history.classify_meso_dialog(
+            self.window, balance, title='이번 측정의 큰 메소 변동 분류', suggestions=suggestions)
+        if result is None or self.session.meso is not balance:
+            return
+        balance.marked = set(result)
+        self.meso_prompt_session = self.session.session_id
+        self.meso_prompt_reviewed = set(range(len(balance.large_changes)))
+        self.session.meso_dirty = True
+        if self.session.rows:
+            try:
+                self.save_summary()
+            except OSError as exc:
+                tracker.log_error('메소 변동 분류 저장', exc)
+        self.update_meso_display(self._monotonic())
 
     def show_history(self):
         from record_history import build_dialog

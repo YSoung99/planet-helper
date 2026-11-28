@@ -257,6 +257,26 @@ class ConfirmationTests(unittest.TestCase):
         self.assertIsNone(reader.read(dark, now=2))
         self.assertEqual(reader.last_diag['status'], 'closed')
 
+    def test_stationary_inventory_skips_label_ocr_when_only_digits_change(self):
+        box = (300, 400, 150, 18)
+        first = add_amount_glyphs(inventory_frame(box), box, '105')
+        second = add_amount_glyphs(inventory_frame(box), box, '205')
+        reader = meso.Reader()
+        with mock.patch.object(meso, 'read_amount', side_effect=[105, 205]), \
+             mock.patch.object(meso, 'read_binary_amount', side_effect=[105, 205]), \
+             mock.patch.object(meso, 'has_label', return_value=True) as label:
+            self.assertEqual(reader.read(first, now=1), 105)
+            self.assertEqual(reader.read(second, now=3), 205)
+        self.assertEqual(label.call_count, 1)
+        # If the surrounding label strip changes, has_label must be rechecked.
+        third = add_amount_glyphs(inventory_frame(box), box, '305')
+        ImageDraw.Draw(third).rectangle((270, 400, 295, 415), fill=(200, 10, 10))
+        with mock.patch.object(meso, 'read_amount', return_value=305), \
+             mock.patch.object(meso, 'read_binary_amount', return_value=305), \
+             mock.patch.object(meso, 'has_label', return_value=True) as label2:
+            self.assertEqual(reader.read(third, now=5), 305)
+        self.assertEqual(label2.call_count, 1)
+
 
 class SessionMesoTests(unittest.TestCase):
     def test_duplicate_and_distant_frames_do_not_confirm(self):
@@ -451,6 +471,40 @@ class RecordTests(unittest.TestCase):
         self.assertEqual(lines, [('메소', 0.99)])
         self.assertEqual(calls[0], {'use_det': True, 'use_rec': False})
         self.assertEqual(calls[1], {'use_det': False, 'use_rec': True})
+
+    def test_large_change_metadata_timeline_and_post_hunt_classification(self):
+        import json
+        import record_history
+        import tracker
+        with tempfile.TemporaryDirectory() as base:
+            with mock.patch.object(tracker, 'BASE', Path(base)):
+                session = tracker.Session(level=170)
+                for stamp, value in ((0, (219671043, 51.32)), (1, (219671043, 51.32)),
+                                     (2, (219676043, 51.32)), (62, (219681043, 51.33))):
+                    session.accept(value, stamp)
+                session.meso.observe(5_000_000, active_seconds=0.0, when=datetime(2026, 11, 28, 18, 0, 0))
+                session.meso.observe(5_200_000, active_seconds=30.0, when=datetime(2026, 11, 28, 18, 0, 30))
+                session.meso.observe(2_560_000, active_seconds=60.0, when=datetime(2026, 11, 28, 18, 1, 0))
+                session.meso.complete = True
+                self.assertIn('-2,640,000', session.meso.describe_change(0))
+                self.assertIn('18:01', session.meso.describe_change(0))
+                writer = tracker.App.__new__(tracker.App)
+                writer.session = session
+                with mock.patch.object(tracker.time, 'monotonic', return_value=62):
+                    writer.save_observation()
+                row_before, = record_history.collect(base)
+                self.assertEqual(row_before['meso'], -2_440_000)
+                # Post-hunt classification excludes the -2,640,000 purchase.
+                updated = record_history.save_meso_marks(session.session_id, {0}, base)
+                self.assertEqual(updated.hunted(), 200_000)
+                self.assertEqual(len(updated.checkpoints), 3)
+                row_after, = record_history.collect(base)
+                self.assertEqual((row_after['meso'], row_after['meso_trade']), (200_000, -2_640_000))
+                summary = record_history.period_summary([row_after], datetime(2020, 1, 1))
+                self.assertEqual(summary['meso_total'], 200_000)
+                self.assertGreater(summary['meso_per_hour'], 0)
+                text = record_history.period_text([row_after], now=row_after['started'])
+                self.assertIn('메소 +20.0만', text)
 
 
 if __name__ == '__main__':

@@ -190,6 +190,9 @@ class AssistTests(unittest.TestCase):
         with patch('jev.ask', return_value='1'):
             self.assertEqual(jev_assist.ask_buff(frame, frame), 'inactive')
             self.assertEqual(jev_assist.ask_nickname(frame, ['본캐', '부캐', '본캐']), '부캐')
+            self.assertEqual(jev_assist.ask_meso_change(frame, -2_640_000), '사냥 획득')
+        with patch('jev.ask', return_value='0'):
+            self.assertEqual(jev_assist.ask_meso_change(frame, -2_640_000), '거래·구매·창고')
         self.assertIsNone(jev_assist.ask_nickname(frame, []))
 
     def test_frame_ring_keeps_reduced_frames_at_most_every_period(self):

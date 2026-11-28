@@ -18,13 +18,17 @@ import tracker
 
 KOREAN_MODEL = 'korean_PP-OCRv5_rec_mobile.onnx'
 DETECT_MODEL = 'PP-OCRv6_det_tiny.onnx'
+DIGIT_MODEL = 'en_PP-OCRv4_rec_mobile.onnx'
 REGION = (.22, .16)       # minimap title lives in this top-left share of the game frame (.13 cut the map line off on wide windows)
 MIN_SCORE = .6
 HANGUL = re.compile('[가-힣]')
 
 _engine = None
+_digit_engine = None
+_digit_engine_checked = False
 _engine_lock = threading.Lock()
 _recognition_lock = threading.Lock()
+_digit_lock = threading.Lock()
 
 
 def available(resources=None):
@@ -51,6 +55,31 @@ def _get_engine():
         return _engine
 
 
+def _get_digit_engine():
+    """Lightweight English/digit recognizer for pure numeric strips (faster than Korean rec)."""
+    global _digit_engine, _digit_engine_checked
+    if _digit_engine_checked:
+        return _digit_engine
+    with _engine_lock:
+        if not _digit_engine_checked:
+            _digit_engine_checked = True
+            model = Path(tracker.RESOURCES)/'models'/DIGIT_MODEL
+            if model.is_file():
+                try:
+                    import logging
+                    from rapidocr import RapidOCR, LangRec, ModelType, OCRVersion
+                    _digit_engine = RapidOCR(params={
+                        'Global.use_det': False, 'Global.use_cls': False, 'Global.log_level': 'error',
+                        'Rec.lang_type': LangRec.EN, 'Rec.ocr_version': OCRVersion.PPOCRV4,
+                        'Rec.model_type': ModelType.MOBILE, 'Rec.model_path': str(model),
+                        'EngineConfig.onnxruntime.intra_op_num_threads': 1,
+                        'EngineConfig.onnxruntime.inter_op_num_threads': 1})
+                    logging.getLogger('RapidOCR').setLevel(logging.ERROR)
+                except Exception:
+                    _digit_engine = None
+        return _digit_engine
+
+
 def detect_boxes(rgb):
     """Run text detection only, reusing the shared PP-OCRv6_det_tiny session."""
     with _recognition_lock:
@@ -72,10 +101,20 @@ def title_area(image):
     return image.crop((0, 0, int(width*REGION[0]), int(height*REGION[1]))).convert('RGB')
 
 
-def recognize_lines(image, *, detect=True):
+def recognize_lines(image, *, detect=True, digits_only=False):
     import numpy as np
+    rgb = np.asarray(image.convert('RGB'))
+    if not detect and digits_only:
+        fast = _get_digit_engine()
+        if fast is not None:
+            with _digit_lock:
+                result = fast(rgb, use_det=False, use_rec=True)
+            txts = getattr(result, 'txts', None)
+            scores = getattr(result, 'scores', None)
+            if txts is not None and scores is not None:
+                return list(zip(txts, scores))
     with _recognition_lock:
-        result = _get_engine()(np.asarray(image.convert('RGB')), use_det=detect, use_rec=True)
+        result = _get_engine()(rgb, use_det=detect, use_rec=True)
     txts = getattr(result, 'txts', None)
     scores = getattr(result, 'scores', None)
     return list(zip(txts, scores)) if txts is not None and scores is not None else []
