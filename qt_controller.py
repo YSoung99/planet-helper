@@ -277,7 +277,7 @@ class WindowSelection(QDialog):
         layout = QVBoxLayout(self)
         self.instruction = QLabel(
             '게임 창 이미지에서 인벤토리 메소 숫자 칸을 드래그 · ESC 취소' if mode == 'meso'
-            else '우하단 단축키에서 추적할 포션 칸(또는 숫자 부분)을 드래그 · ESC 취소' if mode == 'potion'
+            else '우하단 단축키에서 추적할 포션 아이콘 칸 전체를 드래그 (단축키를 옮겨도 아이콘으로 자동 추적) · ESC 취소' if mode == 'potion'
             else '게임 창 이미지에서 경험치 숫자와 [퍼센트]만 드래그 · ESC 취소')
         layout.addWidget(self.instruction)
         self.image_view = WindowImage(self,image,mode=mode)
@@ -754,7 +754,7 @@ class SharedController(MenuAndSettingsMixin, MesoAndProbesMixin, JevMixin, track
         self.cancel_selection()
         default_name = f'포션 {len(self.potion_slots) + 1}'
         name, ok = QInputDialog.getText(
-            self.window, '포션 이름', '이 단축키 포션의 이름을 입력해 주세요. (예: 쭈쭈바, 맑은 물)',
+            self.window, '포션 이름', '이 포션의 이름을 입력해 주세요. (예: 쭈쭈바, 맑은 물)\n단축키 위치가 바뀌어도 아이콘 이미지로 자동 추적해요.',
             text=default_name)
         if not ok:
             return
@@ -765,13 +765,29 @@ class SharedController(MenuAndSettingsMixin, MesoAndProbesMixin, JevMixin, track
             0, 0, 10**9)
         if not ok_cost:
             cost = 0
+        slot_entry = {'name': name, 'unit_cost': int(cost), 'roi': dict(roi)}
+        if selection_image is not None:
+            try:
+                pixel_rect = self.capture_module().pixel_rect
+                left, top, width, height = pixel_rect(roi, selection_image.width, selection_image.height)
+                if width >= 12 and height >= 12:
+                    crop = selection_image.crop((left, top, left + width, top + height)).convert('RGB')
+                    slot_entry['icon'] = potions.save_icon(crop, tracker.BASE)
+                    slot_entry['reference_height'] = selection_image.height
+            except (OSError, ValueError, RuntimeError) as exc:
+                tracker.log_error('포션 아이콘 저장', exc)
+        # Clean up any replaced icon with the same name.
+        for old in self.potion_slots:
+            if old['name'] == name and old.get('icon') and old.get('icon') != slot_entry.get('icon'):
+                potions.delete_icon(old['icon'], tracker.BASE)
         self.potion_slots = [s for s in self.potion_slots if s['name'] != name]
-        self.potion_slots.append({'name': name, 'unit_cost': int(cost), 'roi': dict(roi)})
+        self.potion_slots.append(slot_entry)
         self.potion_reader.reset()
         self.potion_confirmations = {}
         self.save_config()
         self.update_potion_display(self._monotonic())
-        self.status.set(f'포션 슬롯 등록됨 · {name}')
+        mode_hint = '아이콘 자동 추적' if 'icon' in slot_entry else '고정 영역'
+        self.status.set(f'포션 등록됨 · {name} ({mode_hint})')
 
     def apply_window_region(self,roi,selection_image=None):
         self.window_region = roi

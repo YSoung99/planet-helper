@@ -425,6 +425,11 @@ class MenuAndSettingsMixin:
         actions.addWidget(cancel_btn)
         layout.addLayout(actions)
         if dialog.exec() == QDialog.DialogCode.Accepted:
+            import potions
+            kept_icons = {s.get('icon') for s in slots if s.get('icon')}
+            for old in getattr(self, 'potion_slots', ()):
+                if old.get('icon') and old['icon'] not in kept_icons:
+                    potions.delete_icon(old['icon'], tracker.BASE)
             self.potion_slots = list(slots)
             self.potion_reader.reset()
             self.potion_confirmations = {}

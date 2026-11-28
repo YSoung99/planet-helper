@@ -1,23 +1,31 @@
-"""Track quickslot potion / consumable usage from bottom-right hotkey slots.
+"""Track quickslot potion / consumable usage by potion icon image (hotkey-agnostic) or ROI.
 
-Each configured slot stores a window-relative ROI, a display name, and an optional unit cost
-(meso per item). When the user drags a full square quickslot icon, the reader automatically
-focuses on the lower strip where the white black-outlined count digits live.
+Each configured slot stores a display name, optional unit cost (meso per item), an icon template
+filename saved under ``records/potion-icons/`` (matched across the bottom-right quickslot bar
+with the top-left hotkey text and bottom digit strip masked out), and an optional fallback ROI.
 
-Only decreases in confirmed count add to `used`; increases (buying/restocking potions) update
-the baseline without subtracting from `used`. Pixel-identical crops skip OCR completely.
+Because matching uses only the potion artwork, moving the potion to a different hotkey or
+switching characters still tracks the exact same potion automatically—and if the potion is not
+on the quickslot bar, it is cleanly skipped instead of reading a different skill or item.
 """
 import hashlib
+import math
 import re
 import threading
+import time
+from pathlib import Path
 
 COUNT_RE = re.compile(r'\d{1,5}')
 MIN_SCORE = 0.80
+ICON_MATCH_THRESHOLD = 0.78
 MAX_COUNT = 99_999
 MAX_SLOTS = 8
 CONFIRMATION_GAP = 12.0
 LARGE_DROP_THRESHOLD = 50
 SCAN_INTERVAL = 2.0
+# Bottom-right quickslot search region (normalized x0, y0, x1, y1).
+QUICKSLOT_SEARCH = (0.68, 0.72, 1.0, 1.0)
+ICON_FILE_RE = re.compile(r'^[A-Za-z0-9._-]{1,64}\.png$')
 
 _rec_engine = None
 _rec_checked = False
@@ -25,7 +33,7 @@ _rec_lock = threading.Lock()
 
 
 def _get_rec_engine():
-    """Lazy PP-OCRv6_rec_medium recognizer (far more accurate on outlined pixel digits than Korean mobile)."""
+    """Lazy PP-OCRv6_rec_medium recognizer (accurate on outlined pixel digits)."""
     global _rec_engine, _rec_checked
     if _rec_checked:
         return _rec_engine
@@ -50,10 +58,35 @@ def _get_rec_engine():
         return _rec_engine
 
 
+def icon_dir(base=None):
+    import tracker
+    return Path(base or tracker.BASE) / 'records' / 'potion-icons'
+
+
+def icon_path(filename, base=None):
+    return icon_dir(base) / filename
+
+
+def save_icon(image, base=None):
+    """Save a cropped potion slot RGB image as PNG and return its filename."""
+    folder = icon_dir(base)
+    folder.mkdir(parents=True, exist_ok=True)
+    name = f'potion-{time.time_ns()}.png'
+    image.convert('RGB').save(folder / name)
+    return name
+
+
+def delete_icon(filename, base=None):
+    if filename and ICON_FILE_RE.fullmatch(str(filename)):
+        try:
+            icon_path(filename, base).unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
 def valid_slot(entry):
-    """Validate one persisted potion slot dict."""
+    """Validate one persisted potion slot dict (supports icon-based and/or ROI-based slots)."""
     from window_capture import valid_roi
-    import math
 
     if not isinstance(entry, dict):
         return False
@@ -63,9 +96,17 @@ def valid_slot(entry):
     cost = entry.get('unit_cost', 0)
     if isinstance(cost, bool) or not isinstance(cost, int) or not (0 <= cost <= 10**9):
         return False
+    icon = entry.get('icon')
+    has_icon = isinstance(icon, str) and bool(ICON_FILE_RE.fullmatch(icon))
     roi = entry.get('roi')
-    aspect = roi.get('reference_aspect') if isinstance(roi, dict) else None
-    if not (valid_roi(roi) and type(aspect) in (int, float) and math.isfinite(aspect) and aspect > 0):
+    has_roi = False
+    if roi is not None:
+        aspect = roi.get('reference_aspect') if isinstance(roi, dict) else None
+        has_roi = bool(valid_roi(roi) and type(aspect) in (int, float) and math.isfinite(aspect) and aspect > 0)
+    if not (has_icon or has_roi):
+        return False
+    ref_h = entry.get('reference_height')
+    if ref_h is not None and (isinstance(ref_h, bool) or not isinstance(ref_h, (int, float)) or not (100 <= ref_h <= 10000)):
         return False
     return True
 
@@ -77,32 +118,92 @@ def clean_slots(entries):
     result = []
     for entry in entries[:MAX_SLOTS]:
         if valid_slot(entry):
-            roi = {k: entry['roi'][k] for k in ('left', 'top', 'width', 'height', 'reference_aspect')}
-            result.append({
+            cleaned = {
                 'name': ' '.join(entry['name'].split())[:24],
                 'unit_cost': int(entry.get('unit_cost', 0)),
-                'roi': roi,
-            })
+            }
+            if isinstance(entry.get('icon'), str) and ICON_FILE_RE.fullmatch(entry['icon']):
+                cleaned['icon'] = entry['icon']
+            if entry.get('reference_height') is not None:
+                cleaned['reference_height'] = int(round(entry['reference_height']))
+            if isinstance(entry.get('roi'), dict):
+                cleaned['roi'] = {k: entry['roi'][k] for k in ('left', 'top', 'width', 'height', 'reference_aspect')}
+            result.append(cleaned)
     return result
 
 
-def crop_digit_strip(frame, roi):
-    """Crop the digit region for one quickslot ROI (auto-trimming square icon crops to lower half)."""
-    from window_capture import pixel_rect
+def icon_mask(width, height):
+    """3-channel mask keeping pure potion art while ignoring top-left hotkey text and bottom digits."""
+    import cv2
+    import numpy as np
 
-    x, y, w, h = pixel_rect(roi, frame.width, frame.height)
+    mask = np.full((height, width), 255, dtype=np.uint8)
+    # Ignore top-left hotkey label (A, Del, Shift, Home, etc.)
+    mask[:int(height * 0.38), :int(width * 0.65)] = 0
+    # Ignore bottom count digits
+    mask[int(height * 0.58):, :] = 0
+    return cv2.merge([mask, mask, mask])
+
+
+def find_icon(frame, template_rgb, *, reference_height=None, threshold=ICON_MATCH_THRESHOLD):
+    """Locate `template_rgb` inside the bottom-right quickslot area, ignoring hotkey text & digits.
+
+    Returns (x, y, w, h, score) in full-frame pixel coordinates, or None when not found.
+    """
+    import cv2
+    import numpy as np
+    from PIL import Image
+
+    fw, fh = frame.size
+    sx0 = int(fw * QUICKSLOT_SEARCH[0])
+    sy0 = int(fh * QUICKSLOT_SEARCH[1])
+    search_pil = frame.crop((sx0, sy0, fw, fh))
+    if search_pil.mode != 'RGB':
+        search_pil = search_pil.convert('RGB')
+    search = np.asarray(search_pil)
+    sh_s, sw_s = search.shape[:2]
+
+    tw, th = template_rgb.size
+    if reference_height and reference_height > 0:
+        ratio = fh / float(reference_height)
+        if abs(ratio - 1.0) >= 0.04:
+            tw = max(12, round(tw * ratio))
+            th = max(12, round(th * ratio))
+            template_rgb = template_rgb.resize((tw, th), Image.Resampling.LANCZOS)
+    if tw >= sw_s or th >= sh_s or tw < 10 or th < 10:
+        return None
+    tmpl = np.asarray(template_rgb if template_rgb.mode == 'RGB' else template_rgb.convert('RGB'))
+    mask3 = icon_mask(tw, th)
+    res = cv2.matchTemplate(search, tmpl, cv2.TM_CCOEFF_NORMED, mask=mask3)
+    res = np.nan_to_num(res, nan=-1.0, posinf=-1.0, neginf=-1.0)
+    _, best_val, _, best_loc = cv2.minMaxLoc(res)
+    if best_val < threshold:
+        return None
+    bx, by = best_loc
+    return (sx0 + bx, sy0 + by, tw, th, float(best_val))
+
+
+def _box_digit_strip(frame, box):
+    """Crop the digit strip from a pixel box (x, y, w, h); trims square icon boxes to lower 48%."""
+    x, y, w, h = box
     x = max(0, min(x, frame.width - 1))
     y = max(0, min(y, frame.height - 1))
     w = min(w, frame.width - x)
     h = min(h, frame.height - y)
     if w < 10 or h < 8:
         return None
-    # If the user selected the whole square quickslot icon, focus on its lower 48% where digits sit.
     if h >= w * 0.65:
         top = y + round(h * 0.52)
         h = max(8, (y + h) - top)
         y = top
     return frame.crop((x, y, x + w, y + h)).convert('RGB')
+
+
+def crop_digit_strip(frame, roi):
+    """Crop the digit region for one quickslot ROI (auto-trimming square icon crops to lower half)."""
+    from window_capture import pixel_rect
+
+    return _box_digit_strip(frame, pixel_rect(roi, frame.width, frame.height))
 
 
 def recognize_count(crop, ocr_fn=None):
@@ -126,11 +227,9 @@ def recognize_count(crop, ocr_fn=None):
     scale = max(2, min(4, round(66 / max(1, crop.height))))
     enlarged = crop.resize((crop.width * scale, crop.height * scale), Image.Resampling.LANCZOS)
     padded_w = ImageOps.expand(enlarged, border=12, fill=(255, 255, 255))
-    lines = run_ocr(padded_w)
-    val = _parse_lines(lines)
+    val = _parse_lines(run_ocr(padded_w))
     if val is not None:
         return val
-    # Secondary pass with neutral gray padding if white padding missed.
     padded_g = ImageOps.expand(enlarged, border=12, fill=(128, 128, 128))
     return _parse_lines(run_ocr(padded_g))
 
@@ -186,24 +285,91 @@ class SlotConfirmation:
 
 
 class Reader:
-    """Hash-cached quickslot reader; skips OCR whenever a slot's pixels are unchanged."""
+    """Icon-matching + hash-cached quickslot reader; skips matching & OCR when pixels are unchanged."""
 
-    def __init__(self, ocr_fn=None):
+    def __init__(self, ocr_fn=None, base=None):
         self.ocr_fn = ocr_fn
-        self._cache = {}  # index -> (size, digest, value)
+        self.base = base
+        self._cache = {}       # index -> (size, digest, value)
+        self._templates = {}   # filename -> PIL RGB Image or None
+        self._last_boxes = {}  # index -> (frame_size, box, full_slot_digest)
 
     def reset(self):
         self._cache.clear()
+        self._templates.clear()
+        self._last_boxes.clear()
+
+    def _load_template(self, filename):
+        if filename in self._templates:
+            return self._templates[filename]
+        from PIL import Image
+        path = icon_path(filename, self.base)
+        try:
+            with Image.open(path) as img:
+                loaded = img.convert('RGB').copy()
+        except OSError:
+            loaded = None
+        self._templates[filename] = loaded
+        return loaded
+
+    def _locate_slot_box(self, idx, frame, slot):
+        """Return pixel box (x, y, w, h) for a slot via icon matching (with fast cache) or ROI."""
+        icon_file = slot.get('icon')
+        if icon_file:
+            template = self._load_template(icon_file)
+            if template is None:
+                return None
+            # Fast path: if the previously matched box still has identical pixels, reuse it directly.
+            prev = self._last_boxes.get(idx)
+            if prev is not None and prev[0] == frame.size:
+                bx, by, bw, bh = prev[1]
+                if bx + bw <= frame.width and by + bh <= frame.height:
+                    patch = frame.crop((bx, by, bx + bw, by + bh))
+                    if patch.mode != 'RGB':
+                        patch = patch.convert('RGB')
+                    digest = hashlib.blake2b(patch.tobytes(), digest_size=16).digest()
+                    if digest == prev[2]:
+                        return prev[1]
+                    # Check if the icon art at the same position still matches (only digits changed!).
+                    import cv2
+                    import numpy as np
+                    tmpl = template
+                    if tmpl.size != (bw, bh):
+                        from PIL import Image
+                        tmpl = tmpl.resize((bw, bh), Image.Resampling.LANCZOS)
+                    res = cv2.matchTemplate(np.asarray(patch), np.asarray(tmpl),
+                                            cv2.TM_CCOEFF_NORMED, mask=icon_mask(bw, bh))
+                    score = float(np.nan_to_num(res[0, 0], nan=-1.0))
+                    if score >= ICON_MATCH_THRESHOLD:
+                        self._last_boxes[idx] = (frame.size, prev[1], digest)
+                        return prev[1]
+            found = find_icon(frame, template, reference_height=slot.get('reference_height'))
+            if found is None:
+                self._last_boxes.pop(idx, None)
+                return None
+            box = found[:4]
+            patch = frame.crop((box[0], box[1], box[0] + box[2], box[1] + box[3])).convert('RGB')
+            digest = hashlib.blake2b(patch.tobytes(), digest_size=16).digest()
+            self._last_boxes[idx] = (frame.size, box, digest)
+            return box
+        roi = slot.get('roi')
+        if roi is not None:
+            from window_capture import pixel_rect
+            try:
+                return pixel_rect(roi, frame.width, frame.height)
+            except (ValueError, RuntimeError):
+                return None
+        return None
 
     def read_slots(self, frame, slots):
         """Return list of (name, value_or_None) for each configured slot."""
         results = []
         for idx, slot in enumerate(slots):
-            try:
-                crop = crop_digit_strip(frame, slot['roi'])
-            except (ValueError, RuntimeError):
+            box = self._locate_slot_box(idx, frame, slot)
+            if box is None:
                 results.append((slot['name'], None))
                 continue
+            crop = _box_digit_strip(frame, box)
             if crop is None:
                 results.append((slot['name'], None))
                 continue
