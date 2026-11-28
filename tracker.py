@@ -20,12 +20,13 @@ from collections import deque, Counter
 from pathlib import Path
 
 import meso
+import potions
 
 RESOURCES = Path(getattr(sys, '_MEIPASS', Path(__file__).resolve().parent))
 BASE = Path(os.environ.get('PLANET_EXP_DATA_DIR') or (
     Path.home()/'Library'/'Application Support'/'Maple Planet Helper Auto Trial'
     if sys.platform == 'darwin' else Path(__file__).resolve().parent))
-APP_VERSION = '1.4.38'
+APP_VERSION = '1.4.39'
 MAX_BOUNDARY_GAP = 10.0
 BURNING_MAX_LEVEL = 120  # Planet Up & Up grants one bonus level, capped at 120.
 REST_AFTER = 180.0  # EXP unchanged this long: rest counted from the last gain
@@ -171,6 +172,12 @@ def load_settings(path):
             clean['meso_region'] = {key: meso_region[key] for key in ('left', 'top', 'width', 'height', 'reference_aspect')}
         else:
             invalid.append('meso_region')
+    if 'potion_slots' in payload:
+        raw_slots = payload['potion_slots']
+        if isinstance(raw_slots, list):
+            clean['potion_slots'] = potions.clean_slots(raw_slots)
+        else:
+            invalid.append('potion_slots')
     if 'window_opacity' in payload:
         value = payload['window_opacity']
         if type(value) in (int, float) and math.isfinite(value) and .2 <= value <= 1.0:
@@ -592,6 +599,8 @@ class Session:
         self.meso_start_at = None
         self.meso_start_frame = None
         self.meso_dirty = False
+        self.potions = potions.SessionPotions()
+        self.potions_dirty = False
         self.session_id = time.strftime('%Y%m%d-%H%M%S') + f'-{time.time_ns()%1000000000:09d}'
         self.started = None
         self.rate_anchor = None
@@ -977,6 +986,7 @@ def load_saved_session(path, level, now):
     if isinstance(buffs, dict):
         session.exp_buff_intervals = buffs
     session.meso = meso.SessionMeso(state.get('meso'))
+    session.potions = potions.SessionPotions(state.get('potions'))
     nickname = state.get('character_name')
     session.character_conflict = state.get('character_conflict') is True
     if isinstance(nickname, str) and not session.character_conflict:
@@ -1364,6 +1374,7 @@ class MeasurementCore:
         must_flush = (
             force_summary or first_write or self.session.ended is not None
             or self.session.blocked or self.session.meso_dirty or self.session.exp_buffs_dirty
+            or self.session.potions_dirty
             or last_sid != self.session.session_id
             or last_started != self.session.started
             or last_flush is None or now - last_flush >= self.SUMMARY_FLUSH_SECONDS
@@ -1396,6 +1407,8 @@ class MeasurementCore:
             summary['exp_buff_intervals_seconds'] = self.session.exp_buff_intervals
         if self.session.meso.as_dict():
             summary['meso'] = self.session.meso.as_dict()
+        if self.session.potions.as_dict():
+            summary['potions'] = self.session.potions.as_dict()
         if self.session.character_name:
             summary['character_name'] = self.session.character_name
         if self.session.character_conflict:
@@ -1416,6 +1429,7 @@ class MeasurementCore:
         self._last_summary_started = self.session.started
         self.session.exp_buffs_dirty = False
         self.session.meso_dirty = False
+        self.session.potions_dirty = False
 
     def remember_accepted_capture(self, previous_value, details):
         if previous_value != self.session.last:

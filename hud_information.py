@@ -151,8 +151,12 @@ def build_dialog(controller):
             engine_line = 'OCR 엔진 · Python 기본'
         arbiter = getattr(controller, 'jev_arbiter', None)
         jev_summary = arbiter.summary_text() if arbiter is not None and hasattr(arbiter, 'summary_text') else ''
+        potion_line = ''
+        potion_lbl = getattr(controller, 'potion_label', None)
+        if potion_lbl is not None and potion_lbl.text():
+            potion_line = potion_lbl.text()
         update(effects_text, '\n'.join(filter(None, (engine_line, controller.buff_label.text(),
-                                                    jev_summary, controller.jev_status.text(),
+                                                    potion_line, jev_summary, controller.jev_status.text(),
                                                     f'연타 · {controller.repeat_status.text()}'))))
         pixmap = controller.preview.pixmap()
         if pixmap is not None and not pixmap.isNull() and pixmap.cacheKey() != preview_key:

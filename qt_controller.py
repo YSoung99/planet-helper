@@ -32,6 +32,7 @@ import jev
 import jev_assist
 import map_name
 import meso
+import potions
 import tracker
 from recent_exp import RecentExp
 
@@ -220,13 +221,17 @@ class WindowImage(QWidget):
         rgb = image.convert('RGB')
         self.pixmap = QPixmap.fromImage(QImage(rgb.tobytes(),rgb.width,rgb.height,rgb.width*3,QImage.Format.Format_RGB888).copy())
         self.setCursor(Qt.CursorShape.CrossCursor)
-        self.setAccessibleName('인벤토리 메소 영역 선택 이미지' if mode == 'meso' else '게임 경험치 영역 선택 이미지')
+        self.setAccessibleName(
+            '인벤토리 메소 영역 선택 이미지' if mode == 'meso'
+            else '단축키 포션 슬롯 선택 이미지' if mode == 'potion'
+            else '게임 경험치 영역 선택 이미지')
 
     def paintEvent(self,event):
         painter = QPainter(self)
         painter.drawPixmap(self.rect(),self.pixmap,self.pixmap.rect())
         if self.start is not None:
-            painter.setPen(QPen(QColor('#fbbf77' if self.mode == 'meso' else '#ff5555'),2))
+            color = '#fbbf77' if self.mode == 'meso' else '#60a5fa' if self.mode == 'potion' else '#ff5555'
+            painter.setPen(QPen(QColor(color),2))
             painter.drawRect(QRect(self.start,self.end).normalized())
 
     def mousePressEvent(self,event):
@@ -242,17 +247,20 @@ class WindowImage(QWidget):
         self.end = event.position().toPoint()
         rect = QRect(self.start,self.end).normalized().intersected(self.rect())
         points = self.dialog.image.info['content_points']
-        min_width = 24 if self.mode == 'meso' else 40
+        min_width = 12 if self.mode == 'potion' else 24 if self.mode == 'meso' else 40
         if rect.width()/self.width()*points[0] < min_width or rect.height()/self.height()*points[1] < 8:
             self.dialog.instruction.setText(
-                '선택이 너무 작아요 · 인벤토리 메소 숫자 칸 전체를 드래그해 주세요'
-                if self.mode == 'meso' else '선택이 너무 작아요 · 경험치 숫자와 [퍼센트]를 함께 선택해 주세요')
+                '선택이 너무 작아요 · 포션 아이콘 칸 또는 숫자 칸을 드래그해 주세요' if self.mode == 'potion'
+                else '선택이 너무 작아요 · 인벤토리 메소 숫자 칸 전체를 드래그해 주세요' if self.mode == 'meso'
+                else '선택이 너무 작아요 · 경험치 숫자와 [퍼센트]를 함께 선택해 주세요')
             return
         roi = dict(left=rect.x()/self.width(),top=rect.y()/self.height(),
                    width=rect.width()/self.width(),height=rect.height()/self.height(),
                    reference_aspect=points[0]/points[1])
         if self.mode == 'meso':
             self.dialog.controller.apply_meso_region(roi,self.dialog.image)
+        elif self.mode == 'potion':
+            self.dialog.controller.apply_potion_slot(roi,self.dialog.image)
         else:
             self.dialog.controller.apply_window_region(roi,self.dialog.image)
 
@@ -261,12 +269,16 @@ class WindowSelection(QDialog):
     def __init__(self,controller,image,mode='exp'):
         super().__init__(controller.window,Qt.WindowType.Dialog | Qt.WindowType.WindowStaysOnTopHint)
         self.controller,self.image,self.mode = controller,image,mode
-        self.setWindowTitle('인벤토리 메소 영역 지정' if mode == 'meso' else '게임 경험치 영역 지정')
+        self.setWindowTitle(
+            '인벤토리 메소 영역 지정' if mode == 'meso'
+            else '단축키 포션 슬롯 지정' if mode == 'potion'
+            else '게임 경험치 영역 지정')
         self.setWindowModality(Qt.WindowModality.WindowModal)
         layout = QVBoxLayout(self)
         self.instruction = QLabel(
-            '게임 창 이미지에서 인벤토리 메소 숫자 칸을 드래그 · ESC 취소'
-            if mode == 'meso' else '게임 창 이미지에서 경험치 숫자와 [퍼센트]만 드래그 · ESC 취소')
+            '게임 창 이미지에서 인벤토리 메소 숫자 칸을 드래그 · ESC 취소' if mode == 'meso'
+            else '우하단 단축키에서 추적할 포션 칸(또는 숫자 부분)을 드래그 · ESC 취소' if mode == 'potion'
+            else '게임 창 이미지에서 경험치 숫자와 [퍼센트]만 드래그 · ESC 취소')
         layout.addWidget(self.instruction)
         self.image_view = WindowImage(self,image,mode=mode)
         available = controller.application.primaryScreen().availableGeometry()
@@ -404,6 +416,11 @@ class SharedController(MenuAndSettingsMixin, MesoAndProbesMixin, JevMixin, track
         self.meso_visible = False
         self.meso_reader_source = None
         self.meso_last_flush = float('-inf')
+        self.potion_reader = potions.Reader()
+        self.potion_results = queue.SimpleQueue()
+        self.potion_confirmations = {}
+        self.potion_source = None
+        self.potion_last_flush = float('-inf')
         self._probe_executor = None
         self._probe_executor_lock = threading.Lock()
         self.character_candidate = (None, None)
@@ -425,6 +442,7 @@ class SharedController(MenuAndSettingsMixin, MesoAndProbesMixin, JevMixin, track
         self.meso_region = config.get('meso_region')
         if self.meso_region is not None:
             self.meso_reader.set_manual_roi(self.meso_region)
+        self.potion_slots = list(config.get('potion_slots', ()))
         self.cloud_remote = config.get('cloud_remote')
         self.cloud_lock = threading.Lock()
         self.cloud_signals = CloudSignals()
@@ -678,6 +696,12 @@ class SharedController(MenuAndSettingsMixin, MesoAndProbesMixin, JevMixin, track
     def select_meso_region(self):
         self._start_window_selection('meso', '게임 창 연결 중 · 메소 영역 선택 이미지 준비')
 
+    def select_potion_slot(self):
+        if len(getattr(self, 'potion_slots', ())) >= potions.MAX_SLOTS:
+            self.status.set(f'포션 슬롯은 최대 {potions.MAX_SLOTS}개까지 등록할 수 있어요')
+            return
+        self._start_window_selection('potion', '게임 창 연결 중 · 포션 슬롯 선택 이미지 준비')
+
     def _start_window_selection(self, mode, status_text):
         self.cancel_selection()
         if not self.check_permission(): return
@@ -724,6 +748,30 @@ class SharedController(MenuAndSettingsMixin, MesoAndProbesMixin, JevMixin, track
         self.meso_reader.set_manual_roi(None)
         self.save_config()
         self.status.set('메소 영역 자동 탐색으로 되돌림')
+
+    def apply_potion_slot(self, roi, selection_image=None):
+        from PySide6.QtWidgets import QInputDialog
+        self.cancel_selection()
+        default_name = f'포션 {len(self.potion_slots) + 1}'
+        name, ok = QInputDialog.getText(
+            self.window, '포션 이름', '이 단축키 포션의 이름을 입력해 주세요. (예: 쭈쭈바, 맑은 물)',
+            text=default_name)
+        if not ok:
+            return
+        name = ' '.join(name.split())[:24] or default_name
+        cost, ok_cost = QInputDialog.getInt(
+            self.window, '포션 단가 (선택)',
+            f'{name} 1개당 가격(메소)을 입력해 주세요.\n0으로 두면 개수만 카운트하고, 입력하면 물약비도 함께 계산해요.',
+            0, 0, 10**9)
+        if not ok_cost:
+            cost = 0
+        self.potion_slots = [s for s in self.potion_slots if s['name'] != name]
+        self.potion_slots.append({'name': name, 'unit_cost': int(cost), 'roi': dict(roi)})
+        self.potion_reader.reset()
+        self.potion_confirmations = {}
+        self.save_config()
+        self.update_potion_display(self._monotonic())
+        self.status.set(f'포션 슬롯 등록됨 · {name}')
 
     def apply_window_region(self,roi,selection_image=None):
         self.window_region = roi
@@ -1145,6 +1193,7 @@ class SharedController(MenuAndSettingsMixin, MesoAndProbesMixin, JevMixin, track
         self.apply_character_results(now)
         self.apply_buff_results(now)
         self.apply_meso_results(now)
+        self.apply_potion_results(now)
         self.check_efficiency_change()
         self.apply_map_results()
         hunted = self.session.active_elapsed(now)
@@ -1250,6 +1299,7 @@ class SharedController(MenuAndSettingsMixin, MesoAndProbesMixin, JevMixin, track
                 'cloud_remote': getattr(self, 'cloud_remote', None),
                 'meso_trade_threshold': getattr(self, 'meso_trade_threshold', meso.TRADE_THRESHOLD),
                 'meso_region': getattr(self, 'meso_region', None),
+                'potion_slots': getattr(self, 'potion_slots', []),
             }), encoding='utf-8')
             temporary.replace(tracker.BASE/'settings.json')
         except OSError as exc:

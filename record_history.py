@@ -11,7 +11,7 @@ MEMO_FILE = 'memos.json'
 # Character names typed by the user. They override OCR without touching the record files.
 CHARACTER_FILE = 'character-names.json'
 CACHE_FILE = '.summary-cache.json'
-CACHE_VERSION = 2
+CACHE_VERSION = 3
 _cache_lock = threading.Lock()
 _memory_cache = {}
 
@@ -193,6 +193,7 @@ def summarize(csv_path):
                 level_ups=len(session.level_ups), meso=session.meso.hunted(), meso_trade=session.meso.excluded_trade(),
                 meso_large_changes=len(session.meso.large_changes),
                 meso_seconds=session.meso.measured_seconds(active) if session.meso.hunted() is not None else None,
+                potions=session.potions.as_dict(),
                 gained=gained, per_minute=rate['cumulative'], rate_gain=rate['rate_gain'],
                 rate_seconds=rate['duration'], gap=session.gap_seconds(0.0), gap_gain=session.gap_gain,
                 blocked=session.blocked, stop_reason=session.stop_reason,
@@ -883,6 +884,19 @@ def row_details(row, buff_times):
         lines.append(f"효율 변화 {change_text(row['changes'])}")
     lines.append(f"경험치 버프 {buff_times.replace(chr(10), ' / ') or '확인된 구간 없음'}")
     lines.append(meso_detail(row))
+    pot = row.get('potions')
+    if isinstance(pot, dict) and pot.get('items'):
+        parts = [f"{it['name']} {it['used']:,}개" for it in pot['items'] if it.get('used', 0) > 0]
+        if parts:
+            pot_line = '포션 소모 · ' + ' · '.join(parts)
+            cost = pot.get('total_cost', 0)
+            if cost > 0:
+                import meso as meso_mod
+                pot_line += f' (물약비 -{meso_mod.format_short(cost, signed=False)})'
+                if row.get('meso') is not None:
+                    net = row['meso'] - cost
+                    pot_line += f' · 물약비 제외 순수익 {net:+,}'
+            lines.append(pot_line)
     if row.get('stalls'):
         import jev_assist
         lines.append(f"경험치가 멈춘 이유 (JEV) {jev_assist.stall_text(row['stalls'])}")

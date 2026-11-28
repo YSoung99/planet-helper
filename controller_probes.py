@@ -6,6 +6,7 @@ import exp_buffs
 import hunt_activity
 import map_name
 import meso
+import potions
 import tracker
 
 
@@ -439,6 +440,13 @@ class MesoAndProbesMixin:
                     self.hunt_activity_results.put((generation, stamp, observation))
             except Exception as exc:
                 tracker.log_error('사냥 신호 판독', exc)
+            try:
+                slots = list(getattr(self, 'potion_slots', ()))
+                if slots and window is not None and map_name.available():
+                    readings = self.potion_reader.read_slots(frame, slots)
+                    self.potion_results.put((generation, window, stamp, readings))
+            except Exception as exc:
+                tracker.log_error('포션 소모 판독', exc)
         finally:
             self.hunt_activity_lock.release()
 
@@ -525,3 +533,47 @@ class MesoAndProbesMixin:
         else:
             text = '경험치 버프 · 측정 대기'
         self.set_card_line(self.buff_label, text, visible=self.buff_has_templates)
+
+    def apply_potion_results(self, now):
+        session = self.session
+        slots = {slot['name']: slot.get('unit_cost', 0) for slot in getattr(self, 'potion_slots', ())}
+        while not self.potion_results.empty():
+            generation, window, stamp, readings = self.potion_results.get_nowait()
+            if not self.running or generation != self.generation or window is None:
+                continue
+            source = (generation, window)
+            if self.potion_source != source:
+                self.potion_source = source
+                self.potion_confirmations = {}
+            for name, raw_val in readings:
+                if name not in slots:
+                    continue
+                conf = self.potion_confirmations.get(name)
+                if conf is None:
+                    conf = potions.SlotConfirmation()
+                    self.potion_confirmations[name] = conf
+                confirmed = conf.observe(raw_val, stamp)
+                if confirmed is not None:
+                    session.potions_dirty |= session.potions.observe(name, confirmed, slots[name])
+        if (self.running and session.potions_dirty and session.rows and not session.ledger_dirty
+                and now - self.potion_last_flush >= 10):
+            self.potion_last_flush = now
+            try:
+                self.save_summary()
+            except OSError as exc:
+                tracker.log_error('포션 소모 기록 저장', exc)
+        self.update_potion_display(now)
+
+    def update_potion_display(self, now):
+        label = getattr(self, 'potion_label', None)
+        if label is None:
+            return
+        has_slots = bool(getattr(self, 'potion_slots', ())) or bool(self.session.potions.items)
+        if not has_slots:
+            self.set_card_line(label, '', visible=False)
+            return
+        active = self.session.active_elapsed(now) if self.session.started is not None else None
+        text = self.session.potions.summary_text(active_seconds=active)
+        if not text:
+            text = f'포션 · 슬롯 {len(self.potion_slots)}개 인식 대기' if self.running else f'포션 · 슬롯 {len(self.potion_slots)}개 등록됨'
+        self.set_card_line(label, text, visible=True)

@@ -247,6 +247,10 @@ class MenuAndSettingsMixin:
         if getattr(self, 'meso_region', None) is not None:
             gains.addAction('메소 자동 탐색으로 되돌리기', self.clear_meso_region)
         gains.addSeparator()
+        gains.addAction('포션 슬롯 추가 (영역 지정)…', self.select_potion_slot)
+        if getattr(self, 'potion_slots', None):
+            gains.addAction(f'등록된 포션 관리 ({len(self.potion_slots)}개)…', self.manage_potion_slots)
+        gains.addSeparator()
         gains.addAction('메소 큰 변동 기준 금액', self.meso_threshold_settings)
         gains.addAction('이번 측정의 큰 메소 변동 분류…', self.classify_meso_change)
         gains.addSeparator()
@@ -357,6 +361,76 @@ class MenuAndSettingsMixin:
             except OSError as exc:
                 tracker.log_error('메소 변동 분류 저장', exc)
         self.update_meso_display(self._monotonic())
+
+    def manage_potion_slots(self):
+        slots = list(getattr(self, 'potion_slots', ()))
+        if not slots:
+            self.status.set('등록된 포션 슬롯이 없어요')
+            return
+        dialog = QDialog(self.window)
+        dialog.setWindowTitle('등록된 포션 슬롯 관리')
+        dialog.setStyleSheet('QDialog { background:#151b24; color:#e8f0f6; } QLabel { color:#d5dee8; }')
+        layout = QVBoxLayout(dialog)
+        layout.addWidget(QLabel('단축키 포션 슬롯의 개당 가격을 수정하거나 삭제할 수 있어요.'))
+        rows_box = QVBoxLayout()
+        layout.addLayout(rows_box)
+
+        def rebuild():
+            while rows_box.count():
+                item = rows_box.takeAt(0)
+                if item.widget():
+                    item.widget().deleteLater()
+                elif item.layout():
+                    while item.layout().count():
+                        sub = item.layout().takeAt(0)
+                        if sub.widget():
+                            sub.widget().deleteLater()
+            if not slots:
+                rows_box.addWidget(QLabel('등록된 포션 슬롯이 없어요.'))
+                return
+            for idx, slot in enumerate(slots):
+                row = QHBoxLayout()
+                cost = slot.get('unit_cost', 0)
+                info = QLabel(f"{idx + 1}. {slot['name']} · 개당 {cost:,} 메소" if cost else f"{idx + 1}. {slot['name']} · 단가 미지정")
+                row.addWidget(info, 1)
+                edit_btn = QPushButton('단가 수정')
+                del_btn = QPushButton('삭제')
+
+                def edit_cost(i=idx):
+                    val, ok = QInputDialog.getInt(
+                        dialog, '포션 단가 수정', f"{slots[i]['name']} 1개당 가격 (메소, 0=미계산)",
+                        int(slots[i].get('unit_cost', 0)), 0, 10**9)
+                    if ok:
+                        slots[i] = dict(slots[i], unit_cost=val)
+                        rebuild()
+
+                def remove_slot(i=idx):
+                    slots.pop(i)
+                    rebuild()
+
+                edit_btn.clicked.connect(lambda _=False, fn=edit_cost: fn())
+                del_btn.clicked.connect(lambda _=False, fn=remove_slot: fn())
+                row.addWidget(edit_btn)
+                row.addWidget(del_btn)
+                rows_box.addLayout(row)
+
+        rebuild()
+        actions = QHBoxLayout()
+        actions.addStretch()
+        save_btn = QPushButton('저장')
+        cancel_btn = QPushButton('닫기')
+        save_btn.clicked.connect(dialog.accept)
+        cancel_btn.clicked.connect(dialog.reject)
+        actions.addWidget(save_btn)
+        actions.addWidget(cancel_btn)
+        layout.addLayout(actions)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            self.potion_slots = list(slots)
+            self.potion_reader.reset()
+            self.potion_confirmations = {}
+            self.save_config()
+            self.update_potion_display(self._monotonic())
+            self.status.set(f'포션 슬롯 {len(self.potion_slots)}개 저장됨' if self.potion_slots else '포션 슬롯 모두 삭제됨')
 
     def show_history(self):
         from record_history import build_dialog
