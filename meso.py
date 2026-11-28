@@ -104,11 +104,17 @@ def white_boxes(frame):
     rgb = frame if frame.mode == 'RGB' else frame.convert('RGB')
     pixels = np.asarray(rgb)
     mask = cv2.inRange(pixels, (215, 215, 215), (255, 255, 255))
+    if cv2.countNonZero(mask) < 200:
+        return []
     count, _, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=4)
+    if count <= 1:
+        return []
+    body = stats[1:count]
+    keep = ((body[:, cv2.CC_STAT_HEIGHT] >= 9)
+            & (body[:, cv2.CC_STAT_WIDTH] >= 36)
+            & (body[:, cv2.CC_STAT_AREA] >= 200))
     boxes = []
-    for x, y, w, h, area in stats[1:count]:
-        if h < 9 or w < 36 or area < 200:
-            continue
+    for x, y, w, h, _ in body[keep]:
         # A box can touch other bright UI through a gap in its border; split at rows that are
         # mostly dark (the border lines) and keep each band that is shaped like a box.
         region = mask[y:y + h, x:x + w] > 0

@@ -32,11 +32,13 @@ def read(frame, cache=None):
     crop. OCR is deterministic for identical pixels, so a byte-identical crop
     reuses that result instead of running recognition again.
     """
+    import hashlib
     import numpy as np
     import map_name
 
     def recognized(name, image, detect):
-        key = (image.mode, image.size, image.tobytes())
+        digest = hashlib.blake2b(image.tobytes(), digest_size=16).digest()
+        key = (image.mode, image.size, digest)
         if cache is not None:
             hit = cache.get(name)
             if hit is not None and hit[0] == key:

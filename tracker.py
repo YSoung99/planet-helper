@@ -25,7 +25,7 @@ RESOURCES = Path(getattr(sys, '_MEIPASS', Path(__file__).resolve().parent))
 BASE = Path(os.environ.get('PLANET_EXP_DATA_DIR') or (
     Path.home()/'Library'/'Application Support'/'Maple Planet Helper Auto Trial'
     if sys.platform == 'darwin' else Path(__file__).resolve().parent))
-APP_VERSION = '1.4.36'
+APP_VERSION = '1.4.37'
 MAX_BOUNDARY_GAP = 10.0
 BURNING_MAX_LEVEL = 120  # Planet Up & Up grants one bonus level, capped at 120.
 REST_AFTER = 180.0  # EXP unchanged this long: rest counted from the last gain
@@ -827,13 +827,26 @@ class Session:
 
     def _boundary_exp(self, stamp):
         if stamp <= self.started: return float(self.first[0]), 0.0
-        points = list(self.samples)
-        for (left_t,left_exp),(right_t,right_exp) in zip(points,points[1:]):
-            if left_t <= stamp <= right_t:
-                if stamp == left_t: return float(left_exp), 0.0
-                if stamp == right_t: return float(right_exp), 0.0
-                ratio = (stamp-left_t)/(right_t-left_t)
-                return left_exp+(right_exp-left_exp)*ratio, round(right_t-left_t, 3)
+        n = len(self.samples)
+        if n < 2:
+            return None, None
+        # Binary search on monotonic sample timestamps (O(log N) instead of O(N) list copy).
+        lo, hi = 0, n - 1
+        if stamp < self.samples[0][0] or stamp > self.samples[hi][0]:
+            return None, None
+        while lo + 1 < hi:
+            mid = (lo + hi) // 2
+            if self.samples[mid][0] <= stamp:
+                lo = mid
+            else:
+                hi = mid
+        left_t, left_exp = self.samples[lo]
+        right_t, right_exp = self.samples[hi]
+        if left_t <= stamp <= right_t:
+            if stamp == left_t: return float(left_exp), 0.0
+            if stamp == right_t: return float(right_exp), 0.0
+            ratio = (stamp-left_t)/(right_t-left_t)
+            return left_exp+(right_exp-left_exp)*ratio, round(right_t-left_t, 3)
         return None, None
 
     def establish_rate_anchor(self, stamp, exp, boundary=False):
@@ -1310,12 +1323,16 @@ class MeasurementCore:
                 del _capture_state.backend
             _capture_state.disabled = False
 
-    def save_observation(self):
+    SUMMARY_FLUSH_SECONDS = 5.0
+    PREVIEW_PNG_FLUSH_SECONDS = 5.0
+
+    def save_observation(self, *, force_summary=False):
         folder = BASE/'records'
         folder.mkdir(exist_ok=True)
         path = folder/(self.session.session_id+'.csv')
         header = ['관측 시각','현재 경험치','퍼센트','사냥 초','총 획득 경험치','상태']
         temporary = path.with_suffix('.csv.tmp')
+        first_write = self.session.persisted_rows == 0
         try:
             if self.session.ledger_dirty:
                 with temporary.open('w', newline='', encoding='utf-8-sig') as stream:
@@ -1334,7 +1351,19 @@ class MeasurementCore:
         except OSError:
             self.session.ledger_dirty = True
             raise
-        self.save_summary()
+        now = time.monotonic()
+        last_flush = getattr(self, '_last_summary_flush', None)
+        last_sid = getattr(self, '_last_summary_session', None)
+        last_started = getattr(self, '_last_summary_started', None)
+        must_flush = (
+            force_summary or first_write or self.session.ended is not None
+            or self.session.blocked or self.session.meso_dirty or self.session.exp_buffs_dirty
+            or last_sid != self.session.session_id
+            or last_started != self.session.started
+            or last_flush is None or now - last_flush >= self.SUMMARY_FLUSH_SECONDS
+        )
+        if must_flush:
+            self.save_summary()
 
     def save_summary(self):
         folder = BASE/'records'
@@ -1376,6 +1405,9 @@ class MeasurementCore:
         temp = folder/(self.session.session_id+'.json.tmp')
         temp.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding='utf-8')
         temp.replace(folder/(self.session.session_id+'.json'))
+        self._last_summary_flush = now
+        self._last_summary_session = self.session.session_id
+        self._last_summary_started = self.session.started
         self.session.exp_buffs_dirty = False
         self.session.meso_dirty = False
 
@@ -1406,13 +1438,23 @@ class MeasurementCore:
             stream.write(json.dumps(record,ensure_ascii=False)+'\n')
         frame = details.get('image')
         if frame is not None:
+            import hashlib
             group = 'accepted' if accepted else 'rejected'
-            key = (self.session.session_id, frame.size, frame.tobytes())
-            if not hasattr(self,'saved_frame_keys'): self.saved_frame_keys = {}
-            if self.saved_frame_keys.get(group) != key:
-                name = self.session.session_id+('-last-accepted.png' if accepted else '-last-rejected.png')
-                frame.save(folder/name)
-                self.saved_frame_keys[group] = key
+            now_mono = time.monotonic()
+            if not hasattr(self, 'saved_frame_keys'): self.saved_frame_keys = {}
+            if not hasattr(self, 'saved_frame_at'): self.saved_frame_at = {}
+            prev_at = self.saved_frame_at.get(group)
+            prev_key = self.saved_frame_keys.get(group)
+            same_session = prev_key is not None and prev_key[0] == self.session.session_id
+            if (not same_session or prev_at is None
+                    or now_mono - prev_at >= self.PREVIEW_PNG_FLUSH_SECONDS):
+                digest = hashlib.blake2b(frame.tobytes(), digest_size=16).digest()
+                key = (self.session.session_id, frame.size, digest)
+                if prev_key != key:
+                    name = self.session.session_id+('-last-accepted.png' if accepted else '-last-rejected.png')
+                    frame.save(folder/name)
+                    self.saved_frame_keys[group] = key
+                    self.saved_frame_at[group] = now_mono
 
 
 # Backwards-compatible name used by tests and diagnostics.

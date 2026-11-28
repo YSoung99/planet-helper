@@ -69,13 +69,23 @@ def short_exp(value):
     return f'{value/1e8:.2f}억' if value >= 1e8 else f'{value/1e4:,.0f}만' if value >= 1e4 else f'{value:,.0f}'
 
 
+def _set_text(widget, text):
+    if widget.text() != text:
+        widget.setText(text)
+
+
+def _set_tooltip(widget, tip):
+    if widget.toolTip() != tip:
+        widget.setToolTip(tip)
+
+
 def set_exp_stat(label, text, explanation):
     if len(text) > len('999,999,999') and text.replace(',', '').isdigit():
-        label.setText(short_exp(int(text.replace(',', ''))))
-        label.setToolTip(f'{text} EXP · {explanation}')
+        _set_text(label, short_exp(int(text.replace(',', ''))))
+        _set_tooltip(label, f'{text} EXP · {explanation}')
     else:
-        label.setText(text)
-        label.setToolTip(explanation)
+        _set_text(label, text)
+        _set_tooltip(label, explanation)
 
 
 def arrival_clock(minutes, now):
@@ -1120,16 +1130,17 @@ class SharedController(MenuAndSettingsMixin, MesoAndProbesMixin, JevMixin, track
                 if total >= 60 and not gap: timer += f' · 사냥 {active*100//total}%'
             if gap:
                 timer = ' · '.join(filter(None,(timer,f'공백 {gap//60}:{gap%60:02d}')))
+        timer_tip = '순수 사냥 ' + ' · '.join(filter(None,(hunt_time,timer)))
         for widget in (self.timer_label, self.compact_time):
-            widget.setText(hunt_time)
-            widget.setToolTip('순수 사냥 ' + ' · '.join(filter(None,(hunt_time,timer))))
-        self.time_info.setText(timer)
+            _set_text(widget, hunt_time)
+            _set_tooltip(widget, timer_tip)
+        _set_text(self.time_info, timer)
         while not self.hunt_activity_results.empty():
             generation, stamp, observation = self.hunt_activity_results.get_nowait()
             if self.running and generation == self.generation:
                 self.hunt_activity.update(generation, stamp, observation)
-        self.activity_label.setText(self.hunt_activity.text(self.generation, now) if self.running
-                                    else '사냥 신호 · 측정 대기')
+        _set_text(self.activity_label, self.hunt_activity.text(self.generation, now) if self.running
+                  else '사냥 신호 · 측정 대기')
         self.apply_jev_hints(now)
         self.apply_character_results(now)
         self.apply_buff_results(now)
@@ -1167,27 +1178,27 @@ class SharedController(MenuAndSettingsMixin, MesoAndProbesMixin, JevMixin, track
             footer = self.save_warning or self.audit_warning
         if not self.session.blocked and any(key[0] == self.session.session_id for key in self.capture_failures):
             footer = '시작 화면 저장 실패 · 기록 폴더/용량 확인'
-        self.footer.setText('● '+footer)
-        self.footer.setToolTip(' · '.join(filter(None,[self.session.stop_reason,self.save_warning,self.audit_warning]))
-                               if self.session.blocked else warning)
+        _set_text(self.footer, '● '+footer)
+        _set_tooltip(self.footer, ' · '.join(filter(None,[self.session.stop_reason,self.save_warning,self.audit_warning]))
+                     if self.session.blocked else warning)
         footer_style = 'color: '+('#e7b86e' if self.session.blocked or (self.running and delayed) else '#a8edbb' if self.running else '#7c8c9d')+';'
         if footer_style != self.footer.styleSheet():
             self.footer.setStyleSheet(footer_style)
-        self.current_label.setText(self.value.get())
+        _set_text(self.current_label, self.value.get())
         starting_exp = self.session.rows[0][1] if self.session.rows else None
-        self.baseline_label.setText(f'시작 기준 {starting_exp:,}' if starting_exp is not None else '시작 기준 —')
+        _set_text(self.baseline_label, f'시작 기준 {starting_exp:,}' if starting_exp is not None else '시작 기준 —')
         checked = str(self.session.level) in tracker.EXP_METADATA.get('screenshot_verified',{})
         if self.session.level is not None and self.session.level in tracker.EXP_TABLE:
             table_text = (f'남음 {self.session.total-self.session.last[0]:,} · 통 {self.session.total:,}'
                           if self.session.last else f'{self.session.level}레벨 통 {self.session.total:,} · '+('사진 대조' if checked else '참고표'))
         else: table_text = '경험치통 추정치 사용'
-        self.table_label.setText(table_text)
-        self.detail_label.setText(self.status.get())
+        _set_text(self.table_label, table_text)
+        _set_text(self.detail_label, self.status.get())
         ui_text = self.hud_information.text(running=self.running, automatic=self.auto_hud,
                                             generation=self.generation, now=now)
-        self.ui_label.setText(ui_text)
-        self.title_label.setToolTip(ui_text)
-        self.toggle_button.setText('측정 정지' if self.running else '측정 시작')
+        _set_text(self.ui_label, ui_text)
+        _set_tooltip(self.title_label, ui_text)
+        _set_text(self.toggle_button, '측정 정지' if self.running else '측정 시작')
         if self.toggle_button.property('running') != self.running:
             self.toggle_button.setProperty('running', self.running)
             style = self.toggle_button.style()

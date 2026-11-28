@@ -30,29 +30,58 @@ class WindowCapture:
         } if self.display.has_extension('Composite') and info.image_byte_order == X.LSBFirst else set()
         self.hidden_atom = self.display.intern_atom('_NET_WM_STATE_HIDDEN')
         self.state_atom = self.display.intern_atom('_NET_WM_STATE')
+        self.client_list_atom = self.display.intern_atom('_NET_CLIENT_LIST')
+        self.active_window_atom = self.display.intern_atom('_NET_ACTIVE_WINDOW')
+        self._cached_wid = None
 
-    def game(self):
-        # MapleStory Worlds can own several msw.exe windows (e.g. a minimized
-        # launcher next to the game itself), so skip hidden ones and only report
-        # "minimized" when no visible msw.exe window is left.
-        prop=self.root.get_full_property(self.display.intern_atom('_NET_CLIENT_LIST'),X.AnyPropertyType)
-        hidden=False
-        for wid in ([] if prop is None else prop.value):
-            window=self.display.create_resource_object('window',int(wid))
-            classes=window.get_wm_class() or ()
-            if not any(str(c).lower()=='msw.exe' for c in classes): continue
+    def _inspect_msw(self, wid):
+        """Return (window, bounds, status) where status is 'visible', 'hidden', or 'other'."""
+        try:
+            window = self.display.create_resource_object('window', int(wid))
+            classes = window.get_wm_class() or ()
+            if not any(str(c).lower() == 'msw.exe' for c in classes):
+                return None, None, 'other'
             state = window.get_full_property(self.state_atom, X.AnyPropertyType)
             if (window.get_attributes().map_state != X.IsViewable
-                    or state is not None and self.hidden_atom in state.value):
-                hidden=True
-                continue
-            geo=window.get_geometry(); point=self.root.translate_coords(window,0,0)
-            return window,dict(left=point.x,top=point.y,width=geo.width,height=geo.height)
+                    or (state is not None and self.hidden_atom in state.value)):
+                return window, None, 'hidden'
+            geo = window.get_geometry()
+            point = self.root.translate_coords(window, 0, 0)
+            return window, dict(left=point.x, top=point.y, width=geo.width, height=geo.height), 'visible'
+        except error.XError:
+            return None, None, 'other'
+
+    def game(self):
+        # Fast path: recheck the last known visible msw.exe window in O(1) before scanning
+        # the full X11 _NET_CLIENT_LIST window tree.
+        cached = getattr(self, '_cached_wid', None)
+        if cached is not None:
+            window, bounds, status = self._inspect_msw(cached)
+            if status == 'visible':
+                return window, bounds
+            self._cached_wid = None
+        client_atom = getattr(self, 'client_list_atom', None)
+        if client_atom is None:
+            client_atom = self.display.intern_atom('_NET_CLIENT_LIST')
+            self.client_list_atom = client_atom
+        prop = self.root.get_full_property(client_atom, X.AnyPropertyType)
+        hidden = False
+        for wid in ([] if prop is None else prop.value):
+            window, bounds, status = self._inspect_msw(wid)
+            if status == 'visible':
+                self._cached_wid = int(wid)
+                return window, bounds
+            if status == 'hidden':
+                hidden = True
         if hidden: raise RuntimeError('게임 최소화 · 판독 대기')
         raise RuntimeError('MapleStory Worlds 게임 창을 찾을 수 없음')
 
     def check_active(self, window):
-        active = self.root.get_full_property(self.display.intern_atom('_NET_ACTIVE_WINDOW'), X.AnyPropertyType)
+        active_atom = getattr(self, 'active_window_atom', None)
+        if active_atom is None:
+            active_atom = self.display.intern_atom('_NET_ACTIVE_WINDOW')
+            self.active_window_atom = active_atom
+        active = self.root.get_full_property(active_atom, X.AnyPropertyType)
         if active is None or len(active.value) == 0 or int(active.value[0]) != window.id:
             raise RuntimeError('게임 창 활성화 대기 · 다른 창에서는 판독 중지')
 

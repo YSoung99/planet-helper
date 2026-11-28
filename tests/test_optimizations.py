@@ -235,6 +235,92 @@ class JevControlsAndUpdatePruningTests(unittest.TestCase):
             remaining = sorted(p.name for p in versions.iterdir())
             self.assertEqual(remaining, ['custom-dir', 'v1.4.32-ccc', 'v1.4.33-ddd'])
 
+    def test_frame_ring_stores_compressed_jpeg_bytes_and_decodes_on_demand(self):
+        import jev_assist
+        ring = jev_assist.FrameRing()
+        frame = Image.new('RGB', (1920, 1080), (40, 80, 120))
+        ring.remember(0.0, frame)
+        self.assertEqual(len(ring.frames), 1)
+        stored = ring.frames[0][1]
+        self.assertIsInstance(stored, bytes)
+        self.assertLess(len(stored), 25_000)  # vs ~1.5 MB uncompressed RGB
+        decoded = ring.latest()
+        self.assertEqual(decoded.size, (960, 540))
+        self.assertEqual(decoded.mode, 'RGB')
+
+    def test_boundary_exp_binary_search_matches_exact_interpolation(self):
+        session = tracker.Session(level=170)
+        session.started = 0.0
+        session.first = (1_000_000, 0.23)
+        for i in range(0, 300):
+            session.samples.append((float(i), 1_000_000 + i * 1000))
+        exp_mid, gap_mid = session._boundary_exp(150.5)
+        self.assertAlmostEqual(exp_mid, 1_150_500.0)
+        self.assertAlmostEqual(gap_mid, 1.0)
+        exp_exact, gap_exact = session._boundary_exp(200.0)
+        self.assertAlmostEqual(exp_exact, 1_200_000.0)
+        self.assertEqual(gap_exact, 0.0)
+        self.assertEqual(session._boundary_exp(500.0), (None, None))
+
+    def test_save_observation_throttles_summary_writes_while_appending_csv_immediately(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.object(tracker, 'BASE', Path(tmp)):
+                session = tracker.Session(level=170)
+                writer = tracker.App.__new__(tracker.App)
+                writer.session = session
+                with patch.object(writer, 'save_summary', wraps=writer.save_summary) as flush:
+                    for t, exp in ((0.0, 219671043), (1.0, 219672043), (2.0, 219673043),
+                                   (3.0, 219674043), (4.0, 219675043), (8.0, 219676043)):
+                        session.accept((exp, 51.32), t, corroborated=True, baseline_verified=True)
+                        with patch.object(tracker.time, 'monotonic', return_value=t):
+                            writer.save_observation()
+                # Immediate on baseline (t=0), immediate on hunt-start (t=1), throttled at t=2..4, flushed at t=8.
+                self.assertEqual(flush.call_count, 3)
+                csv_lines = (Path(tmp) / 'records' / f'{session.session_id}.csv').read_text(encoding='utf-8-sig').splitlines()
+                self.assertEqual(len(csv_lines), 1 + len(session.rows))
+
+    def test_linux_capture_caches_visible_window_to_skip_tree_scan(self):
+        if not __import__('sys').platform.startswith('linux'):
+            self.skipTest('Linux-only X11 test')
+        from Xlib import X
+        from linux_capture import WindowCapture
+        calls = {'list': 0, 'inspect': 0}
+
+        class FakeWin:
+            def __init__(self, wid): self.id = wid
+            def get_wm_class(self):
+                calls['inspect'] += 1
+                return ('msw.exe', 'msw.exe')
+            def get_full_property(self, *a): return SimpleNamespace(value=[])
+            def get_attributes(self): return SimpleNamespace(map_state=X.IsViewable)
+            def get_geometry(self): return SimpleNamespace(width=1280, height=720)
+
+        w1 = FakeWin(42)
+        cap = WindowCapture.__new__(WindowCapture)
+        cap.state_atom, cap.hidden_atom = 'STATE', 'HIDDEN'
+        cap.client_list_atom = 'CLIENT_LIST'
+        cap._cached_wid = None
+        cap.display = SimpleNamespace(
+            intern_atom=lambda name: name,
+            create_resource_object=lambda kind, wid: w1,
+        )
+
+        def get_list(*a):
+            calls['list'] += 1
+            return SimpleNamespace(value=[1, 2, 3, 42])
+
+        cap.root = SimpleNamespace(
+            get_full_property=get_list,
+            translate_coords=lambda w, x, y: SimpleNamespace(x=0, y=0),
+        )
+        # First call scans _NET_CLIENT_LIST and caches wid=42.
+        self.assertEqual(cap.game()[0].id, 42)
+        self.assertEqual(calls['list'], 1)
+        # Subsequent calls hit O(1) cache without touching _NET_CLIENT_LIST.
+        for _ in range(5):
+            self.assertEqual(cap.game()[0].id, 42)
+        self.assertEqual(calls['list'], 1)
+
 
 if __name__ == '__main__':
     unittest.main()
