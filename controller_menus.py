@@ -243,6 +243,10 @@ class MenuAndSettingsMixin:
                    self.jev_full_screen, self.set_jev_full_screen)
 
         gains = menu.addMenu('메소·버프')
+        gains.addAction('메소 영역 수동 지정…', self.select_meso_region)
+        if getattr(self, 'meso_region', None) is not None:
+            gains.addAction('메소 자동 탐색으로 되돌리기', self.clear_meso_region)
+        gains.addSeparator()
         gains.addAction('메소 큰 변동 기준 금액', self.meso_threshold_settings)
         gains.addAction('이번 측정의 큰 메소 변동 분류…', self.classify_meso_change)
         gains.addSeparator()

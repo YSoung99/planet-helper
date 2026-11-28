@@ -75,8 +75,10 @@ def title_area(image):
 def recognize_lines(image, *, detect=True):
     import numpy as np
     with _recognition_lock:
-        result = _get_engine()(np.asarray(image.convert('RGB')), use_det=detect)
-    return list(zip(result.txts, result.scores)) if result.txts is not None else []
+        result = _get_engine()(np.asarray(image.convert('RGB')), use_det=detect, use_rec=True)
+    txts = getattr(result, 'txts', None)
+    scores = getattr(result, 'scores', None)
+    return list(zip(txts, scores)) if txts is not None and scores is not None else []
 
 
 def read(image):
@@ -90,11 +92,12 @@ def read_title(crop):
     from PIL import Image
     crop = crop.resize((crop.width*2, crop.height*2), Image.Resampling.LANCZOS)
     with _recognition_lock:
-        result = _get_engine()(np.asarray(crop), use_det=True)
-    if result.txts is None:
+        result = _get_engine()(np.asarray(crop), use_det=True, use_rec=True)
+    txts = getattr(result, 'txts', None)
+    if txts is None:
         return None
     lines = [(min(point[1] for point in box), text, float(score))
-             for box, text, score in zip(result.boxes, result.txts, result.scores)]
+             for box, text, score in zip(result.boxes, txts, result.scores)]
     return lines_to_name(lines)
 
 

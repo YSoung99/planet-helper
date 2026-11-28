@@ -202,20 +202,21 @@ class SnapshotSignals(QObject):
 
 
 class WindowImage(QWidget):
-    def __init__(self, dialog, image):
+    def __init__(self, dialog, image, mode='exp'):
         super().__init__(dialog)
         self.dialog = dialog
+        self.mode = mode
         self.start = self.end = None
         rgb = image.convert('RGB')
         self.pixmap = QPixmap.fromImage(QImage(rgb.tobytes(),rgb.width,rgb.height,rgb.width*3,QImage.Format.Format_RGB888).copy())
         self.setCursor(Qt.CursorShape.CrossCursor)
-        self.setAccessibleName('게임 경험치 영역 선택 이미지')
+        self.setAccessibleName('인벤토리 메소 영역 선택 이미지' if mode == 'meso' else '게임 경험치 영역 선택 이미지')
 
     def paintEvent(self,event):
         painter = QPainter(self)
         painter.drawPixmap(self.rect(),self.pixmap,self.pixmap.rect())
         if self.start is not None:
-            painter.setPen(QPen(QColor('#ff5555'),2))
+            painter.setPen(QPen(QColor('#fbbf77' if self.mode == 'meso' else '#ff5555'),2))
             painter.drawRect(QRect(self.start,self.end).normalized())
 
     def mousePressEvent(self,event):
@@ -231,25 +232,33 @@ class WindowImage(QWidget):
         self.end = event.position().toPoint()
         rect = QRect(self.start,self.end).normalized().intersected(self.rect())
         points = self.dialog.image.info['content_points']
-        if rect.width()/self.width()*points[0] < 40 or rect.height()/self.height()*points[1] < 8:
-            self.dialog.instruction.setText('선택이 너무 작아요 · 경험치 숫자와 [퍼센트]를 함께 선택해 주세요')
+        min_width = 24 if self.mode == 'meso' else 40
+        if rect.width()/self.width()*points[0] < min_width or rect.height()/self.height()*points[1] < 8:
+            self.dialog.instruction.setText(
+                '선택이 너무 작아요 · 인벤토리 메소 숫자 칸 전체를 드래그해 주세요'
+                if self.mode == 'meso' else '선택이 너무 작아요 · 경험치 숫자와 [퍼센트]를 함께 선택해 주세요')
             return
         roi = dict(left=rect.x()/self.width(),top=rect.y()/self.height(),
                    width=rect.width()/self.width(),height=rect.height()/self.height(),
                    reference_aspect=points[0]/points[1])
-        self.dialog.controller.apply_window_region(roi,self.dialog.image)
+        if self.mode == 'meso':
+            self.dialog.controller.apply_meso_region(roi,self.dialog.image)
+        else:
+            self.dialog.controller.apply_window_region(roi,self.dialog.image)
 
 
 class WindowSelection(QDialog):
-    def __init__(self,controller,image):
+    def __init__(self,controller,image,mode='exp'):
         super().__init__(controller.window,Qt.WindowType.Dialog | Qt.WindowType.WindowStaysOnTopHint)
-        self.controller,self.image = controller,image
-        self.setWindowTitle('게임 경험치 영역 지정')
+        self.controller,self.image,self.mode = controller,image,mode
+        self.setWindowTitle('인벤토리 메소 영역 지정' if mode == 'meso' else '게임 경험치 영역 지정')
         self.setWindowModality(Qt.WindowModality.WindowModal)
         layout = QVBoxLayout(self)
-        self.instruction = QLabel('게임 창 이미지에서 경험치 숫자와 [퍼센트]만 드래그 · ESC 취소')
+        self.instruction = QLabel(
+            '게임 창 이미지에서 인벤토리 메소 숫자 칸을 드래그 · ESC 취소'
+            if mode == 'meso' else '게임 창 이미지에서 경험치 숫자와 [퍼센트]만 드래그 · ESC 취소')
         layout.addWidget(self.instruction)
-        self.image_view = WindowImage(self,image)
+        self.image_view = WindowImage(self,image,mode=mode)
         available = controller.application.primaryScreen().availableGeometry()
         factor = min((available.width()-80)/image.width,(available.height()-140)/image.height,1)
         self.image_view.setFixedSize(round(image.width*factor),round(image.height*factor))
@@ -321,11 +330,14 @@ class SharedController(MenuAndSettingsMixin, MesoAndProbesMixin, JevMixin, track
         self.scan_seconds = 0
         self.target_seconds = 1.0
         self.preview_frame = self.preview_stamp = None
+        self.meso_preview_frame = self.meso_preview_stamp = None
+        self.meso_diag = None
         self.save_warning = self.audit_warning = ''
         self.worker_ready = False
         self.stop = threading.Event()
         self.overlays = []
         self.selection_generation = 0
+        self.selection_mode = 'exp'
         self.capture_clients = threading.local()
         self.snapshot_signals = SnapshotSignals()
         self.snapshot_signals.ready.connect(self.present_window_selection)
@@ -372,6 +384,9 @@ class SharedController(MenuAndSettingsMixin, MesoAndProbesMixin, JevMixin, track
         self.meso_capture_lock = threading.Lock()
         self.meso_results = queue.SimpleQueue()
         self.meso_confirmation = meso.Confirmation()
+        self.idle_meso_confirmation = meso.Confirmation()
+        self.idle_meso_source = None
+        self.idle_meso = None
         self.meso_rechecking = False
         self.meso_log = meso.DailyLog()
         self.meso_source = None
@@ -397,6 +412,9 @@ class SharedController(MenuAndSettingsMixin, MesoAndProbesMixin, JevMixin, track
         self.current_character = config.get('current_character')
         self.nickname_patterns = config.get('nickname_patterns', {})
         self.meso_trade_threshold = config.get('meso_trade_threshold', meso.TRADE_THRESHOLD)
+        self.meso_region = config.get('meso_region')
+        if self.meso_region is not None:
+            self.meso_reader.set_manual_roi(self.meso_region)
         self.cloud_remote = config.get('cloud_remote')
         self.cloud_lock = threading.Lock()
         self.cloud_signals = CloudSignals()
@@ -645,10 +663,17 @@ class SharedController(MenuAndSettingsMixin, MesoAndProbesMixin, JevMixin, track
 
     def select(self):
         if not self.finish_measurement('영역 재지정'): return
+        self._start_window_selection('exp', '게임 창 연결 중 · 영역 선택 이미지 준비')
+
+    def select_meso_region(self):
+        self._start_window_selection('meso', '게임 창 연결 중 · 메소 영역 선택 이미지 준비')
+
+    def _start_window_selection(self, mode, status_text):
         self.cancel_selection()
         if not self.check_permission(): return
+        self.selection_mode = mode
         token = self.selection_generation
-        self.status.set('게임 창 연결 중 · 영역 선택 이미지 준비')
+        self.status.set(status_text)
         def capture():
             try:
                 client = self.capture_module().WindowCapture()
@@ -663,13 +688,32 @@ class SharedController(MenuAndSettingsMixin, MesoAndProbesMixin, JevMixin, track
 
     def present_window_selection(self,token,image):
         if token != self.selection_generation or self.stop.is_set(): return
-        dialog = WindowSelection(self,image)
+        dialog = WindowSelection(self,image,mode=getattr(self,'selection_mode','exp'))
         self.overlays.append(dialog)
         dialog.show(); self.native_overlay(dialog,4); dialog.raise_(); dialog.activateWindow()
 
     def selection_failed(self,token,error):
         if token == self.selection_generation:
             self.status.set(error)
+
+    def apply_meso_region(self, roi, selection_image=None):
+        self.meso_region = roi
+        self.meso_reader_source = None
+        self.meso_reader.set_manual_roi(roi)
+        self.save_config()
+        if selection_image is not None:
+            pixel_rect = self.capture_module().pixel_rect
+            left, top, width, height = pixel_rect(roi, selection_image.width, selection_image.height)
+            self.meso_preview_frame = (selection_image.crop((left, top, left + width, top + height)), time.monotonic())
+        self.status.set('메소 수동 영역 저장됨 · 인벤토리가 열리면 지정 영역에서 읽어요')
+        self.cancel_selection()
+
+    def clear_meso_region(self):
+        self.meso_region = None
+        self.meso_reader_source = None
+        self.meso_reader.set_manual_roi(None)
+        self.save_config()
+        self.status.set('메소 영역 자동 탐색으로 되돌림')
 
     def apply_window_region(self,roi,selection_image=None):
         self.window_region = roi
@@ -767,7 +811,8 @@ class SharedController(MenuAndSettingsMixin, MesoAndProbesMixin, JevMixin, track
         if self.running and not self.session.restored and hasattr(self, 'meso_results'):
             now = time.monotonic()
             self.apply_meso_results(now, finishing=True)
-            self.session.meso.finish(None if self.meso_rechecking else self.meso_source, now)
+            self.session.meso.finish(self.meso_source, now)
+            self.update_meso_display(now)
         had_record = bool(self.session.rows) and not self.session.restored
         if not super().finish_measurement(reason):
             return False
@@ -798,6 +843,7 @@ class SharedController(MenuAndSettingsMixin, MesoAndProbesMixin, JevMixin, track
         buffer.clear()
         self.session = session
         session.meso_start_at = now
+        self.seed_meso_from_idle(self.generation, source[0], now)
         self.recent_start_source = source
         self.level_var.set(level)
         exp, pct = session.last
@@ -830,8 +876,9 @@ class SharedController(MenuAndSettingsMixin, MesoAndProbesMixin, JevMixin, track
                  and not self.hunt_activity_lock.locked()
                  and stamp >= getattr(self.capture_clients, 'next_activity_scan', 0)
                  and (not recent or stamp >= self.character_recheck_at))
-        meso_probe = (not recent and models_available and session.meso_start_at is not None
-                      and session.meso_start_frame is None and not self.meso_capture_lock.locked()
+        meso_probe = (models_available and not self.meso_capture_lock.locked()
+                      and ((not recent and session.meso_start_at is not None and session.meso_start_frame is None)
+                           or (recent and self.collect_recent()))
                       and (generation != getattr(self.capture_clients, 'meso_generation', None)
                            or stamp >= getattr(self.capture_clients, 'next_meso_scan', 0)))
         starting = not recent and (session.started is None or self.recent_start_source is not None)
@@ -862,7 +909,8 @@ class SharedController(MenuAndSettingsMixin, MesoAndProbesMixin, JevMixin, track
         if meso_probe and full is not None and window is not None:
             if self.queue_meso_frame(generation, observed_at, full, window):
                 self.capture_clients.meso_generation = generation
-                waiting_for_start = (session.meso.start is None
+                waiting_for_start = (not recent and session.meso.start is None
+                                     and session.meso_start_at is not None
                                      and stamp - session.meso_start_at <= meso.START_WINDOW)
                 self.capture_clients.next_meso_scan = stamp + self.meso_scan_interval(waiting_for_start)
         if probe:
@@ -1152,6 +1200,11 @@ class SharedController(MenuAndSettingsMixin, MesoAndProbesMixin, JevMixin, track
             frame = frame.convert('RGB')
             qimage = QImage(frame.tobytes(), frame.width, frame.height, frame.width*3, QImage.Format.Format_RGB888).copy()
             self.preview.setPixmap(QPixmap.fromImage(qimage).scaled(self.preview.size(), Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.FastTransformation))
+        if self.meso_preview_frame is not None and self.meso_preview_frame[1] != self.meso_preview_stamp:
+            frame, self.meso_preview_stamp = self.meso_preview_frame
+            frame = frame.convert('RGB')
+            qimage = QImage(frame.tobytes(), frame.width, frame.height, frame.width*3, QImage.Format.Format_RGB888).copy()
+            self.meso_preview.setPixmap(QPixmap.fromImage(qimage).scaled(self.meso_preview.size(), Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.FastTransformation))
 
     def update_recent_button(self, now):
         available = (not self.running and self.collect_recent() and self.recent_exp.available(now)
@@ -1185,6 +1238,7 @@ class SharedController(MenuAndSettingsMixin, MesoAndProbesMixin, JevMixin, track
                 'nickname_patterns': getattr(self, 'nickname_patterns', {}),
                 'cloud_remote': getattr(self, 'cloud_remote', None),
                 'meso_trade_threshold': getattr(self, 'meso_trade_threshold', meso.TRADE_THRESHOLD),
+                'meso_region': getattr(self, 'meso_region', None),
             }), encoding='utf-8')
             temporary.replace(tracker.BASE/'settings.json')
         except OSError as exc:

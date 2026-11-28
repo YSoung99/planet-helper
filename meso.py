@@ -3,7 +3,8 @@
 The inventory shows the amount in a white box at its bottom edge, wherever the window is: the
 classic UI writes `[coin] [8,890,080] 메소`, the new UI `[coin 메소] [24,252,276]`. A white box
 only counts when the word 메소 sits right next to it, which rules out the coin boxes of the trade
-window. Nothing is read while the inventory is closed.
+window (unless the user explicitly pinned a manual meso region). Nothing is read while the
+inventory is closed.
 """
 import csv
 import hashlib
@@ -19,9 +20,63 @@ MAX_THRESHOLD = 10**12
 END_WINDOW = 12.0
 CONFIRMATION_GAP = 8.0
 START_WINDOW = 30.0
+PRE_START_WINDOW = 180.0
+CONTINUOUS_CONFIRM_SECONDS = 60.0
+CHECKPOINT_INTERVAL = 15.0
+MAX_CHECKPOINTS = 600
+MIN_RATE_SECONDS = 60.0
+RECENT_FLOW_WINDOW = 360.0
 # A reading this many times larger or smaller than the last one is usually a dropped or extra digit.
 JUMP_RATIO = 10
 RECHECK = object()
+
+
+def format_short(value, *, signed=True):
+    """Compact Korean meso formatting: +1.23억, +148만, +8,500."""
+    if value is None:
+        return '—'
+    sign = '+' if signed and value > 0 else '-' if value < 0 else ('+' if signed else '')
+    mag = abs(value)
+    if mag >= 1e8:
+        return f'{sign}{mag / 1e8:.2f}억'
+    if mag >= 1e4:
+        return f'{sign}{mag / 1e4:,.1f}만' if mag < 1e6 else f'{sign}{mag / 1e4:,.0f}만'
+    return f'{sign}{mag:,.0f}'
+
+
+def is_suspicious_jump(previous, value):
+    """True when a jump looks like a dropped/extra digit or sudden zero glitch."""
+    if previous is None or value is None or previous == value:
+        return False
+    if value == 0 and previous > 0:
+        return True
+    if previous > 0 and value > 0:
+        if max(value, previous) >= JUMP_RATIO * min(value, previous):
+            return True
+        if max(value, previous) >= 100_000:
+            prev_s, curr_s = str(previous), str(value)
+            if abs(len(prev_s) - len(curr_s)) == 1:
+                shorter, longer = (prev_s, curr_s) if len(prev_s) < len(curr_s) else (curr_s, prev_s)
+                if longer.endswith(shorter) or longer.startswith(shorter):
+                    return True
+    return False
+
+
+def sources_compatible(first, second):
+    """True when two meso sources refer to the same session, window, and compatible character.
+
+    An empty character name '' means OCR had not resolved the nickname yet; transitioning from ''
+    to a confirmed character on the same game window is character resolution, not a character switch.
+    """
+    if first is None or second is None:
+        return False
+    if first == second:
+        return True
+    if len(first) != 3 or len(second) != 3:
+        return False
+    if first[0] != second[0] or first[2] != second[2]:
+        return False
+    return (not first[1] or not second[1]) and first[1] is not None and second[1] is not None
 
 
 def longest_run(flags, bridge=0):
@@ -48,7 +103,7 @@ def white_boxes(frame):
 
     rgb = frame if frame.mode == 'RGB' else frame.convert('RGB')
     pixels = np.asarray(rgb)
-    mask = cv2.inRange(pixels, (225, 225, 225), (255, 255, 255))
+    mask = cv2.inRange(pixels, (215, 215, 215), (255, 255, 255))
     count, _, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=4)
     boxes = []
     for x, y, w, h, area in stats[1:count]:
@@ -109,7 +164,7 @@ def amount_glyphs(frame, box):
     x, y, w, h = box
     gray = frame.crop((x, y, x + w, y + h)).convert('L')
     pixels = np.asarray(gray)
-    left, right = longest_run((pixels >= 222).mean(axis=0) >= .32, bridge=max(2, round(h * .3)))
+    left, right = longest_run((pixels >= 215).mean(axis=0) >= .32, bridge=max(2, round(h * .3)))
     margin = max(1, h // 24)
     if right - left < h or h <= margin * 2:
         return None
@@ -145,6 +200,7 @@ def read_gray_amount(glyphs):
 
 def read_binary_amount(glyphs):
     from PIL import Image, ImageOps
+    import numpy as np
 
     binary = glyphs.point(lambda pixel: 0 if pixel < 135 else 255)
     scale = max(2, round(40 / glyphs.height))
@@ -153,7 +209,19 @@ def read_binary_amount(glyphs):
     if value is not None:
         return value
     # A narrow glyph such as 0 can become ambiguous after enlargement.
-    return recognize_amount(ImageOps.expand(binary, border=(10, 5), fill=255))
+    value = recognize_amount(ImageOps.expand(binary, border=(10, 5), fill=255))
+    if value is not None:
+        return value
+    # Adaptive threshold fallback for slightly lighter/darker font rendering.
+    arr = np.asarray(glyphs)
+    low, high = int(arr.min()), int(arr.max())
+    if high - low >= 40:
+        midpoint = (low + high) // 2
+        if abs(midpoint - 135) >= 15:
+            adaptive = glyphs.point(lambda pixel, t=midpoint: 0 if pixel < t else 255)
+            scaled_ad = adaptive.resize((adaptive.width * scale, adaptive.height * scale), Image.Resampling.NEAREST)
+            return recognize_amount(ImageOps.expand(scaled_ad, border=8, fill=255))
+    return None
 
 
 def has_label(frame, box):
@@ -189,19 +257,30 @@ def has_label(frame, box):
 
 
 class Reader:
-    """Find the inventory meso box, remembering where it was last seen."""
+    """Find the inventory meso box, remembering where it was last seen or using a manual ROI."""
 
     RECHECK_SECONDS = 30.0
     MAX_REJECTED = 128
 
-    def __init__(self, arbiter=None):
+    def __init__(self, arbiter=None, manual_roi=None):
         self.box = None
         self.cached = None
         self.last_glyphs = None
         self.needs_recheck = False
         self.rejected = {}
         self.arbiter = arbiter
+        self.manual_roi = manual_roi
         self.hint = None      # normalized region JEV pointed at, searched when the full frame finds nothing
+        self.hinted = None
+        self.last_crop = None
+        self.last_diag = None
+
+    def set_manual_roi(self, manual_roi):
+        self.manual_roi = manual_roi
+        self.box = None
+        self.cached = None
+        self.last_glyphs = None
+        self.rejected.clear()
         self.hinted = None
 
     @staticmethod
@@ -212,7 +291,17 @@ class Reader:
                              min(frame.width, x + w + reach), min(frame.height, y + h + 3)))
         return frame.size, hashlib.blake2b(region.tobytes(), digest_size=16).digest()
 
+    @staticmethod
+    def preview_crop(frame, box):
+        x, y, w, h = box
+        pad_x = max(4, round(h * 0.4))
+        pad_y = max(2, round(h * 0.15))
+        return frame.crop((max(0, x - pad_x), max(0, y - pad_y),
+                           min(frame.width, x + w + pad_x), min(frame.height, y + h + pad_y))).convert('RGB')
+
     def read(self, frame, now=None):
+        if self.manual_roi is not None:
+            return self.read_manual(frame, now)
         value = self.read_frame(frame, now)
         if value is not None or self.needs_recheck or self.hint is None:
             return value
@@ -229,7 +318,64 @@ class Reader:
         reader = self.hinted[1]
         value = reader.read_frame(crop, now)
         self.needs_recheck = reader.needs_recheck
+        if reader.last_crop is not None:
+            self.last_crop = reader.last_crop
+        if reader.last_diag is not None and (value is not None or self.needs_recheck):
+            diag = dict(reader.last_diag)
+            diag['mode'] = 'jev_hint'
+            self.last_diag = diag
         return value
+
+    def read_manual(self, frame, now=None):
+        """Read directly from a user-pinned window-relative ROI while rejecting closed inventory."""
+        import time
+        import numpy as np
+        from window_capture import pixel_rect
+
+        now = time.monotonic() if now is None else now
+        self.needs_recheck = False
+        rx, ry, rw, rh = pixel_rect(self.manual_roi, frame.width, frame.height)
+        rx = max(0, min(rx, frame.width - 1))
+        ry = max(0, min(ry, frame.height - 1))
+        rw = min(rw, frame.width - rx)
+        rh = min(rh, frame.height - ry)
+        if rw < 16 or rh < 6:
+            self.box = self.cached = None
+            self.last_diag = {'mode': 'manual', 'status': 'missing', 'reason': '수동 영역이 너무 작아요',
+                              'frame_size': frame.size, 'box': None, 'value': None}
+            return None
+        roi_box = (rx, ry, rw, rh)
+        self.last_crop = frame.crop((rx, ry, rx + rw, ry + rh)).convert('RGB')
+        # Fast path: reuse cached reading if the manual ROI pixels did not change.
+        if self.box is not None and self.cached is not None:
+            signature = self.signature(frame, self.box)
+            if signature == self.cached[0]:
+                self.last_diag = {'mode': 'manual', 'status': 'ok',
+                                  'reason': f'수동 영역 인식 유지 ({self.cached[1]:,})',
+                                  'frame_size': frame.size, 'box': self.box, 'value': self.cached[1]}
+                return self.cached[1]
+        self.box = self.cached = None
+        # Look for a white box inside a slightly expanded region around the manual ROI first.
+        pad = max(6, rh // 2)
+        sx0, sy0 = max(0, rx - pad), max(0, ry - pad)
+        sx1, sy1 = min(frame.width, rx + rw + pad), min(frame.height, ry + rh + pad)
+        sub = frame.crop((sx0, sy0, sx1, sy1))
+        candidates = [(sx0 + bx, sy0 + by, bw, bh) for bx, by, bw, bh in white_boxes(sub)]
+        for box in candidates:
+            value = self.check(frame, box, now, require_label=False, mode='manual')
+            if value is not None or self.needs_recheck:
+                return value
+        # Fallback: test the exact manual ROI if it has a light background (inventory open).
+        gray = np.asarray(self.last_crop.convert('L'))
+        if (gray >= 215).mean() >= .40:
+            value = self.check(frame, roi_box, now, require_label=False, mode='manual')
+            if value is not None or self.needs_recheck:
+                return value
+            return None
+        self.last_diag = {'mode': 'manual', 'status': 'closed',
+                          'reason': '수동 영역에 밝은 메소 칸 없음 · 인벤토리가 닫혀 있거나 위치가 바뀜',
+                          'frame_size': frame.size, 'box': roi_box, 'value': None}
+        return None
 
     @property
     def located(self):
@@ -243,6 +389,10 @@ class Reader:
         if self.box is not None and self.cached is not None:
             signature = self.signature(frame, self.box)
             if signature == self.cached[0]:
+                self.last_crop = self.preview_crop(frame, self.box)
+                self.last_diag = {'mode': 'auto', 'status': 'ok',
+                                  'reason': f'인벤토리 메소 칸 인식 유지 ({self.cached[1]:,})',
+                                  'frame_size': frame.size, 'box': self.box, 'value': self.cached[1]}
                 return self.cached[1]
         old_box = self.box
         self.box = self.cached = None
@@ -253,45 +403,78 @@ class Reader:
             value = self.check(frame, old_box, now)
             if value is not None or self.needs_recheck:
                 return value
-        for box in white_boxes(frame):
+        boxes = white_boxes(frame)
+        checked = 0
+        for box in boxes:
             if box != old_box:
+                checked += 1
                 value = self.check(frame, box, now)
                 if value is not None or self.needs_recheck:
                     return value
+        if not boxes and old_box is None:
+            reason = '흰색 칸 없음 · 인벤토리가 닫혀 있거나 가려짐'
+        elif checked or old_box is not None:
+            reason = f'후보 칸 {len(boxes)}개 확인 · "메소" 라벨 또는 숫자 미일치'
+        else:
+            reason = '인벤토리 메소 칸 대기 중'
+        self.last_diag = {'mode': 'auto', 'status': 'missing', 'reason': reason,
+                          'frame_size': frame.size, 'box': None, 'value': None, 'candidates': len(boxes)}
         return None
 
-    def check(self, frame, box, now):
+    def check(self, frame, box, now, *, require_label=True, mode='auto'):
         x, y, w, h = box
         if x + w > frame.width or y + h > frame.height:
             return None
         signature = self.signature(frame, box)
-        rejected = self.rejected.get(box)
-        if rejected is not None and rejected[1] == signature:
-            return None
+        if require_label:
+            rejected = self.rejected.get(box)
+            if rejected is not None and rejected[1] == signature:
+                return None
         glyphs = amount_glyphs(frame, box)
         if glyphs is None:
+            if not require_label:
+                self.last_diag = {'mode': mode, 'status': 'occluded',
+                                  'reason': '글자 분리 실패 또는 가림 감지 · 판독 보류',
+                                  'frame_size': frame.size, 'box': box, 'value': None}
             return None
         key = glyphs.size, glyphs.tobytes()
         reuse = self.last_glyphs is not None and self.last_glyphs[0] == key
         value = self.last_glyphs[1] if reuse else read_amount(frame, box)
         if value is None:
             value = read_gray_amount(glyphs)
-        if value is not None and has_label(frame, box):
+        if value is not None and (not require_label or has_label(frame, box)):
             self.box = box
+            self.last_crop = self.preview_crop(frame, box)
             if not reuse:
                 binary = read_binary_amount(glyphs)
                 if binary != value:
-                    value = self.judge(glyphs, key, value, binary)
-                    if value is None:
+                    judged = self.judge(glyphs, key, value, binary)
+                    if judged is None:
                         self.needs_recheck = True
+                        b_text = '없음' if binary is None else f'{binary:,}'
+                        self.last_diag = {
+                            'mode': mode, 'status': 'recheck',
+                            'reason': f'원본({value:,}) / 흑백({b_text}) 불일치 · 재확인 중',
+                            'frame_size': frame.size, 'box': box, 'value': None,
+                            'candidates': (value, binary),
+                        }
                         return None
+                    value = judged
             self.last_glyphs = key, value
             self.cached = signature, value
+            self.last_diag = {'mode': mode, 'status': 'ok',
+                              'reason': f'{"수동 영역" if mode == "manual" else "인벤토리"} 메소 인식 ({value:,})',
+                              'frame_size': frame.size, 'box': box, 'value': value}
             return value
-        self.rejected.pop(box, None)
-        if len(self.rejected) >= self.MAX_REJECTED:
-            del self.rejected[next(iter(self.rejected))]
-        self.rejected[box] = (now, signature)
+        if require_label:
+            self.rejected.pop(box, None)
+            if len(self.rejected) >= self.MAX_REJECTED:
+                del self.rejected[next(iter(self.rejected))]
+            self.rejected[box] = (now, signature)
+        else:
+            self.last_diag = {'mode': mode, 'status': 'unreadable',
+                              'reason': '수동 영역 숫자 판독 보류 · 영역이 정확한지 확인해 주세요',
+                              'frame_size': frame.size, 'box': box, 'value': None}
         return None
 
     def judge(self, glyphs, key, color, binary):
@@ -315,7 +498,7 @@ class Reader:
 
 
 class Confirmation:
-    """Accept a value seen twice in a row; a tenfold jump needs a third sighting."""
+    """Accept a value seen twice in a row; suspicious jumps/digit-drops need a third sighting."""
 
     def __init__(self):
         self.current = None
@@ -346,9 +529,7 @@ class Confirmation:
             self.count = 1
             self.pending_since = stamp
         self.pending = value
-        needed = 2
-        if self.current and value and max(value, self.current) >= JUMP_RATIO * min(value, self.current):
-            needed = 3
+        needed = 3 if is_suspicious_jump(self.current, value) else 2
         if self.count >= needed:
             self.current, self.pending, self.count = value, None, 0
             self.first_seen = self.pending_since
@@ -431,7 +612,7 @@ class DailyLog:
 
 
 class SessionMeso:
-    """Store sampled balance changes without guessing their cause."""
+    """Store sampled balance changes with exact active-time spans and flow checkpoints."""
 
     def __init__(self, data=None):
         data = data if isinstance(data, dict) else {}
@@ -452,41 +633,110 @@ class SessionMeso:
                        } if isinstance(marks, list) else set()
         self.complete = data.get('complete', self.readings >= 2) is True
         self.legacy = bool(data) and 'large_changes' not in data
+        start_active = data.get('start_active')
+        end_active = data.get('end_active')
+        if (isinstance(start_active, (int, float)) and isinstance(end_active, (int, float))
+                and 0 <= start_active <= end_active):
+            self.start_active = float(start_active)
+            self.end_active = float(end_active)
+        else:
+            measured = data.get('measured_seconds')
+            if isinstance(measured, (int, float)) and measured > 0:
+                self.start_active = 0.0
+                self.end_active = float(measured)
+            else:
+                self.start_active = self.end_active = None
+        self.checkpoints = []
+        self.large_change_times = []
+        self.seeded = False
         self.source = self.last_seen = self.opening = None
         self.source_changed = False
 
     def check_source(self, source):
-        if self.source is not None and source != self.source:
+        if self.source is None:
+            return not self.source_changed
+        if source is None:
             self.source_changed = True
-        return not self.source_changed
+            return False
+        if source == self.source:
+            return not self.source_changed
+        if sources_compatible(self.source, source):
+            if not self.source[1] and source[1]:
+                self.source = source
+            return not self.source_changed
+        self.source_changed = True
+        return False
 
-    def observe(self, value, threshold=TRADE_THRESHOLD):
+    def _record_checkpoint(self, active_seconds, value):
+        if active_seconds is None:
+            return
+        active = max(0.0, float(active_seconds))
+        if self.start_active is None:
+            self.start_active = active
+        if self.end_active is None or active >= self.end_active:
+            self.end_active = active
+        if not self.checkpoints:
+            self.checkpoints.append((active, value))
+            return
+        last_t, last_v = self.checkpoints[-1]
+        if active < last_t:
+            return
+        if value != last_v or active - last_t >= CHECKPOINT_INTERVAL:
+            self.checkpoints.append((active, value))
+            if len(self.checkpoints) > MAX_CHECKPOINTS:
+                # Keep the first anchor and thin out intermediate points.
+                self.checkpoints = [self.checkpoints[0]] + self.checkpoints[2::2] + [self.checkpoints[-1]]
+
+    def seed(self, value, source, stamp, opening=0, *, active_seconds=0.0):
+        """Seed a pre-hunt confirmed balance from idle scanning before measurement started."""
+        if self.start is not None or self.source_changed or source is None:
+            return False
+        self.source = source
+        self.start = self.end = value
+        self.readings = 1
+        self.last_seen = stamp
+        self.opening = opening
+        self.seeded = True
+        self._record_checkpoint(active_seconds, value)
+        return True
+
+    def observe(self, value, threshold=TRADE_THRESHOLD, *, active_seconds=None):
         if self.start is None:
             self.start = value
         elif abs(value - self.end) > threshold:
             self.large_changes.append(value - self.end)
+            self.large_change_times.append(
+                max(0.0, float(active_seconds)) if active_seconds is not None else self.end_active)
         self.end = value
         self.readings += 1
+        self._record_checkpoint(active_seconds, value)
 
-    def sample(self, value, source, stamp, opening, started, threshold, *, first_seen=None):
+    def sample(self, value, source, stamp, opening, started, threshold, *,
+               first_seen=None, active_seconds=None):
         if self.source is None:
-            start_seen = stamp if first_seen is None else first_seen
-            if not started <= start_seen <= min(stamp, started + START_WINDOW):
+            if started is not None and stamp < started:
                 return False
             self.source = source
         if not self.check_source(source):
             return False
-        changed = self.start is None or value != self.end or opening != self.opening
+        continuous_ready = (
+            self.readings == 1 and self.start_active is not None and active_seconds is not None
+            and active_seconds - self.start_active >= CONTINUOUS_CONFIRM_SECONDS
+        )
+        changed = (self.start is None or value != self.end or opening != self.opening
+                   or continuous_ready)
         if changed:
-            self.observe(value, threshold)
+            self.observe(value, threshold, active_seconds=active_seconds)
+        elif active_seconds is not None:
+            self._record_checkpoint(active_seconds, value)
         self.last_seen, self.opening = stamp, opening
         return changed
 
-    def end_ready(self, source, now):
-        return (self.readings >= 2 and not self.source_changed and self.source == source
-                and self.last_seen is not None and 0 <= now - self.last_seen <= END_WINDOW)
+    def end_ready(self, source, now=None):
+        return (self.readings >= 2 and not self.source_changed and self.source is not None
+                and sources_compatible(self.source, source))
 
-    def finish(self, source, now):
+    def finish(self, source, now=None):
         self.complete = self.end_ready(source, now)
 
     def toggle_trade(self, index):
@@ -505,10 +755,79 @@ class SessionMeso:
             return self.trade
         return sum(amount for index, amount in enumerate(self.large_changes) if index in self.marked)
 
+    def _excluded_trade_between(self, start_active, end_active):
+        if self.legacy or not self.marked:
+            return 0
+        total = 0
+        for index in self.marked:
+            if index < len(self.large_changes) and index < len(self.large_change_times):
+                when = self.large_change_times[index]
+                if when is not None and start_active < when <= end_active:
+                    total += self.large_changes[index]
+        return total
+
+    def measured_seconds(self, fallback_active=None):
+        if self.start_active is not None and self.end_active is not None and self.end_active > self.start_active:
+            return self.end_active - self.start_active
+        if fallback_active is not None and fallback_active > 0:
+            return float(fallback_active)
+        return None
+
+    def rate(self, fallback_active=None, *, min_seconds=MIN_RATE_SECONDS):
+        """Return cumulative and recent-window meso rates based on measured active hunting time."""
+        delta = self.observed_delta()
+        seconds = self.measured_seconds(fallback_active)
+        result = {
+            'delta': delta,
+            'seconds': seconds,
+            'per_minute': None,
+            'per_hour': None,
+            'ready': False,
+            'recent_delta': None,
+            'recent_seconds': None,
+            'recent_per_hour': None,
+            'trend_ratio': None,
+        }
+        if delta is None or seconds is None or seconds <= 0:
+            return result
+        if seconds >= min_seconds:
+            per_minute = delta * 60.0 / seconds
+            per_hour = delta * 3600.0 / seconds
+            result.update(per_minute=per_minute, per_hour=per_hour, ready=True)
+        # Recent flow (e.g., last ~6 minutes of active hunting) when intermediate checkpoints exist.
+        if len(self.checkpoints) >= 3:
+            t_end, v_end = self.checkpoints[-1]
+            target = t_end - RECENT_FLOW_WINDOW
+            # Pick the checkpoint closest to target with at least min_seconds of span, excluding the very first
+            # anchor if it covers almost the entire measurement (no distinct recent sub-window).
+            candidates = [
+                (t, v) for t, v in self.checkpoints[:-1]
+                if t_end - t >= min_seconds and (seconds <= 0 or (t_end - t) < seconds * 0.85)
+            ]
+            if candidates:
+                t_anchor, v_anchor = min(candidates, key=lambda pt: abs(pt[0] - target))
+                dt = t_end - t_anchor
+                recent_delta = (v_end - v_anchor) - self._excluded_trade_between(t_anchor, t_end)
+                recent_hour = recent_delta * 3600.0 / dt
+                trend = None
+                if result['per_hour'] and abs(result['per_hour']) >= 1000:
+                    trend = (recent_hour - result['per_hour']) / abs(result['per_hour'])
+                result.update(
+                    recent_delta=recent_delta,
+                    recent_seconds=dt,
+                    recent_per_hour=recent_hour,
+                    trend_ratio=trend,
+                )
+        return result
+
     def as_dict(self):
         if self.start is None:
             return None
         data = {'start': self.start, 'end': self.end, 'trade': self.trade, 'readings': self.readings}
         if not self.legacy:
             data.update(complete=self.complete, large_changes=self.large_changes, marked=sorted(self.marked))
+            if self.start_active is not None and self.end_active is not None:
+                data['start_active'] = round(self.start_active, 2)
+                data['end_active'] = round(self.end_active, 2)
+                data['measured_seconds'] = round(max(0.0, self.end_active - self.start_active), 2)
         return data

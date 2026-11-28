@@ -188,16 +188,67 @@ class ViewTests(unittest.TestCase):
         self.assertEqual([value for _, _, value in meso.load(tracker.BASE)], [100, 99])
         self.assertEqual(c.meso_delta_label.text(), '-1')
 
-    def test_meso_confirmation_status_expires_before_stop(self):
+    def test_meso_confirmation_status_persists_for_auto_stop(self):
         c = self.c
         c.running = True
         c.meso_source = (c.generation, '본캐', 20)
         balance = c.session.meso
-        balance.sample(100, c.meso_source, 102, 1, 100, 100)
+        balance.sample(100, c.meso_source, 102, 1, 100, 100, active_seconds=0.0)
         self.assertEqual(c.meso_status(103), '시작 잔액 확인 · 종료 잔액 대기')
-        balance.sample(200, c.meso_source, 130, 2, 100, 100)
+        balance.sample(200, c.meso_source, 130, 2, 100, 100, active_seconds=30.0)
         self.assertEqual(c.meso_status(131), '시작 잔액 확인 · 종료 잔액 확인')
-        self.assertEqual(c.meso_status(143), '시작 잔액 확인 · 종료 잔액 대기')
+        # Even 5 minutes later (e.g., auto-stop after 5m idle), the confirmed span stays valid.
+        self.assertEqual(c.meso_status(430), '시작 잔액 확인 · 종료 잔액 확인')
+
+    def test_idle_meso_seeds_auto_measure_and_updates_compact_and_info_views(self):
+        from PIL import Image
+        import hud_information
+
+        c = self.c
+        self.assertTrue(c.compact_meso.isVisibleTo(c.window))
+        # Idle meso reading while waiting for auto-start.
+        for stamp in (90.0, 92.0):
+            c.meso_results.put((c.generation, 20, stamp, '본캐', 10_000_000))
+            c.apply_meso_results(stamp)
+        self.assertIsNotNone(c.idle_meso)
+        self.assertIn('10,000,000', c.compact_meso.text())
+        # Auto-start via start_with_recent seeds the idle balance into the new session.
+        c.recent_permission = True
+        source = (c.generation, 20, 169, (1280, 720), 'new')
+        c.recent_exp.observe(source, 94.0, (172680132, 42.55))
+        c.recent_exp.observe(source, 96.0, (172680232, 42.55))
+        c.recent_exp.observe(source, 98.0, (172680332, 42.55))
+        with patch('qt_controller.time.monotonic', return_value=99.0):
+            c.start_with_recent()
+        self.assertTrue(c.running)
+        self.assertEqual(c.session.meso.start, 10_000_000)
+        self.assertTrue(c.session.meso.seeded)
+        # Later mid-hunt reading after 10 minutes of active hunting.
+        exp_val = 172680332
+        for t in range(104, 704, 5):
+            exp_val += 100
+            c.session.accept((exp_val, 42.55), float(t), corroborated=True, baseline_verified=True)
+        for stamp in (697.0, 699.0):
+            c.meso_results.put((c.generation, 20, stamp, '본캐', 10_300_000))
+            c.apply_meso_results(stamp)
+        self.assertIn('+30.0만', c.compact_meso.text())
+        self.assertIn('시급', c.compact_meso.text())
+        self.assertIn('시간당', c.meso_rate_label.text())
+        # Manual meso region saves to settings and appears in menu & 인식 정보.
+        roi = {'left': 0.1, 'top': 0.7, 'width': 0.2, 'height': 0.05, 'reference_aspect': 16 / 9}
+        c.apply_meso_region(roi, Image.new('RGB', (320, 180), 'white'))
+        clean, warning = tracker.load_settings(tracker.BASE / 'settings.json')
+        self.assertIsNone(warning)
+        self.assertEqual(clean['meso_region'], roi)
+        menu = c.build_context_menu(); self.addCleanup(menu.deleteLater)
+        gains = next(a for a in menu.actions() if a.text() == '메소·버프').menu()
+        labels = [a.text() for a in gains.actions()]
+        self.assertIn('메소 영역 수동 지정…', labels)
+        self.assertIn('메소 자동 탐색으로 되돌리기', labels)
+        dialog = hud_information.build_dialog(c); self.addCleanup(dialog.close)
+        self.assertIn('수동 영역 지정됨', c.meso_diagnostic_text(700.0))
+        c.clear_meso_region()
+        self.assertIsNone(c.meso_region)
 
     def test_connected_nickname_registration_and_character_change(self):
         c = self.c

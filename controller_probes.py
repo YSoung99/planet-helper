@@ -9,14 +9,23 @@ import meso
 import tracker
 
 
+def _clock_mmss(seconds):
+    total = max(0, int(round(seconds)))
+    hours, rem = divmod(total, 3600)
+    minutes, secs = divmod(rem, 60)
+    return f'{hours}:{minutes:02d}:{secs:02d}' if hours else f'{minutes}:{secs:02d}'
+
+
 class MesoAndProbesMixin:
     CHARACTER_RECHECK_SECONDS = 8.0
     MESO_IDLE_SCAN_INTERVAL = 4.0
 
     def meso_character(self):
-        if self.session.character_conflict:
-            return None
-        return self.session.character_name or self.current_character or ''
+        if self.running:
+            if self.session.character_conflict:
+                return None
+            return self.session.character_name or self.current_character or ''
+        return self.character_identity[1] or self.current_character or ''
 
     def clear_meso_confirmation(self, source):
         self.meso_source = source
@@ -31,6 +40,32 @@ class MesoAndProbesMixin:
             return hunt_activity.SCAN_INTERVAL
         return self.MESO_IDLE_SCAN_INTERVAL
 
+    def seed_meso_from_idle(self, generation, window, reference_stamp):
+        """Seed the new session's starting meso from a recent confirmed idle reading."""
+        idle = getattr(self, 'idle_meso', None)
+        if idle is None or window is None:
+            return False
+        idle_stamp, idle_window, idle_char, idle_value = idle
+        if idle_window != window:
+            return False
+        if not (0 <= reference_stamp - idle_stamp <= meso.PRE_START_WINDOW):
+            return False
+        character = self.meso_character()
+        if character is None:
+            return False
+        if character and idle_char and character != idle_char:
+            return False
+        resolved_char = character or idle_char or ''
+        source = (generation, resolved_char, window)
+        active_at_seed = 0.0
+        if self.session.started is not None and idle_stamp > self.session.started:
+            active_at_seed = self.session.active_elapsed(idle_stamp)
+        if self.session.meso.seed(idle_value, source, reference_stamp, opening=0, active_seconds=active_at_seed):
+            self.clear_meso_confirmation(source)
+            self.session.meso_dirty = True
+            return True
+        return False
+
     def apply_meso_results(self, now, *, finishing=False):
         session = self.session
         character = self.meso_character()
@@ -41,20 +76,48 @@ class MesoAndProbesMixin:
                 session.meso_start_frame = None
             elif self.queue_meso_frame(self.generation, stamp, frame, window):
                 session.meso_start_frame = None
-        if self.meso_source is not None and self.meso_source[:2] != (self.generation, character):
-            self.clear_meso_confirmation(None)
-        if session.meso.source is not None and session.meso.source[:2] != (self.generation, character):
-            session.meso.check_source(None)
+        if self.meso_source is not None:
+            if (self.meso_source[0] != self.generation or character is None
+                    or (self.meso_source[1] and character and self.meso_source[1] != character)):
+                self.clear_meso_confirmation(None)
+            elif not self.meso_source[1] and character:
+                self.meso_source = (self.meso_source[0], character, self.meso_source[2])
+        if session.meso.source is not None:
+            if (session.meso.source[0] != self.generation or character is None
+                    or (session.meso.source[1] and character and session.meso.source[1] != character)):
+                session.meso.check_source(None)
+            elif not session.meso.source[1] and character:
+                session.meso.check_source((session.meso.source[0], character, session.meso.source[2]))
         while not self.meso_results.empty():
             generation, window, stamp, observed_character, value = self.meso_results.get_nowait()
-            if (not self.running or generation != self.generation or character is None
-                    or observed_character != character or window is None or session.meso_start_at is None
-                    or stamp < session.meso_start_at or stamp < now - meso.END_WINDOW):
+            if generation != self.generation or window is None or stamp < now - meso.END_WINDOW:
                 continue
-            source = generation, character, window
+            if not self.running:
+                idle_source = (generation, window)
+                if getattr(self, 'idle_meso_source', None) != idle_source:
+                    self.idle_meso_source = idle_source
+                    self.idle_meso_confirmation = meso.Confirmation()
+                if value is meso.RECHECK:
+                    self.idle_meso_confirmation.observe(None, stamp)
+                    continue
+                self.meso_visible = value is not None
+                confirmed = self.idle_meso_confirmation.observe(value, stamp)
+                if confirmed is not None:
+                    idle_char = character or observed_character or ''
+                    self.idle_meso = (stamp, window, idle_char, confirmed)
+                continue
+            if (character is None or session.meso_start_at is None
+                    or stamp < session.meso_start_at):
+                continue
+            if observed_character and character and observed_character != character:
+                continue
+            resolved_char = character or observed_character or ''
+            source = generation, resolved_char, window
             session.meso.check_source(source)
-            if source != self.meso_source:
+            if not meso.sources_compatible(self.meso_source, source):
                 self.clear_meso_confirmation(source)
+            elif self.meso_source is None or (not self.meso_source[1] and resolved_char):
+                self.meso_source = source
             if value is meso.RECHECK:
                 self.meso_rechecking = True
                 self.meso_confirmation.observe(None, stamp)
@@ -70,13 +133,16 @@ class MesoAndProbesMixin:
                     self.meso_rechecking = True
                 continue
             self.meso_rechecking = False
+            self.idle_meso = (stamp, window, resolved_char, confirmed)
             try:
-                self.meso_log.record(tracker.BASE, character, confirmed, datetime.now())
+                self.meso_log.record(tracker.BASE, resolved_char, confirmed, datetime.now())
             except OSError as exc:
                 tracker.log_error('메소 기록 저장', exc)
+            active_sec = session.active_elapsed(stamp) if session.started is not None else 0.0
             session.meso_dirty |= session.meso.sample(
                 confirmed, source, stamp, self.meso_opening, session.meso_start_at,
-                self.meso_trade_threshold, first_seen=self.meso_confirmation.first_seen)
+                self.meso_trade_threshold, first_seen=self.meso_confirmation.first_seen,
+                active_seconds=active_sec)
         if (not finishing and self.running and session.meso_dirty and session.rows and not session.ledger_dirty
                 and now - self.meso_last_flush >= 10):
             self.meso_last_flush = now
@@ -84,6 +150,10 @@ class MesoAndProbesMixin:
                 self.save_summary()
             except OSError as exc:
                 tracker.log_error('메소 기록 저장', exc)
+        self.update_meso_display(now)
+
+    def update_meso_display(self, now):
+        session = self.session
         text = self.meso_text()
         if text != self.meso_label.text():
             self.meso_label.setText(text)
@@ -92,20 +162,107 @@ class MesoAndProbesMixin:
             self.meso_status_label.setText(ready)
         delta = session.meso.hunted()
         if (self.running and not session.meso.source_changed
-                and session.meso.source == self.meso_source):
+                and meso.sources_compatible(session.meso.source, self.meso_source)):
             delta = session.meso.observed_delta()
         amount = '—' if delta is None else f'{delta:+,}'
         if self.meso_delta_label.text() != amount:
             self.meso_delta_label.setText(amount)
+        rate_text, rate_tip = self.meso_rate_summary(now)
+        if hasattr(self, 'meso_rate_label'):
+            if self.meso_rate_label.text() != rate_text:
+                self.meso_rate_label.setText(rate_text)
+            if self.meso_rate_label.toolTip() != rate_tip:
+                self.meso_rate_label.setToolTip(rate_tip)
+        if hasattr(self, 'compact_meso'):
+            compact_text, compact_tip = self.compact_meso_text(now)
+            if self.compact_meso.text() != compact_text:
+                self.compact_meso.setText(compact_text)
+            if self.compact_meso.toolTip() != compact_tip:
+                self.compact_meso.setToolTip(compact_tip)
+
+    def _current_meso_rate(self, now):
+        session = self.session
+        balance = session.meso
+        if self.running:
+            if balance.source_changed or not meso.sources_compatible(balance.source, self.meso_source):
+                return None
+            fallback = session.active_elapsed(now) if session.started is not None else None
+            return balance.rate(fallback_active=fallback)
+        if balance.hunted() is None:
+            return None
+        fallback = session.active_elapsed(now) if session.started is not None else None
+        return balance.rate(fallback_active=fallback)
+
+    def meso_rate_summary(self, now):
+        balance = self.session.meso
+        if balance.source_changed:
+            return '시간당 메소 · 캐릭터 또는 게임 창 변경으로 집계 중단', ''
+        info = self._current_meso_rate(now)
+        if info is None or info['delta'] is None:
+            if balance.start is not None:
+                return '시간당 메소 · 인벤토리를 다시 열거나 잔액이 바뀌면 표시', ''
+            return '시간당 메소 · 측정 중 인벤토리를 열면 집계', ''
+        seconds = info['seconds']
+        if not info['ready']:
+            span = _clock_mmss(seconds) if seconds else '0:00'
+            return (f'메소 측정 구간 {span} · 1분 이상 측정 시 시급 표시',
+                    f'현재 순증감 {info["delta"]:+,} 메소 ({span})')
+        parts = [
+            f'시간당 {meso.format_short(info["per_hour"])}',
+            f'분당 {info["per_minute"]:+,.0f}',
+        ]
+        if info['recent_per_hour'] is not None:
+            trend = ''
+            if info['trend_ratio'] is not None and abs(info['trend_ratio']) >= 0.05:
+                arrow = '▲' if info['trend_ratio'] > 0 else '▼'
+                trend = f' {arrow}{abs(info["trend_ratio"]) * 100:.0f}%'
+            parts.append(f'최근 {meso.format_short(info["recent_per_hour"])}/시{trend}')
+        parts.append(f'구간 {_clock_mmss(seconds)}')
+        tip = (f'메소 순증감 {info["delta"]:+,} · 측정 사냥 시간 {_clock_mmss(seconds)}\n'
+               f'시간당 {info["per_hour"]:+,.0f} · 분당 {info["per_minute"]:+,.0f}')
+        if info['recent_per_hour'] is not None:
+            tip += (f'\n최근 {_clock_mmss(info["recent_seconds"])} 구간: '
+                    f'{info["recent_delta"]:+,} (시간당 {info["recent_per_hour"]:+,.0f})')
+        return ' · '.join(parts), tip
+
+    def compact_meso_text(self, now):
+        balance = self.session.meso
+        info = self._current_meso_rate(now)
+        if self.running and self.meso_rechecking:
+            current = balance.end if balance.end is not None else self.meso_confirmation.current
+            prefix = f'메소 {current:,}' if current is not None else '메소'
+            return f'{prefix} · 재확인 중', '원본과 흑백 판독이 달라 다시 확인 중입니다.'
+        if info is not None and info['delta'] is not None:
+            delta_str = meso.format_short(info['delta'])
+            if info['ready']:
+                trend = ''
+                if info['trend_ratio'] is not None and abs(info['trend_ratio']) >= 0.05:
+                    arrow = '▲' if info['trend_ratio'] > 0 else '▼'
+                    trend = f' ({arrow}{abs(info["trend_ratio"]) * 100:.0f}%)'
+                text = f'메소 {delta_str} · 시급 {meso.format_short(info["per_hour"])}{trend}'
+            else:
+                text = f'메소 {delta_str} · 구간 {_clock_mmss(info["seconds"] or 0)}'
+            _, tip = self.meso_rate_summary(now)
+            return text, tip
+        if self.running:
+            if balance.source_changed:
+                return '메소 확인 불가 · 창/캐릭터 변경', '캐릭터나 게임 창이 바뀌어 이번 메소 집계를 중단했습니다.'
+            if balance.start is not None:
+                return f'메소 {balance.start:,} · 변동/재확인 대기', '인벤토리를 다시 열거나 잔액이 바뀌면 순증감과 시급을 표시합니다.'
+            return '메소 대기 · 인벤토리 열면 측정', '측정 중 언제든 인벤토리를 열면 메소 측정이 시작됩니다.'
+        idle = getattr(self, 'idle_meso', None)
+        if idle is not None:
+            return f'메소 {idle[3]:,} · 대기 중 확인됨', '자동 측정 시작 시 이 잔액을 시작 기준에 바로 반영합니다.'
+        return '메소 대기 · 인벤토리 열면 측정', '대기 중이나 측정 중 인벤토리를 열면 잔액을 읽습니다.'
 
     def meso_status(self, now):
         balance = self.session.meso
         if balance.source_changed:
             return '시작·종료 잔액 확인 불가 · 캐릭터 또는 게임 창 변경'
-        start = '시작 잔액 확인' if balance.start is not None else '시작 잔액 대기'
-        if (self.running and balance.start is None and self.session.meso_start_at is not None
-                and now - self.session.meso_start_at > meso.START_WINDOW):
-            start = '시작 잔액 확인 시간 지남'
+        if balance.start is not None:
+            start = '시작 잔액 확인 (대기 연동)' if balance.seeded else '시작 잔액 확인'
+        else:
+            start = '시작 잔액 대기'
         end = balance.complete
         if self.running:
             end = not self.meso_rechecking and balance.end_ready(self.meso_source, now)
@@ -118,18 +275,25 @@ class MesoAndProbesMixin:
                 current = self.session.meso.end
             return ('메소' if current is None else f'메소 {current:,}') + ' · 잔액 재확인 중'
         if current is None:
-            if self.running and getattr(self, 'meso_inventory_closed', False) and self.jev_enabled:
-                return '메소 · JEV: 인벤토리가 닫혀 있어요 · 열면 기록'
-            return '메소 · 측정 중 인벤토리를 열면 기록'
+            if self.running and self.session.meso.end is not None:
+                current = self.session.meso.end
+            elif not self.running and getattr(self, 'idle_meso', None) is not None:
+                idle_val = self.idle_meso[3]
+                today = self.meso_log.change(self.meso_character())
+                return f'메소 {idle_val:,} · 대기 중 확인' + (f' · 오늘 {today:+,}' if today is not None else '')
+            else:
+                if self.running and getattr(self, 'meso_inventory_closed', False) and self.jev_enabled:
+                    return '메소 · JEV: 인벤토리가 닫혀 있어요 · 열면 기록'
+                return '메소 · 측정 중 인벤토리를 열면 기록'
         text = f'메소 {current:,}'
         balance = self.session.meso
         if self.running:
             if balance.source_changed:
                 return text + ' · 캐릭터 또는 게임 창 변경 · 이번 잔액 차이 확인 안 됨'
-            if balance.readings < 2 or balance.source != self.meso_source:
+            if balance.readings < 2 or not meso.sources_compatible(balance.source, self.meso_source):
                 if balance.start is None:
-                    return text + ' · 시작 후 30초 안의 잔액 필요'
-                return text + ' · 종료 직전에 인벤토리를 다시 열어 주세요'
+                    return text + ' · 인벤토리 확인 중'
+                return text + ' · 인벤토리를 다시 열거나 잔액이 바뀌면 집계'
             if balance.large_changes:
                 text += f' · 큰 변동 {len(balance.large_changes)}건'
             excluded = balance.excluded_trade()
@@ -139,9 +303,40 @@ class MesoAndProbesMixin:
         today = self.meso_log.change(self.meso_character())
         return text + (f' · 오늘 {today:+,}' if today is not None else '')
 
+    def meso_diagnostic_text(self, now):
+        """Detailed diagnostic text for the 인식 정보 dialog."""
+        mode = '수동 영역 지정됨' if getattr(self, 'meso_region', None) is not None else '자동 탐색'
+        if self.meso_region is None and self.meso_reader.hint is not None:
+            mode += ' (JEV 위치 힌트 사용)'
+        lines = [f'탐색 방식 · {mode}']
+        diag_entry = getattr(self, 'meso_diag', None)
+        if diag_entry is not None:
+            stamp, diag = diag_entry
+            age = max(0, int(now - stamp))
+            reason = diag.get('reason') or '확인 중'
+            box = diag.get('box')
+            box_text = f' · 위치 ({box[0]}, {box[1]}, {box[2]}×{box[3]})' if box else ''
+            lines.append(f'최근 판독 ({age}초 전) · {reason}{box_text}')
+        else:
+            lines.append('최근 판독 · 아직 인벤토리 스캔 전')
+        balance = self.session.meso
+        if balance.start is not None:
+            span = balance.measured_seconds()
+            span_text = f' · 측정 구간 {_clock_mmss(span)}' if span else ''
+            delta = balance.observed_delta()
+            delta_text = f' · 순증감 {delta:+,}' if delta is not None else ''
+            lines.append(f'세션 잔액 · 시작 {balance.start:,} → 현재 {balance.end:,}{delta_text}{span_text}')
+            rate_text, _ = self.meso_rate_summary(now)
+            lines.append(rate_text)
+        elif getattr(self, 'idle_meso', None) is not None:
+            idle_stamp, _, _, idle_val = self.idle_meso
+            lines.append(f'대기 확인 잔액 · {idle_val:,} ({max(0, int(now - idle_stamp))}초 전)')
+        return '\n'.join(lines)
+
     def start_meso_capture(self, generation, stamp, details):
         full = details.get('full_game_image')
         window = details.get('window_id')
+        self.seed_meso_from_idle(generation, window, stamp)
         if full is not None and window is not None and map_name.available():
             if not self.queue_meso_frame(generation, stamp, full, window):
                 self.session.meso_start_frame = stamp, full, window
@@ -162,13 +357,21 @@ class MesoAndProbesMixin:
         try:
             if generation == self.generation:
                 source = generation, window
+                manual_roi = getattr(self, 'meso_region', None)
                 if self.meso_reader_source != source:
-                    self.meso_reader = meso.Reader(self.jev_arbiter)
+                    self.meso_reader = meso.Reader(self.jev_arbiter, manual_roi=manual_roi)
                     self.meso_reader_source = source
+                elif self.meso_reader.manual_roi != manual_roi:
+                    self.meso_reader.set_manual_roi(manual_roi)
                 value = self.meso_reader.read(frame, stamp)
                 if self.meso_reader.needs_recheck:
                     value = meso.RECHECK
-                self.locate_inventory(source, stamp, frame)
+                if self.meso_reader.last_diag is not None:
+                    self.meso_diag = (stamp, dict(self.meso_reader.last_diag))
+                if self.meso_reader.last_crop is not None:
+                    self.meso_preview_frame = (self.meso_reader.last_crop.copy(), stamp)
+                if self.running and manual_roi is None:
+                    self.locate_inventory(source, stamp, frame)
                 self.meso_results.put((generation, window, stamp, character, value))
         except Exception as exc:
             tracker.log_error('메소 판독', exc)

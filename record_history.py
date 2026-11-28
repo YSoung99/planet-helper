@@ -11,7 +11,7 @@ MEMO_FILE = 'memos.json'
 # Character names typed by the user. They override OCR without touching the record files.
 CHARACTER_FILE = 'character-names.json'
 CACHE_FILE = '.summary-cache.json'
-CACHE_VERSION = 1
+CACHE_VERSION = 2
 _cache_lock = threading.Lock()
 _memory_cache = {}
 
@@ -100,6 +100,7 @@ def summarize(csv_path):
                 character_name=session.character_name or assigned, exp_buff_intervals=session.exp_buff_intervals,
                 level_ups=len(session.level_ups), meso=session.meso.hunted(), meso_trade=session.meso.excluded_trade(),
                 meso_large_changes=len(session.meso.large_changes),
+                meso_seconds=session.meso.measured_seconds(active) if session.meso.hunted() is not None else None,
                 gained=gained, per_minute=rate['cumulative'], rate_gain=rate['rate_gain'],
                 rate_seconds=rate['duration'], gap=session.gap_seconds(0.0), gap_gain=session.gap_gain,
                 blocked=session.blocked, stop_reason=session.stop_reason,
@@ -295,9 +296,10 @@ def by_memo_detailed(rows):
         name = names[spot_key(row['memo'])]
         gained, active, count, meso_sum, meso_sec, meso_count = groups.get(name, (0, 0.0, 0, 0, 0.0, 0))
         meso_val = row.get('meso')
-        if meso_val is not None and row.get('active', 0) > 0:
+        meso_duration = row.get('meso_seconds') or row.get('active', 0)
+        if meso_val is not None and meso_duration > 0:
             meso_sum += meso_val
-            meso_sec += row['active']
+            meso_sec += meso_duration
             meso_count += 1
         groups[name] = (gained+row['rate_gain'], active+row['rate_seconds'], count+1,
                         meso_sum, meso_sec, meso_count)
@@ -679,9 +681,17 @@ def meso_cell(row):
 def meso_detail(row):
     if row.get('meso') is None:
         return '메소 · 같은 캐릭터와 게임 창에서 시작·종료 잔액 확인 안 됨'
+    import meso
     trade = row.get('meso_trade') or 0
-    per_minute = row['meso']*60/row['active'] if row['active'] else None
-    text = f"메소 {row['meso']:+,}" + (f' · 분당 {per_minute:,.0f}' if per_minute is not None else '')
+    sec = row.get('meso_seconds') or row.get('active')
+    per_minute = row['meso'] * 60 / sec if sec else None
+    per_hour = row['meso'] * 3600 / sec if sec else None
+    text = f"메소 {row['meso']:+,}"
+    if per_minute is not None:
+        text += f' · 분당 {per_minute:,.0f} · 시간당 {meso.format_short(per_hour)}'
+    active = row.get('active') or 0
+    if sec and active and abs(active - sec) >= 30:
+        text += f' · 측정 구간 {clock(sec)}'
     large = row.get('meso_large_changes') or 0
     if large:
         text += f' · 큰 변동 {large}건'

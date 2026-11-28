@@ -92,6 +92,14 @@ def build_dialog(controller):
     preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
     recognized.addWidget(preview)
 
+    meso_section = section('메소 인식')
+    meso_info = line(meso_section)
+    meso_preview = QLabel('메소 판독 이미지 대기')
+    meso_preview.setAccessibleName('최근 메소 판독 이미지')
+    meso_preview.setMinimumHeight(34)
+    meso_preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
+    meso_section.addWidget(meso_preview)
+
     measured = section('측정 상세')
     exp = line(measured)
     rates = line(measured)
@@ -114,9 +122,10 @@ def build_dialog(controller):
             widget.setText(text)
 
     preview_key = None
+    meso_preview_key = None
 
     def refresh():
-        nonlocal preview_key
+        nonlocal preview_key, meso_preview_key
         state = controller.hud_information
         now = time.monotonic()
         update(ui, state.text(running=controller.running, automatic=controller.auto_hud,
@@ -126,6 +135,8 @@ def build_dialog(controller):
         freshness = f'UI 확인 {max(0, int(now-state.verified_at))}초 전' if state.verified_at else 'UI 확인 대기'
         update(capture, f'{mode} · {size} · {freshness}')
         update(live, controller.detail_label.text())
+        if hasattr(controller, 'meso_diagnostic_text'):
+            update(meso_info, controller.meso_diagnostic_text(now))
         update(exp, '\n'.join(filter(None, (controller.baseline_label.text(), controller.table_label.text()))))
         update(rates, '\n'.join(filter(None, (controller.minute_info.text(), controller.rate_info.text(),
                                              controller.activity_label.text()))))
@@ -147,6 +158,12 @@ def build_dialog(controller):
         if pixmap is not None and not pixmap.isNull() and pixmap.cacheKey() != preview_key:
             preview.setPixmap(pixmap)
             preview_key = pixmap.cacheKey()
+        meso_widget = getattr(controller, 'meso_preview', None)
+        if meso_widget is not None:
+            meso_pix = meso_widget.pixmap()
+            if meso_pix is not None and not meso_pix.isNull() and meso_pix.cacheKey() != meso_preview_key:
+                meso_preview.setPixmap(meso_pix)
+                meso_preview_key = meso_pix.cacheKey()
 
     timer = QTimer(dialog)
     timer.timeout.connect(refresh)

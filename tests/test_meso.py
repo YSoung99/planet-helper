@@ -225,6 +225,38 @@ class ConfirmationTests(unittest.TestCase):
         self.assertIsNone(confirm.observe(889008))
         self.assertEqual(confirm.observe(889008), 889008)
 
+    def test_digit_drop_and_sudden_zero_need_a_third_sighting(self):
+        # Leading digit dropped: 33,823,666 -> 3,823,666 (ratio 8.84 < 10)
+        confirm = meso.Confirmation()
+        confirm.observe(33_823_666); confirm.observe(33_823_666)
+        self.assertIsNone(confirm.observe(3_823_666))
+        self.assertIsNone(confirm.observe(3_823_666))
+        self.assertEqual(confirm.observe(3_823_666), 3_823_666)
+        # Sudden zero glitch: 43,778,432 -> 0
+        confirm2 = meso.Confirmation()
+        confirm2.observe(43_778_432); confirm2.observe(43_778_432)
+        self.assertIsNone(confirm2.observe(0))
+        self.assertIsNone(confirm2.observe(0))
+        self.assertEqual(confirm2.observe(0), 0)
+
+    def test_manual_roi_reads_bright_box_and_rejects_closed_inventory(self):
+        box = (300, 400, 150, 18)
+        frame = add_amount_glyphs(inventory_frame(box), box, '12345')
+        roi = {'left': 295 / 800, 'top': 396 / 600, 'width': 160 / 800, 'height': 26 / 600,
+               'reference_aspect': 800 / 600}
+        reader = meso.Reader(manual_roi=roi)
+        with mock.patch.object(meso, 'read_amount', return_value=12345), \
+             mock.patch.object(meso, 'read_binary_amount', return_value=12345), \
+             mock.patch.object(meso, 'has_label', side_effect=AssertionError('manual ROI skips label')):
+            self.assertEqual(reader.read(frame, now=1), 12345)
+            self.assertIsNotNone(reader.last_crop)
+            self.assertEqual(reader.last_diag['mode'], 'manual')
+            self.assertEqual(reader.last_diag['status'], 'ok')
+        # Closed inventory (dark map) must return None and not fabricate numbers.
+        dark = Image.new('RGB', (800, 600), (30, 40, 50))
+        self.assertIsNone(reader.read(dark, now=2))
+        self.assertEqual(reader.last_diag['status'], 'closed')
+
 
 class SessionMesoTests(unittest.TestCase):
     def test_duplicate_and_distant_frames_do_not_confirm(self):
@@ -234,18 +266,59 @@ class SessionMesoTests(unittest.TestCase):
         self.assertIsNone(confirm.observe(100, 20))
         self.assertEqual(confirm.observe(100, 22), 100)
 
-    def test_single_opening_and_stale_end_do_not_complete(self):
+    def test_single_opening_needs_second_reading_and_auto_stop_preserves_completed_span(self):
         session = meso.SessionMeso()
         source = (1, '본캐', 10)
         for stamp in (2, 4, 6):
-            session.sample(100, source, stamp, 1, 0, 100)
+            session.sample(100, source, stamp, 1, 0, 100, active_seconds=float(stamp))
         session.finish(source, 7)
         self.assertIsNone(session.hunted())
-        session.sample(100, source, 30, 2, 0, 100)
-        session.finish(source, 45)
-        self.assertIsNone(session.hunted())
-        session.finish(source, 32)
+        # Reopened later during hunt, then auto-stopped 5 minutes (300s) later.
+        session.sample(100, source, 120, 2, 0, 100, active_seconds=120.0)
+        session.finish(source, 420)
         self.assertEqual(session.hunted(), 0)
+        self.assertEqual(session.measured_seconds(), 118.0)
+
+    def test_mid_hunt_opening_and_character_resolution_work_without_invalidating(self):
+        session = meso.SessionMeso()
+        # First opened 3 minutes after hunt started, before nickname OCR resolved.
+        self.assertTrue(session.sample(1_000_000, (1, '', 10), 180, 1, 0, 1_000_000, active_seconds=180.0))
+        # Nickname resolves to '본캐' on same window; second reading at 13 minutes.
+        self.assertTrue(session.sample(1_600_000, (1, '본캐', 10), 780, 2, 0, 1_000_000, active_seconds=780.0))
+        session.finish((1, '본캐', 10), 1100)
+        self.assertEqual(session.hunted(), 600_000)
+        self.assertEqual(session.measured_seconds(), 600.0)
+        rate = session.rate()
+        self.assertTrue(rate['ready'])
+        self.assertAlmostEqual(rate['per_minute'], 60_000.0)
+        self.assertAlmostEqual(rate['per_hour'], 3_600_000.0)
+
+    def test_continuous_open_inventory_completes_and_tracks_recent_flow(self):
+        session = meso.SessionMeso()
+        source = (1, '본캐', 10)
+        # Steady hunting with inventory open: 10,000/min for first 10 min, then 20,000/min for next 6 min.
+        for minute in range(0, 11):
+            session.sample(1_000_000 + minute * 10_000, source, minute * 60, 1, 0, 1_000_000,
+                           active_seconds=float(minute * 60))
+        for minute in range(11, 17):
+            extra = (minute - 10) * 20_000
+            session.sample(1_100_000 + extra, source, minute * 60, 1, 0, 1_000_000,
+                           active_seconds=float(minute * 60))
+        rate = session.rate()
+        self.assertTrue(rate['ready'])
+        self.assertEqual(rate['delta'], 220_000)
+        self.assertEqual(rate['seconds'], 960.0)
+        self.assertAlmostEqual(rate['recent_per_hour'], 1_200_000.0)
+        self.assertGreater(rate['trend_ratio'], 0.3)
+
+    def test_continuous_unchanged_balance_completes_after_one_minute(self):
+        session = meso.SessionMeso()
+        source = (1, '본캐', 10)
+        session.sample(500_000, source, 0, 1, 0, 1_000_000, active_seconds=0.0)
+        session.sample(500_000, source, 70, 1, 0, 1_000_000, active_seconds=70.0)
+        session.finish(source, 75)
+        self.assertEqual(session.hunted(), 0)
+        self.assertEqual(session.measured_seconds(), 70.0)
 
     def test_switching_windows_invalidates_the_delta_even_after_returning(self):
         session = meso.SessionMeso()
@@ -353,8 +426,31 @@ class RecordTests(unittest.TestCase):
         self.assertEqual(record_history.meso_cell({'meso': None}), '—')
         self.assertEqual(record_history.meso_cell({'meso': 123456}), '+123,456')
         text = record_history.meso_detail({'meso': 60000, 'meso_trade': -500000, 'active': 600})
-        self.assertEqual(text, '메소 +60,000 · 분당 6,000 (거래·구매 -500,000 제외)')
+        self.assertEqual(text, '메소 +60,000 · 분당 6,000 · 시간당 +36.0만 (거래·구매 -500,000 제외)')
+        sub_span = record_history.meso_detail({'meso': 60000, 'active': 1200, 'meso_seconds': 600})
+        self.assertIn('분당 6,000', sub_span)
+        self.assertIn('측정 구간 10:00', sub_span)
         self.assertIn('확인 안 됨', record_history.meso_detail({'meso': None}))
+
+    def test_map_name_recognize_lines_always_passes_use_rec_true(self):
+        import map_name
+        from PIL import Image
+        calls = []
+
+        class FakeResult:
+            txts = ['메소']
+            scores = [0.99]
+
+        def fake_engine(arr, **kwargs):
+            calls.append(kwargs)
+            return FakeResult()
+
+        with mock.patch.object(map_name, '_get_engine', return_value=fake_engine):
+            map_name.detect_boxes(Image.new('RGB', (20, 20)))
+            lines = map_name.recognize_lines(Image.new('RGB', (20, 20)), detect=False)
+        self.assertEqual(lines, [('메소', 0.99)])
+        self.assertEqual(calls[0], {'use_det': True, 'use_rec': False})
+        self.assertEqual(calls[1], {'use_det': False, 'use_rec': True})
 
 
 if __name__ == '__main__':

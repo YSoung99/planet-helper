@@ -25,7 +25,7 @@ RESOURCES = Path(getattr(sys, '_MEIPASS', Path(__file__).resolve().parent))
 BASE = Path(os.environ.get('PLANET_EXP_DATA_DIR') or (
     Path.home()/'Library'/'Application Support'/'Maple Planet Helper Auto Trial'
     if sys.platform == 'darwin' else Path(__file__).resolve().parent))
-APP_VERSION = '1.4.34'
+APP_VERSION = '1.4.35'
 MAX_BOUNDARY_GAP = 10.0
 BURNING_MAX_LEVEL = 120  # Planet Up & Up grants one bonus level, capped at 120.
 REST_AFTER = 180.0  # EXP unchanged this long: rest counted from the last gain
@@ -163,6 +163,14 @@ def load_settings(path):
             clean['meso_trade_threshold'] = value
         else:
             invalid.append('meso_trade_threshold')
+    if payload.get('meso_region') is not None:
+        from window_capture import valid_roi
+        meso_region = payload['meso_region']
+        aspect = meso_region.get('reference_aspect') if isinstance(meso_region, dict) else None
+        if valid_roi(meso_region) and type(aspect) in (int, float) and math.isfinite(aspect) and aspect > 0:
+            clean['meso_region'] = {key: meso_region[key] for key in ('left', 'top', 'width', 'height', 'reference_aspect')}
+        else:
+            invalid.append('meso_region')
     if 'window_opacity' in payload:
         value = payload['window_opacity']
         if type(value) in (int, float) and math.isfinite(value) and .2 <= value <= 1.0:
