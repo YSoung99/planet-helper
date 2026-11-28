@@ -733,7 +733,6 @@ class SharedController(MenuAndSettingsMixin, MesoAndProbesMixin, JevMixin, track
     def apply_meso_region(self, roi, selection_image=None):
         self.meso_region = roi
         self.meso_reader_source = None
-        self.meso_reader.set_manual_roi(roi)
         self.save_config()
         if selection_image is not None:
             pixel_rect = self.capture_module().pixel_rect
@@ -745,7 +744,6 @@ class SharedController(MenuAndSettingsMixin, MesoAndProbesMixin, JevMixin, track
     def clear_meso_region(self):
         self.meso_region = None
         self.meso_reader_source = None
-        self.meso_reader.set_manual_roi(None)
         self.save_config()
         self.status.set('메소 영역 자동 탐색으로 되돌림')
 
@@ -782,7 +780,7 @@ class SharedController(MenuAndSettingsMixin, MesoAndProbesMixin, JevMixin, track
                 potions.delete_icon(old['icon'], tracker.BASE)
         self.potion_slots = [s for s in self.potion_slots if s['name'] != name]
         self.potion_slots.append(slot_entry)
-        self.potion_reader.reset()
+        self.potion_reader = potions.Reader()
         self.potion_confirmations = {}
         self.save_config()
         self.update_potion_display(self._monotonic())
@@ -850,7 +848,8 @@ class SharedController(MenuAndSettingsMixin, MesoAndProbesMixin, JevMixin, track
         if self.running:
             session = self.session
             if (session.started is not None and session.last_gain_at is not None and session.samples
-                    and session.samples[-1][0]-session.last_gain_at >= self.AUTO_END_SECONDS):
+                    and (session.samples[-1][0] - session.last_gain_at >= self.AUTO_END_SECONDS
+                         or now - session.samples[-1][0] >= self.AUTO_END_SECONDS)):
                 reason = f'경험치 {int(self.AUTO_END_SECONDS//60)}분 정지 · 자동 종료'
                 if self.finish_measurement(reason):
                     self.status.set(reason+' · 다시 오르면 새 측정')
@@ -887,7 +886,7 @@ class SharedController(MenuAndSettingsMixin, MesoAndProbesMixin, JevMixin, track
             self.apply_meso_results(now, finishing=True)
             self.session.meso.finish(self.meso_source, now)
             self.update_meso_display(now)
-        had_record = bool(self.session.rows) and not self.session.restored
+        had_record = bool(self.session.rows) and not self.session.restored and self.session.ended is None
         if not super().finish_measurement(reason):
             return False
         self.recent_start_source = None

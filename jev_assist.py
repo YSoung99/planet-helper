@@ -130,13 +130,12 @@ def load_stalls(base=None):
 
 
 def save_stall(session_id, minute, reason, base=None):
-    data = load_stalls(base)
-    data.setdefault(session_id, {})[str(minute)] = reason
+    import records_backup
     path = stall_path(base)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix('.json.tmp')
-    temporary.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding='utf-8')
-    temporary.replace(path)
+    with records_backup.SHARED_JSON_LOCK:
+        data = load_stalls(base)
+        data.setdefault(session_id, {})[str(minute)] = reason
+        records_backup.atomic_write_json(path, data)
 
 
 def stall_text(reasons):
@@ -155,6 +154,25 @@ def ask_buff(icon, corner):
                  [('Yes, the same icon is shown in the buff bar', 'active'),
                   ('No, that icon is not in the buff bar', 'inactive')],
                  'JEV 버프 확인')
+
+
+def ask_buffs(icons_by_kind, corner):
+    """Check multiple registered buff icons against the same buff bar in one JEV request."""
+    if len(icons_by_kind) == 1:
+        kind, icon = next(iter(icons_by_kind.items()))
+        return {kind: ask_buff(icon, corner)}
+    images = [('Top-right buff bar of the game', corner)]
+    items = []
+    for kind, icon in icons_by_kind.items():
+        images.append((f'Registered buff icon ({kind})', icon))
+        items.append((
+            kind,
+            f'Is the registered buff icon ({kind}) currently shown in the top-right buff bar? '
+            'A countdown number may cover the bottom of the icon.',
+            [('active', 'Yes, that icon is shown in the buff bar'),
+             ('inactive', 'No, that icon is not in the buff bar')],
+        ))
+    return jev.ask_many(images, items, context='JEV 버프 확인')
 
 
 # ---- 5: which known character name is shown ----

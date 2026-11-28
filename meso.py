@@ -524,7 +524,7 @@ class Reader:
         import jev
         self.arbiter.submit(question,
                             lambda: jev.pick_reading(glyphs, [f'{v:,}' for v in readings], 'meso amount'),
-                            label='메소 판독')
+                            label='메소 판독', priority=2)
         return None
 
 
@@ -729,8 +729,18 @@ class SessionMeso:
         if value != last_v or active - last_t >= CHECKPOINT_INTERVAL:
             self.checkpoints.append((active, value))
             if len(self.checkpoints) > MAX_CHECKPOINTS:
-                # Keep the first anchor and thin out intermediate points.
-                self.checkpoints = [self.checkpoints[0]] + self.checkpoints[2::2] + [self.checkpoints[-1]]
+                # Keep the first anchor and full resolution inside RECENT_FLOW_WINDOW; thin older points.
+                cutoff = active - RECENT_FLOW_WINDOW
+                middle = self.checkpoints[1:-1]
+                old = [pt for pt in middle if pt[0] < cutoff]
+                recent = [pt for pt in middle if pt[0] >= cutoff]
+                if len(old) >= 4:
+                    thinned = old[::2]
+                else:
+                    thinned = old
+                    if len(recent) > MAX_CHECKPOINTS - 2:
+                        recent = recent[::2]
+                self.checkpoints = [self.checkpoints[0]] + thinned + recent + [self.checkpoints[-1]]
 
     def seed(self, value, source, stamp, opening=0, *, active_seconds=0.0):
         """Seed a pre-hunt confirmed balance from idle scanning before measurement started."""

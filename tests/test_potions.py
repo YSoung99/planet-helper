@@ -128,7 +128,7 @@ class PotionCoreTests(unittest.TestCase):
             reader = potions.Reader(ocr_fn=lambda img: [('412', 0.96)], base=tmp)
             self.assertEqual(reader.read_slots(frame, [slot]), [('쭈쭈바', 412)])
             # Verify it located the moved coordinates (820, 520), not any fixed ROI.
-            self.assertEqual(reader._last_boxes[0][1][:2], (820, 520))
+            self.assertEqual(reader._last_boxes[('icon', icon_file)][1][:2], (820, 520))
 
             # If the potion is removed from the quickslot bar, reader returns None cleanly.
             empty = Image.new('RGB', (1000, 600), (25, 35, 45))

@@ -11,7 +11,7 @@ MEMO_FILE = 'memos.json'
 # Character names typed by the user. They override OCR without touching the record files.
 CHARACTER_FILE = 'character-names.json'
 CACHE_FILE = '.summary-cache.json'
-CACHE_VERSION = 3
+CACHE_VERSION = 4
 _cache_lock = threading.Lock()
 _memory_cache = {}
 
@@ -34,17 +34,16 @@ def _load_map(path):
 
 def _save_entries(path, entries, limit):
     """Set or clear several session ids in one atomic write; returns the cleaned texts."""
-    data = _load_map(path)
-    cleaned = {}
-    for session_id, text in entries.items():
-        text = ' '.join(str(text).split())[:limit]
-        if text: data[session_id] = text
-        else: data.pop(session_id, None)
-        cleaned[session_id] = text
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix('.json.tmp')
-    temporary.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding='utf-8')
-    temporary.replace(path)
+    import records_backup
+    with records_backup.SHARED_JSON_LOCK:
+        data = _load_map(path)
+        cleaned = {}
+        for session_id, text in entries.items():
+            text = ' '.join(str(text).split())[:limit]
+            if text: data[session_id] = text
+            else: data.pop(session_id, None)
+            cleaned[session_id] = text
+        records_backup.atomic_write_json(path, data)
     return cleaned
 
 
@@ -85,18 +84,18 @@ def load_session_meso(session_id, base=None):
 def save_meso_marks(session_id, marked, base=None):
     """Persist updated large-change trade exclusions back to a saved session JSON."""
     import meso
+    import records_backup
     path = Path(base or tracker.BASE) / 'records' / f'{session_id}.json'
-    payload = json.loads(path.read_text(encoding='utf-8'))
-    if not isinstance(payload, dict) or not isinstance(payload.get('meso'), dict):
-        raise ValueError('저장된 메소 기록이 없어요.')
-    balance = meso.SessionMeso(payload['meso'])
-    balance.marked = {i for i in marked if isinstance(i, int) and 0 <= i < len(balance.large_changes)}
-    updated = dict(payload['meso'])
-    updated['marked'] = sorted(balance.marked)
-    payload['meso'] = updated
-    temporary = path.with_suffix('.json.tmp')
-    temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding='utf-8')
-    temporary.replace(path)
+    with records_backup.SHARED_JSON_LOCK:
+        payload = json.loads(path.read_text(encoding='utf-8'))
+        if not isinstance(payload, dict) or not isinstance(payload.get('meso'), dict):
+            raise ValueError('저장된 메소 기록이 없어요.')
+        balance = meso.SessionMeso(payload['meso'])
+        balance.marked = {i for i in marked if isinstance(i, int) and 0 <= i < len(balance.large_changes)}
+        updated = dict(payload['meso'])
+        updated['marked'] = sorted(balance.marked)
+        payload['meso'] = updated
+        records_backup.atomic_write_json(path, payload)
     return balance
 
 
@@ -1272,6 +1271,15 @@ def build_dialog(controller):
         populate_picker(character_picker.currentData())
         render_records()
 
+    def sync_live_meso_marks(session_id, marked):
+        session = getattr(controller, 'session', None)
+        if session is not None and session.session_id == session_id:
+            session.meso.marked = {
+                i for i in marked if isinstance(i, int) and 0 <= i < len(session.meso.large_changes)
+            }
+            if hasattr(controller, 'update_meso_display'):
+                controller.update_meso_display(controller._monotonic())
+
     def classify_saved_meso(row):
         balance = load_session_meso(row['session_id'])
         if balance is None or not balance.large_changes:
@@ -1280,14 +1288,20 @@ def build_dialog(controller):
         if result is None:
             return
         try:
-            save_meso_marks(row['session_id'], result)
+            updated = save_meso_marks(row['session_id'], result)
         except (OSError, ValueError) as exc:
             tracker.log_error('저장된 메소 변동 분류', exc)
             return
+        sync_live_meso_marks(row['session_id'], updated.marked)
         reload_all_rows()
 
     def open_detail(row):
-        show_session_detail(dialog, row, on_meso_changed=reload_all_rows)
+        def on_changed():
+            refreshed = load_session_meso(row['session_id'])
+            if refreshed is not None:
+                sync_live_meso_marks(row['session_id'], refreshed.marked)
+            reload_all_rows()
+        show_session_detail(dialog, row, on_meso_changed=on_changed)
 
     def context_menu(position):
         clicked = table.indexAt(position)

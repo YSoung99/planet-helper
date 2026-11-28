@@ -141,10 +141,13 @@ class MesoAndProbesMixin:
             except OSError as exc:
                 tracker.log_error('메소 기록 저장', exc)
             active_sec = session.active_elapsed(stamp) if session.started is not None else 0.0
+            prev_large = len(session.meso.large_changes)
             session.meso_dirty |= session.meso.sample(
                 confirmed, source, stamp, self.meso_opening, session.meso_start_at,
                 self.meso_trade_threshold, first_seen=self.meso_confirmation.first_seen,
                 active_seconds=active_sec, when=now_wall)
+            if len(session.meso.large_changes) > prev_large and getattr(self, 'jev_enabled', False):
+                self._capture_meso_change_frame(session.session_id, len(session.meso.large_changes) - 1, generation, stamp)
         if (not finishing and self.running and session.meso_dirty and session.rows and not session.ledger_dirty
                 and now - self.meso_last_flush >= 10):
             self.meso_last_flush = now
@@ -389,9 +392,26 @@ class MesoAndProbesMixin:
             return False
         return True
 
+    def _capture_meso_change_frame(self, session_id, index, generation, stamp):
+        """Pin the exact frame when a large meso change happened so JEV inspects that moment."""
+        import jev_assist
+        last = getattr(self, '_last_meso_frame', None)
+        frame = last[2] if (last is not None and last[0] == generation) else self.jev_frames.latest()
+        if frame is None:
+            return
+        self.jev_frames.remember(stamp, frame, force=True)
+        store = getattr(self, 'meso_change_frames', None)
+        if store is None:
+            store = {}
+            self.meso_change_frames = store
+        store[(session_id, index)] = jev_assist.FrameRing._encode(frame)
+        while len(store) > 16:
+            store.pop(next(iter(store)))
+
     def read_meso_frame(self, generation, stamp, frame, window, character):
         try:
             if generation == self.generation:
+                self._last_meso_frame = (generation, stamp, frame)
                 source = generation, window
                 manual_roi = getattr(self, 'meso_region', None)
                 if self.meso_reader_source != source:
@@ -426,7 +446,8 @@ class MesoAndProbesMixin:
                 tracker.log_error('캐릭터 HUD 판독', exc)
             if recent:
                 return
-            self.jev_frames.remember(stamp, frame)
+            if self.jev_enabled:
+                self.jev_frames.remember(stamp, frame)
             try:
                 if window is not None and self.buff_has_templates:
                     revision = self.buff_revision
@@ -442,8 +463,9 @@ class MesoAndProbesMixin:
                 tracker.log_error('사냥 신호 판독', exc)
             try:
                 slots = list(getattr(self, 'potion_slots', ()))
+                reader = self.potion_reader
                 if slots and window is not None and map_name.available():
-                    readings = self.potion_reader.read_slots(frame, slots)
+                    readings = reader.read_slots(frame, slots)
                     self.potion_results.put((generation, window, stamp, readings))
             except Exception as exc:
                 tracker.log_error('포션 소모 판독', exc)
@@ -554,7 +576,7 @@ class MesoAndProbesMixin:
                     self.potion_confirmations[name] = conf
                 confirmed = conf.observe(raw_val, stamp)
                 if confirmed is not None:
-                    session.potions_dirty |= session.potions.observe(name, confirmed, slots[name])
+                    session.potions_dirty |= session.potions.observe(name, confirmed, slots[name], stamp=stamp)
         if (self.running and session.potions_dirty and session.rows and not session.ledger_dirty
                 and now - self.potion_last_flush >= 10):
             self.potion_last_flush = now

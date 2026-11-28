@@ -83,6 +83,9 @@ class MenuAndSettingsMixin:
         finally:
             cleanup()
 
+    def _active_session_exclusions(self):
+        return {self.session.session_id} if self.running and self.session.session_id else None
+
     def export_records(self):
         import records_backup
         suggested = str(Path.home() / f"planet-helper-records-{datetime.now():%Y%m%d}.zip")
@@ -92,7 +95,7 @@ class MenuAndSettingsMixin:
         if not path.endswith('.zip'):
             path += '.zip'
         try:
-            count = records_backup.export_zip(path)
+            count = records_backup.export_zip(path, exclude_sessions=self._active_session_exclusions())
         except OSError as exc:
             tracker.log_error('기록 내보내기', exc)
             QMessageBox.warning(self.window, '사냥 기록 내보내기', f'내보내지 못했어요.\n{exc}')
@@ -122,10 +125,11 @@ class MenuAndSettingsMixin:
 
     def run_auto_backup(self):
         """Daily copy of the records, in the background so startup stays quick."""
+        excluded = self._active_session_exclusions()
         def work():
             try:
                 import records_backup
-                records_backup.auto_backup()
+                records_backup.auto_backup(exclude_sessions=excluded)
             except Exception as exc:
                 tracker.log_error('자동 백업', exc)
             if self.cloud_remote:
@@ -186,11 +190,12 @@ class MenuAndSettingsMixin:
                 self.cloud_signals.done.emit('이미 동기화 중이에요')
             return
         try:
+            excluded = self._active_session_exclusions()
             if push_only:
-                cloud_sync.push(remote)
+                cloud_sync.push(remote, exclude_sessions=excluded)
                 text = '구글 드라이브에 기록 올림'
             else:
-                text = '구글 드라이브 ' + cloud_sync.describe(cloud_sync.sync(remote))
+                text = '구글 드라이브 ' + cloud_sync.describe(cloud_sync.sync(remote, exclude_sessions=excluded))
         except Exception as exc:
             tracker.log_error('구글 드라이브 동기화', exc)
             try:
@@ -431,7 +436,7 @@ class MenuAndSettingsMixin:
                 if old.get('icon') and old['icon'] not in kept_icons:
                     potions.delete_icon(old['icon'], tracker.BASE)
             self.potion_slots = list(slots)
-            self.potion_reader.reset()
+            self.potion_reader = potions.Reader()
             self.potion_confirmations = {}
             self.save_config()
             self.update_potion_display(self._monotonic())
@@ -457,7 +462,7 @@ class MenuAndSettingsMixin:
         name = ' '.join(text.split())[:24] or None
         self.current_character = name
         self.save_config()
-        if self.session.rows:
+        if self.running and self.session.rows and not self.session.restored:
             try:
                 self.save_summary()  # the record being measured gets the name too
             except OSError as exc:

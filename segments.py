@@ -80,10 +80,9 @@ def load_tags(base=None):
 
 def save_tag(session_id, minute, text, base=None):
     """Store a tag; an empty text records that the question was dismissed."""
-    tags = load_tags(base)
-    tags.setdefault(session_id, {})[str(minute)] = ' '.join(str(text).split())[:60]
+    import records_backup
     path = tag_path(base)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix('.json.tmp')
-    temporary.write_text(json.dumps(tags, ensure_ascii=False, indent=2), encoding='utf-8')
-    temporary.replace(path)
+    with records_backup.SHARED_JSON_LOCK:
+        tags = load_tags(base)
+        tags.setdefault(session_id, {})[str(minute)] = ' '.join(str(text).split())[:60]
+        records_backup.atomic_write_json(path, tags)

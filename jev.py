@@ -28,9 +28,25 @@ class Unavailable(Exception):
     """JEV could not be asked (no key, no network); the question may be asked again later."""
 
 
+_ssl_ctx = None
+_ssl_lock = threading.Lock()
+
+
+def _ssl_context():
+    global _ssl_ctx
+    if _ssl_ctx is not None:
+        return _ssl_ctx
+    with _ssl_lock:
+        if _ssl_ctx is None:
+            import certifi  # the frozen app cannot see the system certificate store
+            _ssl_ctx = ssl.create_default_context(cafile=certifi.where())
+        return _ssl_ctx
+
+
 def image_url(picture, side=SIDE, *, center=True):
-    """PNG data URL of the picture scaled to fit a light grey square."""
+    """Data URL of the picture scaled to fit a light grey square (JPEG for full frames, PNG for crops)."""
     from PIL import Image
+    use_jpeg = max(picture.size) >= 400
     picture = picture.convert('RGB')
     scale = side / max(picture.size)
     picture = picture.resize((max(1, round(picture.width*scale)), max(1, round(picture.height*scale))),
@@ -39,6 +55,9 @@ def image_url(picture, side=SIDE, *, center=True):
     left = (side - picture.width) // 2 if center else 0
     canvas.paste(picture, (left, (side - picture.height) // 2))
     stream = io.BytesIO()
+    if use_jpeg:
+        canvas.save(stream, 'JPEG', quality=88)
+        return 'data:image/jpeg;base64,' + base64.b64encode(stream.getvalue()).decode()
     canvas.save(stream, 'PNG')
     return 'data:image/png;base64,' + base64.b64encode(stream.getvalue()).decode()
 
@@ -48,9 +67,7 @@ def request(content, questions, key, timeout=60):
     body = {'model': MODEL, 'input': [{'role': 'user', 'content': content}], 'questions': questions}
     call = urllib.request.Request(URL, json.dumps(body).encode(), {
         'Authorization': f'Bearer {key}', 'Content-Type': 'application/json'})
-    import certifi  # the frozen app cannot see the system certificate store
-    context = ssl.create_default_context(cafile=certifi.where())
-    with urllib.request.urlopen(call, timeout=timeout, context=context) as response:
+    with urllib.request.urlopen(call, timeout=timeout, context=_ssl_context()) as response:
         return json.loads(response.read())
 
 
@@ -103,6 +120,42 @@ def ask(images, instructions, choices, *, context='JEV', minimum=MIN_PROBABILITY
     return (value, probability) if scored else value
 
 
+def ask_many(images, items, *, context='JEV', minimum=MIN_PROBABILITY):
+    """Send multiple choice questions over the same images in a single HTTP request.
+
+    ``items`` is [(name, instructions, choices)] where choices is [(value, description)].
+    Returns {name: value_or_None}. Raises Unavailable on missing key or network error.
+    """
+    import map_name
+    key = map_name.gateway_key()
+    if not key:
+        raise Unavailable('JEV API 키 없음')
+    if not items:
+        return {}
+    content = [{'type': 'input_text', 'text': INTRO}]
+    for label, picture in images:
+        content += [{'type': 'input_text', 'text': label},
+                    {'type': 'input_image', 'image_url': image_url(picture)}]
+    questions = []
+    allowed_by_name = {}
+    for name, instructions, choices in items:
+        allowed_by_name[name] = {value for value, _ in choices}
+        questions.append({
+            'type': 'choice', 'name': name, 'instructions': instructions,
+            'choices': [{'value': value, 'description': text} for value, text in choices]
+            + [{'value': 'none', 'description': 'None of these, or unclear'}],
+        })
+    try:
+        reply = request(content, questions, key)
+    except (OSError, ValueError) as exc:
+        tracker.log_error(context, exc)
+        raise Unavailable(str(exc)) from exc
+    return {
+        name: best(reply, name, allowed, minimum=minimum)
+        for name, allowed in allowed_by_name.items()
+    }
+
+
 def pick_reading(picture, readings, what):
     """Choose which OCR reading matches the digits in the picture; readings are text."""
     choices = [(str(index), text) for index, text in enumerate(readings)]
@@ -131,6 +184,8 @@ class Arbiter:
         self.answers = OrderedDict()
         self.busy = None
         self.next_at = 0.0
+        self.last_done = 0.0
+        self.last_wait = 0.0
         self.calls = 0
         self.last_label = ''
         self.last_outcome = ''
@@ -157,9 +212,14 @@ class Arbiter:
             base += f' · 최근 {label}: {outcome}'
         return base
 
-    def submit(self, key, question, *, full_screen=False, label=''):
+    def submit(self, key, question, *, full_screen=False, label='', priority=0):
         with self.lock:
-            if (key in self.answers or self.busy is not None or self.clock() < self.next_at
+            now = self.clock()
+            effective_next = self.next_at
+            if priority >= 2 and self.last_wait <= self.cooldown:
+                # High-priority blocking tie-breaks (EXP/meso OCR) wait at most 3s instead of full cooldown.
+                effective_next = min(self.next_at, self.last_done + min(self.cooldown, 3.0))
+            if (key in self.answers or self.busy is not None or now < effective_next
                     or not self.enabled() or (full_screen and not self.full_screen_enabled())):
                 return False
             self.busy = key
@@ -185,8 +245,11 @@ class Arbiter:
                 if label:
                     self.last_label = label
                     self.last_outcome = outcome
+                done_at = self.clock()
                 self.busy = None
-                self.next_at = self.clock() + wait
+                self.last_done = done_at
+                self.last_wait = wait
+                self.next_at = done_at + wait
 
         try:
             self.runner(work)

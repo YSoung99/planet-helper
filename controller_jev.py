@@ -135,26 +135,68 @@ class JevMixin:
             self.jev_arbiter.submit(('nick', key), question, label='닉네임')
         return None
 
+    BUFF_ACTIVE_TTL = 30.0  # never smear a single JEV 'active' answer across a whole 2-minute bucket
+
     def jev_buff_readings(self, frame, stamp, readings):
-        """Worker thread: settle 'unknown' buff readings with one JEV look per kind and period."""
+        """Worker thread: settle 'unknown' buff readings with one batched JEV look per period."""
         readings = dict(readings)
         bucket = int(stamp // jev_assist.BUFF_SECONDS)
+        answered_at = getattr(self, '_jev_buff_answered', None)
+        if answered_at is None:
+            answered_at = {}
+            self._jev_buff_answered = answered_at
+        pending = []
         for kind, value in readings.items():
             if value != 'unknown':
                 continue
             question = ('buff', kind, bucket)
             found, verdict = self.jev_arbiter.answer(question)
             if found:
-                if verdict:
+                when = answered_at.setdefault(question, stamp)
+                if verdict == 'active' and stamp - when <= self.BUFF_ACTIVE_TTL:
+                    readings[kind] = verdict
+                elif verdict == 'inactive':
                     readings[kind] = verdict
                 continue
+            pending.append(kind)
+        if not pending:
+            return readings
+        # Batch multiple simultaneous unknown buffs into a single HTTP request when possible.
+        if len(pending) > 1:
+            batch_key = ('buff-batch', tuple(sorted(pending)), bucket)
+            found, verdicts = self.jev_arbiter.answer(batch_key)
+            if found:
+                when = answered_at.setdefault(batch_key, stamp)
+                if isinstance(verdicts, dict):
+                    for kind in pending:
+                        verdict = verdicts.get(kind)
+                        if verdict == 'active' and stamp - when <= self.BUFF_ACTIVE_TTL:
+                            readings[kind] = verdict
+                        elif verdict == 'inactive':
+                            readings[kind] = verdict
+                return readings
             corner = exp_buffs.buff_corner(frame)
 
-            def ask(kind=kind, corner=corner):
+            def ask_batch(kinds=tuple(pending), corner=corner):
                 from PIL import Image
-                with Image.open(exp_buffs.template_path(tracker.BASE, kind)) as icon:
-                    return jev_assist.ask_buff(icon.convert('RGB'), corner)
-            self.jev_arbiter.submit(question, ask, label='버프 확인')
+                icons = {}
+                for k in kinds:
+                    with Image.open(exp_buffs.template_path(tracker.BASE, k)) as icon:
+                        icons[k] = icon.convert('RGB')
+                return jev_assist.ask_buffs(icons, corner)
+
+            self.jev_arbiter.submit(batch_key, ask_batch, label='버프 확인', priority=0)
+            return readings
+        kind = pending[0]
+        question = ('buff', kind, bucket)
+        corner = exp_buffs.buff_corner(frame)
+
+        def ask(kind=kind, corner=corner):
+            from PIL import Image
+            with Image.open(exp_buffs.template_path(tracker.BASE, kind)) as icon:
+                return jev_assist.ask_buff(icon.convert('RGB'), corner)
+
+        self.jev_arbiter.submit(question, ask, label='버프 확인', priority=0)
         return readings
 
     def note_missing_hud(self, generation, full):
@@ -201,7 +243,7 @@ class JevMixin:
             return
         question = ('inventory', source, stamp)
         if self.jev_arbiter.submit(question, lambda: jev_assist.ask_inventory(frame),
-                                   full_screen=True, label='인벤토리 위치'):
+                                   full_screen=True, label='인벤토리 위치', priority=1):
             self.meso_missing = (source, since, question, stamp)
 
     def change_suggestion(self, change):
@@ -216,21 +258,25 @@ class JevMixin:
         after = self.jev_frames.latest(since=self.session.started + change['minute'] * 60)
         if before is not None and after is not None:
             self.jev_arbiter.submit(question, lambda: jev_assist.ask_change(before, after),
-                                    full_screen=True, label='효율 변화')
+                                    full_screen=True, label='효율 변화', priority=0)
         return None
 
     def meso_change_suggestion(self, index, delta):
         """JEV's cause hint for a large meso change ('거래·구매·창고' or '사냥 획득'), or None."""
-        if not self.jev_enabled or not self.running:
+        if not self.jev_enabled:
             return None
         question = ('meso_change', self.session.session_id, index)
         found, verdict = self.jev_arbiter.answer(question)
         if found:
             return verdict
-        frame = self.jev_frames.latest()
+        if not self.running:
+            return None
+        frames_map = getattr(self, 'meso_change_frames', None)
+        encoded = frames_map.get((self.session.session_id, index)) if frames_map else None
+        frame = jev_assist.FrameRing._decode(encoded) if encoded is not None else self.jev_frames.latest()
         if frame is not None:
             self.jev_arbiter.submit(question, lambda: jev_assist.ask_meso_change(frame, delta),
-                                    full_screen=True, label='큰 메소 변동')
+                                    full_screen=True, label='큰 메소 변동', priority=1)
         return None
 
     def apply_jev_hints(self, now):
@@ -257,7 +303,7 @@ class JevMixin:
                 frame = self.jev_frames.latest(since=activity.gained + 30)
                 if frame is not None:
                     self.jev_arbiter.submit(question, lambda: jev_assist.ask_stall(frame),
-                                            full_screen=True, label='멈춘 이유')
+                                            full_screen=True, label='멈춘 이유', priority=1)
             elif reason:
                 minutes = int(now - activity.gained) // 60
                 stall = f'경험치 멈춤 {minutes}분 · JEV 판단: {reason}'

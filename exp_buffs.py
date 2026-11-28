@@ -7,7 +7,10 @@ from PIL import Image
 
 LABELS = {'coupon': '경쿠', 'holy_symbol': '심볼'}
 MIN_SCORE = .92
+INACTIVE_MAX_SCORE = .60
 MAX_GAP = 8.0
+SCALE_LOCK_HITS = 1
+SCALE_UNLOCK_MISSES = 5
 
 
 def template_path(base, kind):
@@ -68,6 +71,8 @@ class Detector:
         self.last_result = None
         self.scales = {}
         self.locked_scales = {}  # (kind, frame_size) -> matched scale
+        self._scale_hits = {}    # (kind, frame_size) -> (scale, consecutive_count)
+        self._scale_misses = {}  # (kind, frame_size) -> consecutive_miss_count
 
     def read(self, frame, base):
         matches = dict.fromkeys(LABELS, 'unregistered')
@@ -104,25 +109,44 @@ class Detector:
             return self.last_result.copy()
 
         pixels = np.asarray(corner)
+        blank = float(pixels.std()) < 10.0
         locations = {}
         for kind, (_, _, patches) in templates.items():
-            locked = self.locked_scales.get((kind, frame.size))
+            lock_key = (kind, frame.size)
+            locked = self.locked_scales.get(lock_key)
             if locked is not None:
                 sizes = [s for s in (locked, locked - 1, locked + 1) if s in patches]
             else:
                 previous = self.scales.get(kind, 37)
                 sizes = sorted(patches, key=lambda size: abs(size - previous))
+            best_score = -1.0
             for size in sizes:
                 patch = patches[size]
                 if patch.shape[0] > pixels.shape[0] or patch.shape[1] > pixels.shape[1]:
                     continue
                 _, score, _, point = cv2.minMaxLoc(cv2.matchTemplate(pixels, patch, cv2.TM_CCOEFF_NORMED))
+                if score > best_score:
+                    best_score = float(score)
                 if score >= MIN_SCORE:
                     self.scales[kind] = size
-                    self.locked_scales[(kind, frame.size)] = size
+                    self._scale_misses[lock_key] = 0
+                    prev_hit = self._scale_hits.get(lock_key)
+                    hits = (prev_hit[1] + 1) if (prev_hit and prev_hit[0] == size) else 1
+                    self._scale_hits[lock_key] = (size, hits)
+                    if hits >= SCALE_LOCK_HITS:
+                        self.locked_scales[lock_key] = size
                     matches[kind] = 'active'
                     locations[kind] = point
                     break
+            if matches[kind] != 'active':
+                misses = self._scale_misses.get(lock_key, 0) + 1
+                self._scale_misses[lock_key] = misses
+                if locked is not None and misses >= SCALE_UNLOCK_MISSES:
+                    self.locked_scales.pop(lock_key, None)
+                    self._scale_hits.pop(lock_key, None)
+                    self._scale_misses[lock_key] = 0
+                if not blank and best_score < INACTIVE_MAX_SCORE:
+                    matches[kind] = 'inactive'
         if len(locations) == 2:
             first, second = locations.values()
             if abs(first[0] - second[0]) < 16 and abs(first[1] - second[1]) < 16:

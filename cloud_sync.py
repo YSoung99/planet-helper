@@ -68,12 +68,12 @@ def _join(remote, name):
     return remote + name if remote.endswith((':', '/')) else f'{remote}/{name}'
 
 
-def push(remote, base=None, name=None):
+def push(remote, base=None, name=None, *, exclude_sessions=None):
     """Upload this computer's backup. Returns the uploaded file name."""
     name = name or f'records-{computer_name()}.zip'
     with tempfile.TemporaryDirectory(prefix='planet-cloud-') as folder:
         archive = Path(folder)/name
-        records_backup.export_zip(archive, base)
+        records_backup.export_zip(archive, base, exclude_sessions=exclude_sessions)
         _run('mkdir', remote)
         _run('copyto', str(archive), _join(remote, name))
     return name
@@ -102,12 +102,12 @@ def pull(remote, base=None, own=None):
     return files, added, names
 
 
-def sync(remote, base=None):
+def sync(remote, base=None, *, exclude_sessions=None):
     """Pull first so the upload already contains what other computers added."""
     if not valid_remote(remote):
         raise ValueError('클라우드 위치가 올바르지 않아요.')
     files, added, names = pull(remote, base)
-    uploaded = push(remote, base)
+    uploaded = push(remote, base, exclude_sessions=exclude_sessions)
     result = dict(time=time.time(), ok=True, files=files, added=added, names=names, uploaded=uploaded)
     save_state(result, base)
     return result
@@ -118,10 +118,7 @@ def state_path(base=None):
 
 
 def save_state(result, base=None):
-    path = state_path(base)
-    temporary = path.with_suffix('.json.tmp')
-    temporary.write_text(json.dumps(result, ensure_ascii=False), encoding='utf-8')
-    temporary.replace(path)
+    records_backup.atomic_write_json(state_path(base), result, indent=None)
 
 
 def load_state(base=None):

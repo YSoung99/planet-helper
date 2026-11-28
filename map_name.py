@@ -12,6 +12,7 @@ import re
 import subprocess
 import sys
 import threading
+import time
 from pathlib import Path
 
 import tracker
@@ -56,27 +57,33 @@ def _get_engine():
 
 
 def _get_digit_engine():
-    """Lightweight English/digit recognizer for pure numeric strips (faster than Korean rec)."""
+    """Lightweight English/digit recognizer for pure numeric strips (reuses TwoTierOcr.fast if present)."""
     global _digit_engine, _digit_engine_checked
+    shared = tracker.shared_ocr_engine()
+    if shared is not None and getattr(shared, 'fast', None) is not None:
+        return shared.fast
     if _digit_engine_checked:
         return _digit_engine
     with _engine_lock:
         if not _digit_engine_checked:
-            _digit_engine_checked = True
             model = Path(tracker.RESOURCES)/'models'/DIGIT_MODEL
-            if model.is_file():
-                try:
-                    import logging
-                    from rapidocr import RapidOCR, LangRec, ModelType, OCRVersion
-                    _digit_engine = RapidOCR(params={
-                        'Global.use_det': False, 'Global.use_cls': False, 'Global.log_level': 'error',
-                        'Rec.lang_type': LangRec.EN, 'Rec.ocr_version': OCRVersion.PPOCRV4,
-                        'Rec.model_type': ModelType.MOBILE, 'Rec.model_path': str(model),
-                        'EngineConfig.onnxruntime.intra_op_num_threads': 1,
-                        'EngineConfig.onnxruntime.inter_op_num_threads': 1})
-                    logging.getLogger('RapidOCR').setLevel(logging.ERROR)
-                except Exception:
-                    _digit_engine = None
+            if not model.is_file():
+                _digit_engine_checked = True
+                return None
+            try:
+                import logging
+                from rapidocr import RapidOCR, LangRec, ModelType, OCRVersion
+                engine = RapidOCR(params={
+                    'Global.use_det': False, 'Global.use_cls': False, 'Global.log_level': 'error',
+                    'Rec.lang_type': LangRec.EN, 'Rec.ocr_version': OCRVersion.PPOCRV4,
+                    'Rec.model_type': ModelType.MOBILE, 'Rec.model_path': str(model),
+                    'EngineConfig.onnxruntime.intra_op_num_threads': 1,
+                    'EngineConfig.onnxruntime.inter_op_num_threads': 1})
+                logging.getLogger('RapidOCR').setLevel(logging.ERROR)
+                _digit_engine = engine
+                _digit_engine_checked = True
+            except Exception:
+                return None
         return _digit_engine
 
 
@@ -107,7 +114,10 @@ def recognize_lines(image, *, detect=True, digits_only=False):
     if not detect and digits_only:
         fast = _get_digit_engine()
         if fast is not None:
-            with _digit_lock:
+            shared = tracker.shared_ocr_engine()
+            lock = (getattr(shared, 'fast_lock', None)
+                    if shared is not None and getattr(shared, 'fast', None) is fast else _digit_lock)
+            with lock:
                 result = fast(rgb, use_det=False, use_rec=True)
             txts = getattr(result, 'txts', None)
             scores = getattr(result, 'scores', None)
@@ -158,11 +168,8 @@ def load(base=None):
 
 
 def _save(data, base=None):
-    path = _path(base)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix('.json.tmp')
-    temporary.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding='utf-8')
-    temporary.replace(path)
+    import records_backup
+    records_backup.atomic_write_json(_path(base), data)
 
 
 def resolve(raw, base=None):
@@ -182,21 +189,27 @@ def resolve(raw, base=None):
 
 
 def learn_alias(raw, name, base=None):
-    data = load(base); data['alias'][raw] = name; _save(data, base)
+    import records_backup
+    with records_backup.SHARED_JSON_LOCK:
+        data = load(base); data['alias'][raw] = name; _save(data, base)
 
 
 def remember_auto(session_id, raw, base=None):
-    data = load(base); data['auto'][session_id] = raw; _save(data, base)
+    import records_backup
+    with records_backup.SHARED_JSON_LOCK:
+        data = load(base); data['auto'][session_id] = raw; _save(data, base)
 
 
 def learn_correction(session_id, corrected, base=None):
     """The user edited an auto-filled memo: map that OCR reading to their text from now on."""
-    data = load(base)
-    raw = data['auto'].get(session_id)
-    if not raw or not corrected or corrected == raw:
-        return False
-    data['alias'][raw] = corrected
-    _save(data, base)
+    import records_backup
+    with records_backup.SHARED_JSON_LOCK:
+        data = load(base)
+        raw = data['auto'].get(session_id)
+        if not raw or not corrected or corrected == raw:
+            return False
+        data['alias'][raw] = corrected
+        _save(data, base)
     # Fix other measurements that still carry the same uncorrected reading.
     from record_history import load_memos, save_memo
     memos = load_memos(base)
@@ -222,18 +235,38 @@ def known_names(base=None):
     return sorted(names)
 
 
+_key_cache = None  # (expires_at, key_or_None)
+_key_lock = threading.Lock()
+_KEY_TTL = 300.0
+
+
+def invalidate_key_cache():
+    global _key_cache
+    with _key_lock:
+        _key_cache = None
+
+
 def gateway_key():
-    """API key from the environment, else the OS key store (macOS Keychain / Linux Secret Service)."""
-    key = os.environ.get('LLM_GATEWAY_API_KEY', '')
-    if not key:
-        command = (['/usr/bin/security', 'find-generic-password', '-s', KEYCHAIN_SERVICE, '-a', 'api-key', '-w']
-                   if sys.platform == 'darwin' else
-                   ['secret-tool', 'lookup', 'service', KEYCHAIN_SERVICE, 'account', 'api-key'])
-        try:
-            key = subprocess.run(command, capture_output=True, text=True, timeout=60).stdout
-        except (OSError, subprocess.SubprocessError):
-            key = ''
-    return key.strip() or None
+    """API key from the environment, else the OS key store (cached in memory for 5 minutes)."""
+    global _key_cache
+    env_key = os.environ.get('LLM_GATEWAY_API_KEY', '').strip()
+    if env_key:
+        return env_key
+    now = time.monotonic()
+    with _key_lock:
+        if _key_cache is not None and now < _key_cache[0]:
+            return _key_cache[1]
+    command = (['/usr/bin/security', 'find-generic-password', '-s', KEYCHAIN_SERVICE, '-a', 'api-key', '-w']
+               if sys.platform == 'darwin' else
+               ['secret-tool', 'lookup', 'service', KEYCHAIN_SERVICE, 'account', 'api-key'])
+    try:
+        key = subprocess.run(command, capture_output=True, text=True, timeout=60).stdout
+    except (OSError, subprocess.SubprocessError):
+        key = ''
+    cleaned = key.strip() or None
+    with _key_lock:
+        _key_cache = (time.monotonic() + _KEY_TTL, cleaned)
+    return cleaned
 
 
 def store_key(key):
@@ -259,6 +292,7 @@ def store_key(key):
         raise OSError(f'키 저장소를 사용할 수 없어요: {exc}') from exc
     if result.returncode != 0 and key:  # deleting a key that is not there is fine
         raise OSError((result.stderr or '키 저장 실패').strip()[:200])
+    invalidate_key_cache()
 
 
 def parse_pick(reply, names):

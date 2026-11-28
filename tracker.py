@@ -26,7 +26,7 @@ RESOURCES = Path(getattr(sys, '_MEIPASS', Path(__file__).resolve().parent))
 BASE = Path(os.environ.get('PLANET_EXP_DATA_DIR') or (
     Path.home()/'Library'/'Application Support'/'Maple Planet Helper Auto Trial'
     if sys.platform == 'darwin' else Path(__file__).resolve().parent))
-APP_VERSION = '1.4.41'
+APP_VERSION = '1.4.42'
 MAX_BOUNDARY_GAP = 10.0
 BURNING_MAX_LEVEL = 120  # Planet Up & Up grants one bonus level, capped at 120.
 REST_AFTER = 180.0  # EXP unchanged this long: rest counted from the last gain
@@ -56,8 +56,9 @@ def log_error(context, error):
 DIAGNOSTIC_SUFFIXES = ('-audit.jsonl', '-last-accepted.png', '-last-rejected.png')
 
 
-def prune_diagnostics(base=None, keep=20, log_limit=1_000_000, log_keep=200_000):
-    """Keep diagnostics for the newest `keep` measurements and cap launch.log.
+def prune_diagnostics(base=None, keep=20, log_limit=1_000_000, log_keep=200_000,
+                      audit_bytes_limit=100_000_000):
+    """Keep diagnostics for the newest `keep` measurements, cap total audit size and launch.log.
 
     Hunting records (CSV/JSON) are never touched. Returns the number of files removed.
     """
@@ -70,9 +71,31 @@ def prune_diagnostics(base=None, keep=20, log_limit=1_000_000, log_keep=200_000)
             for suffix in DIAGNOSTIC_SUFFIXES:
                 if path.is_file() and path.name.endswith(suffix):
                     sessions.setdefault(path.name[:-len(suffix)], []).append(path)
-        for session_id in sorted(sessions)[:-keep or None] if keep else sorted(sessions):
+        ordered = sorted(sessions)
+        drop_ids = ordered[:-keep or None] if keep else ordered
+        for session_id in drop_ids:
             for path in sessions[session_id]:
                 path.unlink(missing_ok=True); removed += 1
+        kept_ids = ordered[-keep:] if keep else []
+        if audit_bytes_limit and len(kept_ids) > 1:
+            total_bytes = 0
+            sizes = {}
+            for sid in kept_ids:
+                size = 0
+                for p in sessions[sid]:
+                    try:
+                        size += p.stat().st_size
+                    except OSError:
+                        pass
+                sizes[sid] = size
+                total_bytes += size
+            # Drop oldest kept sessions if combined diagnostic size still exceeds the byte cap.
+            for sid in kept_ids[:-1]:
+                if total_bytes <= audit_bytes_limit:
+                    break
+                for p in sessions[sid]:
+                    p.unlink(missing_ok=True); removed += 1
+                total_bytes -= sizes[sid]
     log = base/'launch.log'
     try:
         if log.stat().st_size > log_limit:
@@ -310,15 +333,32 @@ class KWinRegionCapture:
 
 
 _capture_state = threading.local()
+_shared_ocr_engine = None
+_shared_ocr_lock = threading.RLock()
+
+
+def register_shared_engine(engine):
+    global _shared_ocr_engine
+    with _shared_ocr_lock:
+        _shared_ocr_engine = engine
+
+
+def shared_ocr_engine():
+    with _shared_ocr_lock:
+        return _shared_ocr_engine
+
 
 class TwoTierOcr:
     """Wrap RapidOCR medium with an optional fast mobile recognizer for EXP lines."""
     def __init__(self, medium, fast=None):
         self.medium = medium
         self.fast = fast
+        self.medium_lock = threading.RLock()
+        self.fast_lock = threading.RLock()
 
     def __call__(self, rgb):
-        return self.medium(rgb)
+        with self.medium_lock:
+            return self.medium(rgb)
 
 
 def create_ocr_engine(*, prefer_native=True):
@@ -447,7 +487,7 @@ class LineReader:
             import jev
             self.arbiter.submit(question, lambda: jev.pick_reading(
                 image, [f'{exp:,} [{pct:.2f}%]' for exp, pct in candidates], 'EXP number and percentage'),
-                label='경험치 판독')
+                label='경험치 판독', priority=2)
             return None
         if picked is None:
             return None
@@ -500,7 +540,13 @@ class LineReader:
             if eff_scale > 1:
                 prepared = prepared.resize((image.width * eff_scale, image.height * eff_scale))
             prepared = ImageOps.expand(prepared, border, fill=0)
-            output = ocr(np.asarray(prepared if prepared.mode == 'RGB' else prepared.convert('RGB')))
+            arr = np.asarray(prepared if prepared.mode == 'RGB' else prepared.convert('RGB'))
+            lock = getattr(self.engine, 'fast_lock', None) if ocr is self.fast else getattr(self.engine, 'medium_lock', None)
+            if lock is not None:
+                with lock:
+                    output = ocr(arr)
+            else:
+                output = ocr(arr)
             texts = output.txts if output.txts is not None else ()
             scores = output.scores if output.scores is not None else ()
             raw = ''.join(texts)
@@ -971,12 +1017,24 @@ def load_saved_session(path, level, now):
     state = {}
     try:
         candidate = json.loads(path.with_suffix('.json').read_text(encoding='utf-8'))
-        if (candidate.get('version', 0) >= 4 and candidate.get('samples') == len(rows)
-                and candidate.get('baseline') == [int(rows[0]['현재 경험치']), float(rows[0]['퍼센트'])]
-                and candidate.get('last') == [int(rows[-1]['현재 경험치']), float(rows[-1]['퍼센트'])]):
-            saved_elapsed = float(candidate['elapsed_seconds'])
-            if math.isfinite(saved_elapsed) and saved_elapsed >= last_elapsed:
-                final_elapsed, state = saved_elapsed, candidate
+        if isinstance(candidate, dict) and candidate.get('version', 0) >= 4:
+            baseline_ok = candidate.get('baseline') == [int(rows[0]['현재 경험치']), float(rows[0]['퍼센트'])]
+            exact = (baseline_ok and candidate.get('samples') == len(rows)
+                     and candidate.get('last') == [int(rows[-1]['현재 경험치']), float(rows[-1]['퍼센트'])])
+            if exact:
+                saved_elapsed = float(candidate['elapsed_seconds'])
+                if math.isfinite(saved_elapsed) and saved_elapsed >= last_elapsed:
+                    final_elapsed, state = saved_elapsed, candidate
+            elif baseline_ok:
+                # Ungraceful shutdown left JSON summary slightly behind or ahead of CSV.
+                # Keep durable session metadata while deriving timing/rate_anchor from CSV rows.
+                state = {
+                    k: candidate[k] for k in (
+                        'exp_buff_intervals_seconds', 'meso', 'potions',
+                        'character_name', 'character_conflict', 'blocked',
+                        'stop_reason', 'level_ups',
+                    ) if k in candidate
+                }
     except (OSError, ValueError, TypeError, KeyError, AttributeError):
         pass
     session = Session(level=level)
@@ -1059,7 +1117,10 @@ class MeasurementCore:
     def restore_latest_record(self):
         folder = BASE/'records'
         if not folder.exists(): return
-        candidates = sorted(folder.glob('*.csv'),key=lambda path:path.stat().st_mtime,reverse=True)
+        candidates = sorted(
+            (p for p in folder.glob('*.csv') if p.name != 'meso.csv'),
+            key=lambda path: path.stat().st_mtime, reverse=True,
+        )
         for path in candidates:
             try:
                 state_path = path.with_suffix('.json')
@@ -1140,6 +1201,11 @@ class MeasurementCore:
         self.generation += 1
         if self.session.restored or self.session.first is None:
             return True
+        if self.session.ended is not None and not (
+            self.session.ledger_dirty or self.session.meso_dirty
+            or self.session.exp_buffs_dirty or self.session.potions_dirty
+        ):
+            return True
         self.session.finish(time.monotonic(), reason)
         try:
             self.save_observation()
@@ -1193,7 +1259,9 @@ class MeasurementCore:
                     try:
                         cpu_started = sum(process.cpu_times()[:2])
                         system_load = psutil.cpu_percent()
-                        if self.engine is None: self.engine = create_ocr_engine()
+                        if self.engine is None:
+                            self.engine = create_ocr_engine()
+                        register_shared_engine(self.engine)
                         if reader is None:
                             reader = LineReader(self.engine)
                             reader.arbiter = getattr(self, 'jev_arbiter', None)
@@ -1293,16 +1361,22 @@ class MeasurementCore:
                             window_bounds=image.info.get('window_bounds'),variants=frame['variants'],temporal=evidence,
                             verification_frames=frames or [initial])
                         if selected is None and evidence['reason'] != 'source_changed':
-                            try:save_rejected(BASE/'records'/'verification-frames',frames,evidence)
-                            except OSError as exc:
-                                details['verification_save_error']=str(exc);log_error('확인 이미지 저장',exc)
+                            submit_diag = getattr(self, '_submit_diagnostic', None)
+                            if callable(submit_diag):
+                                submit_diag(
+                                    '확인 이미지 저장',
+                                    save_rejected, BASE/'records'/'verification-frames', frames, evidence)
+                            else:
+                                try: save_rejected(BASE/'records'/'verification-frames', frames, evidence)
+                                except OSError as exc:
+                                    details['verification_save_error'] = str(exc); log_error('확인 이미지 저장', exc)
                         elif selected is not None and self.session.last and selected['value'][0] < self.session.last[0]:
                             try:
                                 save_conflict(BASE/'records'/'verification-frames',
-                                    getattr(self,'last_accepted_evidence',None),frames,evidence,self.session.last,
-                                    self.session.session_id,generation)
+                                    getattr(self, 'last_accepted_evidence', None), frames, evidence, self.session.last,
+                                    self.session.session_id, generation)
                             except OSError as exc:
-                                details['verification_save_error']=str(exc);log_error('감소 충돌 이미지 저장',exc)
+                                details['verification_save_error'] = str(exc); log_error('감소 충돌 이미지 저장', exc)
                         work_seconds = max(0, time.monotonic()-cycle_started-verification_wait)
                         cpu_seconds = max(0, sum(process.cpu_times()[:2])-cpu_started)
                         self.target_seconds = load_control.period(system_load, work_seconds, cpu_seconds)
@@ -1341,6 +1415,28 @@ class MeasurementCore:
 
     SUMMARY_FLUSH_SECONDS = 5.0
     PREVIEW_PNG_FLUSH_SECONDS = 5.0
+    AUDIT_UNCHANGED_SECONDS = 5.0
+
+    def _submit_diagnostic(self, context, fn, *args):
+        """Run rejected/conflict frame disk I/O off the capture loop (bounded queue, drop if busy)."""
+        lock = getattr(self, '_diag_lock', None)
+        if lock is None:
+            lock = threading.Lock()
+            self._diag_lock = lock
+        if not lock.acquire(blocking=False):
+            return
+        def work():
+            try:
+                fn(*args)
+            except OSError as exc:
+                log_error(context, exc)
+            finally:
+                lock.release()
+        try:
+            threading.Thread(target=work, name='diag-save', daemon=True).start()
+        except RuntimeError as exc:
+            lock.release()
+            log_error(context, exc)
 
     def save_observation(self, *, force_summary=False):
         folder = BASE/'records'
@@ -1440,27 +1536,36 @@ class MeasurementCore:
     def save_audit(self, observed_at, value, raw, score, accepted, details):
         folder = BASE/'records'
         folder.mkdir(exist_ok=True)
-        record = {'app_version':APP_VERSION,'time':time.time(),'capture_time_estimate':time.time()+observed_at-time.monotonic(),
-                  'raw':raw[:180],'value':value,'ocr_score':float(score),'accepted':accepted,
-                  'ocr_engine':details.get('ocr_engine'),
-                  'cached':details.get('cached',False),'covered':details.get('covered',False),'backend':details.get('backend','unknown'),
-                  'reason':self.status.get(),'capture_interval':self.scan_seconds,'target':self.target_seconds,
-                  'work_seconds':details.get('work_seconds'),'cpu_seconds':details.get('cpu_seconds'),
-                  'hud_capture':details.get('hud_capture'),
-                  'variants':details.get('variants',[]),'ui_kind':details.get('ui_kind'),
-                  'game_image_size':details.get('game_image_size'),'temporal':details.get('temporal'),'verification_save_error':details.get('verification_save_error')}
-        record.update(baseline=self.session.first, last=self.session.last,
-                      baseline_candidate=self.session.baseline_candidate,
-                      hunt_started_monotonic=self.session.started,
-                      capture_started_wall=details.get('capture_started_wall'),
-                      capture_finished_wall=details.get('capture_finished_wall'))
-        with (folder/(self.session.session_id+'-audit.jsonl')).open('a',encoding='utf-8') as stream:
-            stream.write(json.dumps(record,ensure_ascii=False)+'\n')
+        now_mono = time.monotonic()
+        status_text = self.status.get()
+        audit_sig = (self.session.session_id, accepted, value, self.session.last, status_text,
+                     details.get('covered', False), details.get('verification_save_error'))
+        prev_sig = getattr(self, '_last_audit_sig', None)
+        prev_at = getattr(self, '_last_audit_at', None)
+        if not (accepted and prev_sig == audit_sig and prev_at is not None
+                and now_mono - prev_at < self.AUDIT_UNCHANGED_SECONDS):
+            record = {'app_version':APP_VERSION,'time':time.time(),'capture_time_estimate':time.time()+observed_at-time.monotonic(),
+                      'raw':raw[:180],'value':value,'ocr_score':float(score),'accepted':accepted,
+                      'ocr_engine':details.get('ocr_engine'),
+                      'cached':details.get('cached',False),'covered':details.get('covered',False),'backend':details.get('backend','unknown'),
+                      'reason':status_text,'capture_interval':self.scan_seconds,'target':self.target_seconds,
+                      'work_seconds':details.get('work_seconds'),'cpu_seconds':details.get('cpu_seconds'),
+                      'hud_capture':details.get('hud_capture'),
+                      'variants':details.get('variants',[]),'ui_kind':details.get('ui_kind'),
+                      'game_image_size':details.get('game_image_size'),'temporal':details.get('temporal'),'verification_save_error':details.get('verification_save_error')}
+            record.update(baseline=self.session.first, last=self.session.last,
+                          baseline_candidate=self.session.baseline_candidate,
+                          hunt_started_monotonic=self.session.started,
+                          capture_started_wall=details.get('capture_started_wall'),
+                          capture_finished_wall=details.get('capture_finished_wall'))
+            with (folder/(self.session.session_id+'-audit.jsonl')).open('a',encoding='utf-8') as stream:
+                stream.write(json.dumps(record,ensure_ascii=False)+'\n')
+            self._last_audit_sig = audit_sig
+            self._last_audit_at = now_mono
         frame = details.get('image')
         if frame is not None:
             import hashlib
             group = 'accepted' if accepted else 'rejected'
-            now_mono = time.monotonic()
             if not hasattr(self, 'saved_frame_keys'): self.saved_frame_keys = {}
             if not hasattr(self, 'saved_frame_at'): self.saved_frame_at = {}
             prev_at = self.saved_frame_at.get(group)
