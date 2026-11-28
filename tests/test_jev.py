@@ -251,8 +251,8 @@ class ControllerTests(unittest.TestCase):
             c.apply_jev_hints(71.0)
             c.apply_jev_hints(72.0)
         ask.assert_called_once()
-        self.assertEqual(c.activity_label.text(), '획득 대기 · 사냥 여부 확인 중 · JEV: 사망')
-        self.assertEqual(c.stall_label.text(), '경험치 멈춤 1분 · JEV 판단: 사망')
+        self.assertEqual(c.activity_label.text(), '획득 대기 · 사냥 여부 확인 중 · 사망')
+        self.assertEqual(c.stall_label.text(), '경험치 멈춤 1분 · 사망')
         self.assertFalse(c.stall_label.isHidden())
         c.hunt_activity.update(c.generation, 80.0, gained=True)    # EXP moves again
         c.apply_jev_hints(81.0)
@@ -288,7 +288,7 @@ class ControllerTests(unittest.TestCase):
             c.apply_jev_hints(701.0)
             c.apply_jev_hints(702.0)
         ask.assert_called_once()
-        self.assertTrue(c.change_prompt.text().endswith('· JEV 추천: 경험치 버프 변화'))
+        self.assertTrue(c.change_prompt.text().endswith('· 경험치 버프 변화'))
         with patch('PySide6.QtWidgets.QInputDialog.getText', return_value=('', False)) as dialog:
             c.answer_change_prompt()
         self.assertEqual(dialog.call_args.kwargs['text'], '경험치 버프 변화')
@@ -319,7 +319,7 @@ class ControllerTests(unittest.TestCase):
             c.locate_inventory(source, 7.0, frame)          # missing for 6 seconds: ask
             c.locate_inventory(source, 9.0, frame)
             self.assertTrue(c.meso_inventory_closed)
-            self.assertEqual(c.meso_text(), '메소 · JEV: 인벤토리가 닫혀 있어요 · 열면 기록')
+            self.assertEqual(c.meso_text(), '메소 · 인벤토리가 닫혀 있어요 · 열면 기록')
             c.locate_inventory(source, 500.0, frame)        # closed: wait ten minutes
             self.assertEqual(ask.call_count, 1)
             c.locate_inventory(source, 608.0, frame)

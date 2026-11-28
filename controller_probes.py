@@ -146,7 +146,7 @@ class MesoAndProbesMixin:
                 confirmed, source, stamp, self.meso_opening, session.meso_start_at,
                 self.meso_trade_threshold, first_seen=self.meso_confirmation.first_seen,
                 active_seconds=active_sec, when=now_wall)
-            if len(session.meso.large_changes) > prev_large and getattr(self, 'jev_enabled', False):
+            if len(session.meso.large_changes) > prev_large:
                 self._capture_meso_change_frame(session.session_id, len(session.meso.large_changes) - 1, generation, stamp)
         if (not finishing and self.running and session.meso_dirty and session.rows and not session.ledger_dirty
                 and now - self.meso_last_flush >= 10):
@@ -207,11 +207,23 @@ class MesoAndProbesMixin:
             return
         idx = unreviewed[-1]
         hint = self.meso_change_suggestion(idx, balance.large_changes[idx]) if hasattr(self, 'meso_change_suggestion') else None
+        # Confident hunting profit / NPC loot sale: quietly keep as hunting income without nagging.
+        if hint == '사냥 획득':
+            self.meso_prompt_reviewed.add(idx)
+            unreviewed = [i for i in unreviewed if i != idx]
+            if not unreviewed:
+                if not prompt.isHidden():
+                    prompt.setVisible(False)
+                    from display_panel import resize
+                    resize(self)
+                return
+            idx = unreviewed[-1]
+            hint = self.meso_change_suggestion(idx, balance.large_changes[idx]) if hasattr(self, 'meso_change_suggestion') else None
         text = f'큰 메소 변동 {balance.describe_change(idx)} · 눌러서 분류'
         if len(unreviewed) > 1:
             text += f' (+{len(unreviewed) - 1}건)'
         if hint:
-            text += f' · JEV: {hint}'
+            text += f' · {hint}'
         if prompt.text() != text:
             prompt.setText(text)
         if prompt.isHidden():
@@ -322,7 +334,7 @@ class MesoAndProbesMixin:
                 return f'메소 {idle_val:,} · 대기 중 확인' + (f' · 오늘 {today:+,}' if today is not None else '')
             else:
                 if self.running and getattr(self, 'meso_inventory_closed', False) and self.jev_enabled:
-                    return '메소 · JEV: 인벤토리가 닫혀 있어요 · 열면 기록'
+                    return '메소 · 인벤토리가 닫혀 있어요 · 열면 기록'
                 return '메소 · 측정 중 인벤토리를 열면 기록'
         text = f'메소 {current:,}'
         balance = self.session.meso
@@ -393,8 +405,17 @@ class MesoAndProbesMixin:
         return True
 
     def _capture_meso_change_frame(self, session_id, index, generation, stamp):
-        """Pin the exact frame when a large meso change happened so JEV inspects that moment."""
+        """Record change timestamp (for local potion cross-check) and pin exact frame for JEV."""
         import jev_assist
+        stamps = getattr(self, 'meso_change_stamps', None)
+        if stamps is None:
+            stamps = {}
+            self.meso_change_stamps = stamps
+        stamps[(session_id, index)] = stamp
+        while len(stamps) > 32:
+            stamps.pop(next(iter(stamps)))
+        if not getattr(self, 'jev_enabled', False):
+            return
         last = getattr(self, '_last_meso_frame', None)
         frame = last[2] if (last is not None and last[0] == generation) else self.jev_frames.latest()
         if frame is None:
@@ -448,6 +469,11 @@ class MesoAndProbesMixin:
                 return
             if self.jev_enabled:
                 self.jev_frames.remember(stamp, frame)
+            retry = getattr(self, 'map_retry_at', None)
+            if (retry is not None and self.running and self.session.started is not None
+                    and retry[0] == self.session.session_id and stamp >= retry[1]):
+                self.map_retry_at = None
+                self.start_map_reading(self.session.session_id, frame, retry=True)
             try:
                 if window is not None and self.buff_has_templates:
                     revision = self.buff_revision

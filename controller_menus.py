@@ -352,8 +352,14 @@ class MenuAndSettingsMixin:
                 hint = self.meso_change_suggestion(idx, amount)
                 if hint:
                     suggestions[idx] = hint
+        reviewed = getattr(self, 'meso_prompt_reviewed', set()) if getattr(self, 'meso_prompt_session', None) == self.session.session_id else set()
+        precheck = {
+            idx for idx, hint in suggestions.items()
+            if hint in ('거래·구매·창고', '물약 구매') and idx not in reviewed
+        }
         result = record_history.classify_meso_dialog(
-            self.window, balance, title='이번 측정의 큰 메소 변동 분류', suggestions=suggestions)
+            self.window, balance, title='이번 측정의 큰 메소 변동 분류',
+            suggestions=suggestions, precheck=precheck)
         if result is None or self.session.meso is not balance:
             return
         balance.marked = set(result)
@@ -436,7 +442,7 @@ class MenuAndSettingsMixin:
                 if old.get('icon') and old['icon'] not in kept_icons:
                     potions.delete_icon(old['icon'], tracker.BASE)
             self.potion_slots = list(slots)
-            self.potion_reader = potions.Reader()
+            self.potion_reader = potions.Reader(arbiter=self.jev_arbiter)
             self.potion_confirmations = {}
             self.save_config()
             self.update_potion_display(self._monotonic())

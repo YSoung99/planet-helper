@@ -35,16 +35,17 @@ ROLLBACK_WINDOW = 30.0
 
 
 def _get_rec_engine():
-    """Return (RapidOCR medium engine, lock) reusing tracker's shared Python engine when possible.
+    """Return (OCR engine, lock) reusing tracker's shared engine on BOTH Linux (NativeOcr) and macOS (TwoTierOcr).
 
-    Linux Rust NativeOcr is NOT substituted here because RapidOCR Python preprocessing is verified
-    4/4 on outlined pixel quickslot digits; macOS / Python-OCR builds share TwoTierOcr.medium directly
-    to avoid loading the 76MB ONNX model twice.
+    Sharing the already-loaded PP-OCRv6_rec_medium engine eliminates a second ~100MB ONNX session
+    on both platforms while preserving full accuracy via 2px border trimming & matched upscaling.
     """
     global _rec_engine, _rec_checked
     import tracker
     shared = tracker.shared_ocr_engine()
-    if shared is not None and not hasattr(shared, 'read_exp'):
+    if shared is not None:
+        if hasattr(shared, 'read_exp'):
+            return shared, getattr(shared, 'lock', tracker._shared_ocr_lock)
         if hasattr(shared, 'medium') and hasattr(shared, 'medium_lock'):
             return shared.medium, shared.medium_lock
         return shared, tracker._shared_ocr_lock
@@ -275,32 +276,69 @@ def crop_digit_strip(frame, roi):
     return _box_digit_strip(frame, pixel_rect(roi, frame.width, frame.height))
 
 
-def recognize_count(crop, ocr_fn=None):
+def _judge_potion(arbiter, crop, first, second):
+    """Quietly break a 2-way OCR disagreement on a suspicious potion reading via JEV."""
+    if arbiter is None or first is None or second is None or first == second:
+        return None
+    readings = (first, second)
+    digest = hashlib.blake2b(f'{crop.size}:'.encode() + crop.tobytes(), digest_size=16).digest()
+    question = ('potion', digest, readings)
+    found, picked = arbiter.answer(question)
+    if found:
+        return None if picked is None else readings[picked]
+    import jev
+    arbiter.submit(
+        question,
+        lambda: jev.pick_reading(crop, [str(v) for v in readings], 'potion count'),
+        label='포션 판독', priority=2,
+    )
+    return None
+
+
+def recognize_count(crop, ocr_fn=None, *, arbiter=None, prev_value=None):
     """Read an integer potion count (0..99999) from a quickslot digit strip, or None."""
     import numpy as np
     from PIL import Image, ImageOps
 
+    engine_info = (None, None) if ocr_fn is not None else _get_rec_engine()
+    engine, lock = engine_info
+    is_native = engine is not None and hasattr(engine, 'read_exp')
+
     def run_ocr(img):
         if ocr_fn is not None:
             return ocr_fn(img)
-        engine, lock = _get_rec_engine()
         if engine is not None:
+            arr = np.asarray(img.convert('RGB'))
             with lock:
-                res = engine(np.asarray(img.convert('RGB')), use_det=False, use_rec=True)
+                res = engine(arr) if is_native else engine(arr, use_det=False, use_rec=True)
             txts = getattr(res, 'txts', None)
             scores = getattr(res, 'scores', None)
             return list(zip(txts, scores)) if txts is not None and scores is not None else []
         import map_name
         return map_name.recognize_lines(img, detect=False, digits_only=True)
 
-    scale = max(2, min(4, round(66 / max(1, crop.height))))
-    enlarged = crop.resize((crop.width * scale, crop.height * scale), Image.Resampling.LANCZOS)
+    # Trim 2px outer horizontal border of the quickslot tile to eliminate stray '|' / ')' artifacts.
+    inner = crop.crop((2, 0, crop.width - 2, crop.height)) if crop.width >= 20 else crop
+    scale = 2 if is_native else max(2, min(4, round(66 / max(1, inner.height))))
+    enlarged = inner.resize((inner.width * scale, inner.height * scale), Image.Resampling.LANCZOS)
     padded_w = ImageOps.expand(enlarged, border=12, fill=(255, 255, 255))
-    val = _parse_lines(run_ocr(padded_w))
-    if val is not None:
-        return val
+    val_w = _parse_lines(run_ocr(padded_w))
+    suspicious = (
+        val_w is not None and prev_value is not None
+        and (val_w == 0 or (prev_value - val_w) >= LARGE_DROP_THRESHOLD or _is_digit_drop(prev_value, val_w))
+    )
+    if val_w is not None and not suspicious:
+        return val_w
     padded_g = ImageOps.expand(enlarged, border=12, fill=(128, 128, 128))
-    return _parse_lines(run_ocr(padded_g))
+    val_g = _parse_lines(run_ocr(padded_g))
+    if val_w is None:
+        return val_g
+    if val_g is None or val_g == val_w:
+        return val_w
+    # Suspicious reading disagreed between white- and grey-padded OCR: let JEV quietly tie-break.
+    if arbiter is not None:
+        return _judge_potion(arbiter, crop, val_w, val_g)
+    return val_w
 
 
 def _parse_lines(lines):
@@ -374,19 +412,22 @@ class SlotConfirmation:
 class Reader:
     """Icon-matching + hash-cached quickslot reader; skips matching & OCR when pixels are unchanged."""
 
-    def __init__(self, ocr_fn=None, base=None):
+    def __init__(self, ocr_fn=None, base=None, *, arbiter=None):
         self.ocr_fn = ocr_fn
         self.base = base
+        self.arbiter = arbiter
         self._cache = {}       # slot_key -> (size, digest, value)
         self._templates = {}   # filename -> PIL RGB Image or None
         self._last_boxes = {}  # slot_key -> (frame_size, box, full_slot_digest)
         self._miss_cache = {}  # slot_key -> (frame_size, search_digest)
+        self._last_values = {}  # slot_key -> last valid int reading
 
     def reset(self):
         self._cache.clear()
         self._templates.clear()
         self._last_boxes.clear()
         self._miss_cache.clear()
+        self._last_values.clear()
 
     def _load_template(self, filename):
         if filename in self._templates:
@@ -478,8 +519,15 @@ class Reader:
             if cached is not None and cached[0] == crop.size and cached[1] == digest:
                 results.append((slot['name'], cached[2]))
                 continue
-            val = recognize_count(crop, ocr_fn=self.ocr_fn)
-            self._cache[key] = (crop.size, digest, val)
+            val = recognize_count(
+                crop, ocr_fn=self.ocr_fn, arbiter=self.arbiter,
+                prev_value=self._last_values.get(key),
+            )
+            if val is not None:
+                self._cache[key] = (crop.size, digest, val)
+                self._last_values[key] = val
+            elif self.arbiter is None:
+                self._cache[key] = (crop.size, digest, None)
             results.append((slot['name'], val))
         return results
 
@@ -490,6 +538,7 @@ class SessionPotions:
     def __init__(self, data=None):
         self.items = {}  # name -> dict(start, end, used, unit_cost, restocks)
         self._recent_drops = {}  # name -> (stamp, before_drop, drop_amount)
+        self._restock_times = []  # monotonic stamps of confirmed restocks for meso cross-checking
         if isinstance(data, dict) and isinstance(data.get('items'), list):
             for entry in data['items']:
                 if not isinstance(entry, dict):
@@ -548,8 +597,18 @@ class SessionPotions:
                     return True
             entry['restocks'] += 1
             entry['end'] = value
+            if stamp is not None:
+                self._restock_times.append(float(stamp))
+                if len(self._restock_times) > 64:
+                    del self._restock_times[:-64]
             return True
         return changed
+
+    def has_restock_near(self, stamp, window=60.0):
+        """True if any potion restock was confirmed within ``window`` seconds of ``stamp``."""
+        if stamp is None or not self._restock_times:
+            return False
+        return any(abs(t - stamp) <= window for t in self._restock_times)
 
     def total_used(self):
         return sum(item['used'] for item in self.items.values())

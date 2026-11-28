@@ -99,11 +99,12 @@ def save_meso_marks(session_id, marked, base=None):
     return balance
 
 
-def classify_meso_dialog(parent, balance, *, title='큰 메소 변동 분류', suggestions=None):
+def classify_meso_dialog(parent, balance, *, title='큰 메소 변동 분류', suggestions=None, precheck=None):
     """Modal checkbox dialog to toggle trade/purchase exclusions with live net-meso preview."""
     from PySide6.QtWidgets import QCheckBox, QDialog, QHBoxLayout, QLabel, QPushButton, QVBoxLayout
 
     suggestions = suggestions or {}
+    precheck = set(precheck or ())
     dialog = QDialog(parent)
     dialog.setWindowTitle(title)
     dialog.setStyleSheet(
@@ -121,9 +122,9 @@ def classify_meso_dialog(parent, balance, *, title='큰 메소 변동 분류', s
     for idx in range(len(balance.large_changes)):
         label = f'{idx + 1}. {balance.describe_change(idx)}'
         if suggestions.get(idx):
-            label += f' · JEV: {suggestions[idx]}'
+            label += f' · {suggestions[idx]}'
         box = QCheckBox(label)
-        box.setChecked(idx in balance.marked)
+        box.setChecked(idx in balance.marked or idx in precheck)
         layout.addWidget(box)
         boxes.append(box)
 

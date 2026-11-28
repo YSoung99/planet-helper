@@ -88,7 +88,7 @@ def best(reply, name, allowed, minimum=MIN_PROBABILITY):
     return value if probability >= minimum else None
 
 
-def ask(images, instructions, choices, *, context='JEV', minimum=MIN_PROBABILITY, scored=False):
+def ask(images, instructions, choices, *, context='JEV', minimum=MIN_PROBABILITY, scored=False, timeout=60):
     """Return the chosen value from ``choices`` [(value, description)], or None.
 
     ``images`` is [(label, picture)]. A 'none' choice is always added so JEV is
@@ -111,7 +111,8 @@ def ask(images, instructions, choices, *, context='JEV', minimum=MIN_PROBABILITY
                 'choices': [{'value': value, 'description': text} for value, text in choices]
                 + [{'value': 'none', 'description': 'None of these, or unclear'}]}
     try:
-        value, probability = top(request(content, [question], key), 'answer', {value for value, _ in choices})
+        value, probability = top(request(content, [question], key, timeout=timeout),
+                                 'answer', {value for value, _ in choices})
     except (OSError, ValueError) as exc:
         tracker.log_error(context, exc)
         raise Unavailable(str(exc)) from exc

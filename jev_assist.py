@@ -240,21 +240,62 @@ def quadrant_region(key):
     return QUADRANTS[key][1]
 
 
-# ---- large meso change cause: shop/trade/storage vs normal hunting ----
+# ---- large meso change cause: shop/trade/storage vs hunting/NPC loot sale ----
 
 MESO_CHANGE_CHOICES = [
-    ('A shop, NPC merchant, player trade window, storage, auction or item purchase UI is visible', '거래·구매·창고'),
+    ('A player trade window, storage, auction/free market, or buying potions/items from a shop (meso spent or transferred)', '거래·구매·창고'),
     ('Normal monster hunting in a field with no shop, trade or storage window open', '사냥 획득'),
+    ('Selling hunt drops/junk/equipment to an NPC merchant (meso gained from selling loot)', '사냥 획득'),
 ]
 
 
 def ask_meso_change(frame, delta):
-    """Ask JEV whether a large meso jump happened in a shop/trade/storage UI or while hunting."""
+    """Ask JEV whether a large meso jump is trade/purchase/storage or hunting profit (incl. NPC loot sale)."""
     direction = f'+{delta:,}' if delta >= 0 else f'{delta:,}'
     return _pick(
         [('Game screen near the meso change', frame)],
         f'The player meso balance changed suddenly by {direction}. '
-        'Does the screen show a shop, trade, storage or purchase window, or normal hunting?',
+        'Is this a player trade, storage transfer, or buying items/potions, '
+        'or normal hunting / selling hunt loot to an NPC?',
         MESO_CHANGE_CHOICES,
         'JEV 큰 메소 변동',
     )
+
+
+# ---- seamless potion preset recognition when registering a quickslot icon ----
+
+POTION_PRESETS = [
+    ('Red Potion (small red bottle, beginner HP potion)', '빨간 포션', 50),
+    ('Orange Potion (small orange bottle, HP potion)', '주황 포션', 160),
+    ('White Potion (small white/silver bottle, HP potion)', '하얀 포션', 320),
+    ('Blue Potion (small blue bottle, MP potion)', '파란 포션', 200),
+    ('Mana Elixir (tall cyan/blue glowing bottle, MP)', '마나 엘릭서', 620),
+    ('Unagi / Roasted Eel on a plate (HP food)', '장어구이', 1100),
+    ('Pure Water / Clear Water glass bottle (sky-blue MP bottle)', '맑은 물', 1650),
+    ('Jujuba / Icebar popsicle on stick (yellow-orange HP)', '쭈쭈바', 2300),
+    ('Patbingsu / Shaved Ice bowl with red bean (MP)', '팥빙수', 4000),
+    ('Reindeer Milk bottle (white milk bottle, HP)', '순록의 우유', 5600),
+    ('Sunset Dew / Twilight Dew bottle (orange-pink MP bottle)', '황혼의 이슬', 10200),
+    ('Elixir (ornate blue/purple potion, 50% HP/MP)', '엘릭서', 0),
+    ('Power Elixir (ornate golden/blue potion, 100% HP/MP)', '파워 엘릭서', 0),
+    ('All Cure Potion (green/white medicine bottle)', '만병통치약', 400),
+    ('Pain Reliever pill/bottle (defense medicine)', '통증 완화제', 1200),
+]
+
+
+def ask_potion_preset(icon, *, timeout=5):
+    """Quietly identify a common MapleStory potion icon to prefill name & NPC shop price, or None."""
+    choices = [(str(i), desc) for i, (desc, _, _) in enumerate(POTION_PRESETS)]
+    try:
+        picked = jev.ask(
+            [('Quickslot consumable icon', icon)],
+            'Which MapleStory consumable item matches this quickslot icon? '
+            'Ignore any hotkey letter at the top-left and quantity digits at the bottom.',
+            choices, context='JEV 포션 인식', minimum=0.80, timeout=timeout,
+        )
+    except jev.Unavailable:
+        return None
+    if picked is None:
+        return None
+    _, name, cost = POTION_PRESETS[int(picked)]
+    return name, cost

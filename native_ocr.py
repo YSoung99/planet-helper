@@ -3,6 +3,7 @@ from importlib.util import find_spec, module_from_spec, spec_from_file_location
 import os
 from pathlib import Path
 import sys
+import threading
 from types import SimpleNamespace
 
 
@@ -81,11 +82,14 @@ def open_recognizer(resources):
 class NativeOcr:
     def __init__(self, recognizer):
         self.recognizer = recognizer
+        self.lock = threading.RLock()
 
     def __call__(self, rgb):
         height, width, _ = rgb.shape
-        text, score = self.recognizer.text(rgb.tobytes(), width, height)
+        with self.lock:
+            text, score = self.recognizer.text(rgb.tobytes(), width, height)
         return SimpleNamespace(txts=(text,), scores=(score,))
 
     def read_exp(self, rgb, total):
-        return self.recognizer.experience(rgb.tobytes(), rgb.width, rgb.height, total)
+        with self.lock:
+            return self.recognizer.experience(rgb.tobytes(), rgb.width, rgb.height, total)

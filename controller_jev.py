@@ -51,11 +51,24 @@ class JevMixin:
             self.jev_button.setAccessibleDescription(text)
         self.set_card_line(self.jev_status, text)
 
-    def start_map_reading(self, session_id, full):
-        """Read the minimap name once per measurement, off the UI thread."""
-        if getattr(self, 'map_read_for', None) == session_id or not map_name.available():
+    MAP_RETRY_DELAY = 75.0
+
+    def start_map_reading(self, session_id, full, *, retry=False):
+        """Read the minimap name once per measurement (with 1 quiet retry if occluded at start)."""
+        if not map_name.available():
+            return
+        attempts = getattr(self, 'map_read_attempts', None)
+        if attempts is None or attempts[0] != session_id:
+            count = 0
+        else:
+            count = attempts[1]
+        if not retry and count >= 1:
+            return
+        if retry and count >= 2:
             return
         self.map_read_for = session_id
+        self.map_read_attempts = (session_id, count + 1)
+        self.map_retry_at = None
         revision = self.jev_revision if self.jev_enabled else None
 
         def can_request():
@@ -105,7 +118,14 @@ class JevMixin:
             if (current_request and session_id == self.jev_status_session
                     and self.jev_status.text() == 'JEV 확인 중…'):
                 self.set_jev_status(f'JEV로 확인 · {picked}' if picked else 'JEV 결과 없음')
-            if not (raw or picked) or load_memos().get(session_id):
+            if not (raw or picked):
+                # Minimap may have been covered at hunt start: quietly schedule 1 retry later.
+                attempts = getattr(self, 'map_read_attempts', None)
+                if (session_id == current_session and self.running
+                        and attempts == (session_id, 1) and not load_memos().get(session_id)):
+                    self.map_retry_at = (session_id, self._monotonic() + self.MAP_RETRY_DELAY)
+                continue
+            if load_memos().get(session_id):
                 continue  # never overwrite a memo the user already wrote
             try:
                 name = save_memo(session_id, picked or map_name.resolve(raw))
@@ -246,8 +266,20 @@ class JevMixin:
                                    full_screen=True, label='인벤토리 위치', priority=1):
             self.meso_missing = (source, since, question, stamp)
 
+    def _local_change_hint(self, change):
+        """Infer an obvious efficiency-change cause from local buff records before calling JEV."""
+        target_sec = change['minute'] * 60.0
+        for spans in (self.session.exp_buff_intervals or {}).values():
+            for start_sec, end_sec in spans:
+                if abs(start_sec - target_sec) <= 90.0 or abs(end_sec - target_sec) <= 90.0:
+                    return '경험치 버프 변화'
+        return None
+
     def change_suggestion(self, change):
-        """JEV's tag for an efficiency change, from frames before and after it, or None."""
+        """Tag for an efficiency change: local buff records first, else JEV before/after comparison."""
+        local = self._local_change_hint(change)
+        if local is not None:
+            return local
         if not self.jev_enabled or self.session.started is None:
             return None
         question = ('change', self.session.session_id, change['minute'])
@@ -262,7 +294,13 @@ class JevMixin:
         return None
 
     def meso_change_suggestion(self, index, delta):
-        """JEV's cause hint for a large meso change ('거래·구매·창고' or '사냥 획득'), or None."""
+        """Cause hint for a large meso change ('물약 구매', '거래·구매·창고', or '사냥 획득'), or None."""
+        # Zero-cost local cross-check: a large meso drop right next to a confirmed potion restock.
+        if delta < 0:
+            stamps = getattr(self, 'meso_change_stamps', None)
+            change_stamp = stamps.get((self.session.session_id, index)) if stamps else None
+            if change_stamp is not None and self.session.potions.has_restock_near(change_stamp, window=60.0):
+                return '물약 구매'
         if not self.jev_enabled:
             return None
         question = ('meso_change', self.session.session_id, index)
@@ -306,8 +344,8 @@ class JevMixin:
                                             full_screen=True, label='멈춘 이유', priority=1)
             elif reason:
                 minutes = int(now - activity.gained) // 60
-                stall = f'경험치 멈춤 {minutes}분 · JEV 판단: {reason}'
-                suffix = f' · JEV: {reason}'
+                stall = f'경험치 멈춤 {minutes}분 · {reason}'
+                suffix = f' · {reason}'
                 if not self.activity_label.text().endswith(suffix):
                     self.activity_label.setText(self.activity_label.text() + suffix)
                 if self.jev_stall_saved != question:
@@ -318,11 +356,11 @@ class JevMixin:
                     except OSError as exc:
                         tracker.log_error('멈춘 이유 저장', exc)
         self.set_card_line(self.stall_label, stall)
-        # Suggested tag for an efficiency change.
+        # Suggested tag for an efficiency change (local buff records work even with JEV off).
         change = getattr(self, 'pending_change', None)
-        if change is not None and enabled:
+        if change is not None and self.running:
             suggestion = self.change_suggestion(change)
-            text = self.change_prompt_text + (f' · JEV 추천: {suggestion}' if suggestion else '')
+            text = self.change_prompt_text + (f' · {suggestion}' if suggestion else '')
             if self.change_prompt.text() != text:
                 self.change_prompt.setText(text)
 
@@ -365,7 +403,7 @@ class JevMixin:
             self.window, '효율 변화',
             f"{change['minute']}분째부터 분당 {change['before']:,.0f} → {change['after']:,.0f}\n"
             '여기서 뭐가 달라졌나요? (예: 버프 끝, 파티 합류, 맵 이동)\n비워 두고 확인하면 다시 묻지 않아요.'
-            + ('\nJEV가 화면을 비교해 추천한 태그를 미리 넣어 뒀어요.' if suggestion else ''),
+            + ('\n감지된 변화를 미리 넣어 뒀어요.' if suggestion else ''),
             text=suggestion or '')
         if not ok:
             return
