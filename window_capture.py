@@ -14,14 +14,16 @@ def _await_callback(start, timeout=5):
         result.extend((value, error))
         ready.set()
     start(completed)
-    deadline = time.monotonic()+timeout
-    while not ready.wait(.02):
-        if time.monotonic() >= deadline:
-            raise TimeoutError('게임 창 캡처 시간 초과 · 자동 재시도')
-        if threading.current_thread() is threading.main_thread():
+    if threading.current_thread() is threading.main_thread():
+        deadline = time.monotonic()+timeout
+        while not ready.wait(.02):
+            if time.monotonic() >= deadline:
+                raise TimeoutError('게임 창 캡처 시간 초과 · 자동 재시도')
             from PySide6.QtWidgets import QApplication
             app = QApplication.instance()
             if app: app.processEvents()
+    elif not ready.wait(timeout):
+        raise TimeoutError('게임 창 캡처 시간 초과 · 자동 재시도')
     value, error = result
     if error is not None:
         raise RuntimeError('게임 창 캡처 실패: '+str(error))
@@ -102,13 +104,19 @@ def cgimage_to_pil(captured, quartz, image_module):
     data = quartz.CGDataProviderCopyData(provider)
     if data is None:
         return None
-    raw = bytes(data)
-    if len(raw) < stride * height:
+    try:
+        view = memoryview(data)
+    except TypeError:
+        view = bytes(data)
+    if len(view) < stride * height:
         return None
-    return image_module.frombytes('RGB', (width, height), raw, 'raw', mode, stride, 1)
+    return image_module.frombytes('RGB', (width, height), view, 'raw', mode, stride, 1)
 
 
 class WindowCapture:
+    CONTENT_TTL = 15.0
+    PIXEL_FORMAT_BGRA = 0x42475241  # kCVPixelFormatType_32BGRA
+
     def __init__(self, bundle_id=BUNDLE_ID, preferred_id=None, expected_pid=None):
         if bundle_id is None and expected_pid is None:
             raise ValueError('A capture owner must be specified')
@@ -117,13 +125,15 @@ class WindowCapture:
         self.preferred_id = preferred_id
         self.content = None
         self.content_at = 0
+        self._cached_filter = None
 
     def find_window(self, force=False):
-        if force or self.content is None or time.monotonic()-self.content_at > 3:
+        if force or self.content is None or time.monotonic()-self.content_at > self.CONTENT_TTL:
             from ScreenCaptureKit import SCShareableContent
             self.content = _await_callback(lambda done:
                 SCShareableContent.getShareableContentExcludingDesktopWindows_onScreenWindowsOnly_completionHandler_(True,False,done))
             self.content_at = time.monotonic()
+            self._cached_filter = None
         windows = []
         for window in self.content.windows():
             owner = window.owningApplication()
@@ -134,12 +144,34 @@ class WindowCapture:
                 windows.append(window)
         if not windows:
             self.content = None
+            self._cached_filter = None
             raise RuntimeError('MapleStory Worlds 게임 창 대기 · 실행/최소화 상태 확인')
         preferred = next((w for w in windows if int(w.windowID()) == self.preferred_id),None)
         window = preferred or max(windows,key=lambda w:
             (str(w.title() or '') == 'MapleStory Worlds',w.frame().size.width*w.frame().size.height))
         self.preferred_id = int(window.windowID())
         return window
+
+    def _filter_and_config(self, window, bounds, SCContentFilter, SCStreamConfiguration):
+        key = (int(window.windowID()), bounds)
+        cached = getattr(self, '_cached_filter', None)
+        if cached is not None and cached[0] == key:
+            return cached[1:]
+        content_filter = SCContentFilter.alloc().initWithDesktopIndependentWindow_(window)
+        rect = content_filter.contentRect()
+        width, height = float(rect.size.width), float(rect.size.height)
+        scale = float(content_filter.pointPixelScale())
+        configuration = SCStreamConfiguration.alloc().init()
+        configuration.setShowsCursor_(False)
+        configuration.setCapturesAudio_(False)
+        configuration.setIgnoreShadowsSingleWindow_(True)
+        configuration.setShouldBeOpaque_(True)
+        if hasattr(configuration, 'setPixelFormat_'):
+            configuration.setPixelFormat_(self.PIXEL_FORMAT_BGRA)
+        configuration.setWidth_(max(1, round(width * scale)))
+        configuration.setHeight_(max(1, round(height * scale)))
+        self._cached_filter = (key, content_filter, width, height, scale, configuration)
+        return content_filter, width, height, scale, configuration
 
     def snapshot(self, roi=None, legacy_region=None, include_full=False):
         import objc
@@ -151,27 +183,15 @@ class WindowCapture:
             window = self.find_window()
             frame = window.frame()
             bounds = (float(frame.origin.x),float(frame.origin.y),float(frame.size.width),float(frame.size.height))
-            content_filter = SCContentFilter.alloc().initWithDesktopIndependentWindow_(window)
-            rect = content_filter.contentRect()
-            width,height = float(rect.size.width),float(rect.size.height)
-            scale = float(content_filter.pointPixelScale())
+            content_filter, width, height, scale, configuration = self._filter_and_config(
+                window, bounds, SCContentFilter, SCStreamConfiguration)
             if roi is None and legacy_region is not None:
                 roi = region_from_desktop(legacy_region,bounds)
-            configuration = SCStreamConfiguration.alloc().init()
-            configuration.setShowsCursor_(False)
-            configuration.setCapturesAudio_(False)
-            configuration.setIgnoreShadowsSingleWindow_(True)
-            configuration.setShouldBeOpaque_(True)
             if roi is not None:
                 if not valid_roi(roi): raise ValueError('게임 경험치 영역을 다시 지정해 주세요')
                 reference = roi.get('reference_aspect',width/height)
                 if abs((width/height)/reference-1) > .02:
                     raise ValueError('게임 창 비율 변경 · 경험치 영역 다시 지정')
-            # sourceRect is not a reliable crop for desktop-independent windows.
-            # Capture at full native resolution, then crop the returned CGImage.
-            # The crop uses the same pixel coordinates as the selection image.
-            configuration.setWidth_(max(1,round(width*scale)))
-            configuration.setHeight_(max(1,round(height*scale)))
             try:
                 captured = _await_callback(lambda done:
                     SCScreenshotManager.captureImageWithFilter_configuration_completionHandler_(content_filter,configuration,done))
@@ -189,6 +209,7 @@ class WindowCapture:
                     image = Image.open(io.BytesIO(bytes(encoded))).convert('RGB')
             except Exception:
                 self.content = None
+                self._cached_filter = None
                 raise
             image.info.update(capture_backend='sck-window',window_id=int(window.windowID()),
                               window_title=str(window.title() or ''),window_bounds=bounds,

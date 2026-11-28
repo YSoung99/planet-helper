@@ -25,7 +25,7 @@ RESOURCES = Path(getattr(sys, '_MEIPASS', Path(__file__).resolve().parent))
 BASE = Path(os.environ.get('PLANET_EXP_DATA_DIR') or (
     Path.home()/'Library'/'Application Support'/'Maple Planet Helper Auto Trial'
     if sys.platform == 'darwin' else Path(__file__).resolve().parent))
-APP_VERSION = '1.4.37'
+APP_VERSION = '1.4.38'
 MAX_BOUNDARY_GAP = 10.0
 BURNING_MAX_LEVEL = 120  # Planet Up & Up grants one bonus level, capped at 120.
 REST_AFTER = 180.0  # EXP unchanged this long: rest counted from the last gain
@@ -486,7 +486,13 @@ class LineReader:
             return grayscale
 
         def run_variant(ocr, prepared, scale=4, border=20):
-            prepared = ImageOps.expand(prepared.resize((image.width*scale, image.height*scale)), border, fill=0)
+            # Cap upscaling on high-DPI / Retina macOS crops (already 2x taller) so we do not
+            # inflate 50px crops to 200px before PaddleOCR immediately shrinks them back to 48px.
+            target_h = 80 if scale >= 4 else 64
+            eff_scale = max(1, min(scale, round(target_h / max(1, image.height))))
+            if eff_scale > 1:
+                prepared = prepared.resize((image.width * eff_scale, image.height * eff_scale))
+            prepared = ImageOps.expand(prepared, border, fill=0)
             output = ocr(np.asarray(prepared if prepared.mode == 'RGB' else prepared.convert('RGB')))
             texts = output.txts if output.txts is not None else ()
             scores = output.scores if output.scores is not None else ()

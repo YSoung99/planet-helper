@@ -74,6 +74,8 @@ class Controller(SharedController):
 
     def show(self):
         super().show()
+        if getattr(self, '_icon_applied', False):
+            return
         from AppKit import NSApplication, NSImage
         from Foundation import NSBundle
 
@@ -82,6 +84,7 @@ class Controller(SharedController):
             icon = NSImage.alloc().initWithContentsOfFile_(path)
             if icon is not None:
                 NSApplication.sharedApplication().setApplicationIconImage_(icon)
+                self._icon_applied = True
 
     def native_overlay(self, widget, level=3):
         native_overlay(widget, level)
@@ -136,11 +139,9 @@ class Controller(SharedController):
 
     def check_permission(self):
         from PySide6.QtWidgets import QMessageBox
-        from macos_support import has_capture_permission
+        from macos_support import has_capture_permission, request_capture_permission
         if has_capture_permission(): return True
-        core = ctypes.CDLL('/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics')
-        core.CGRequestScreenCaptureAccess.restype = ctypes.c_bool
-        if core.CGRequestScreenCaptureAccess(): return True
+        if request_capture_permission(): return True
         self.status.set('화면 기록 권한 허용 후 앱 다시 실행')
         answer = QMessageBox.question(self.window, '화면 기록 권한',
             '경험치 숫자를 읽으려면 화면 기록 권한이 필요해요.\n\n'

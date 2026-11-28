@@ -106,8 +106,15 @@ class KeyRepeatBridge(QObject):
                         raise ValueError('invalid status')
                 if 'settings' in state:
                     self.settings = validated_settings(state['settings'])
+                changed = state != self.state
                 self.state = state
-                self.changed.emit(dict(state))
+                steady = (state.get('accessibility') and state.get('inputMonitoring')
+                          and not state.get('legacyRunning') and not state.get('error'))
+                target_ms = 10000 if steady else 2000
+                if self.poll_timer.interval() != target_ms:
+                    self.poll_timer.setInterval(target_ms)
+                if changed:
+                    self.changed.emit(dict(state))
             except (ValueError, TypeError, UnicodeError):
                 self._protocol_error()
                 return

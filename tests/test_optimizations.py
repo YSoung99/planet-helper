@@ -321,6 +321,77 @@ class JevControlsAndUpdatePruningTests(unittest.TestCase):
             self.assertEqual(cap.game()[0].id, 42)
         self.assertEqual(calls['list'], 1)
 
+    def test_macos_window_capture_caches_filter_and_requests_bgra(self):
+        import window_capture
+        allocs = {'filter': 0, 'cfg': 0, 'pixel_fmt': None}
+
+        class FakeFilter:
+            def initWithDesktopIndependentWindow_(self, w):
+                allocs['filter'] += 1
+                return self
+            def contentRect(self):
+                return SimpleNamespace(size=SimpleNamespace(width=1280, height=720))
+            def pointPixelScale(self):
+                return 2.0
+
+        class FakeConfig:
+            def init(self):
+                allocs['cfg'] += 1
+                return self
+            def setShowsCursor_(self, v): pass
+            def setCapturesAudio_(self, v): pass
+            def setIgnoreShadowsSingleWindow_(self, v): pass
+            def setShouldBeOpaque_(self, v): pass
+            def setPixelFormat_(self, v): allocs['pixel_fmt'] = v
+            def setWidth_(self, v): self.w = v
+            def setHeight_(self, v): self.h = v
+
+        SCContentFilter = SimpleNamespace(alloc=lambda: FakeFilter())
+        SCStreamConfiguration = SimpleNamespace(alloc=lambda: FakeConfig())
+        cap = window_capture.WindowCapture()
+        win = SimpleNamespace(windowID=lambda: 77)
+        bounds = (0.0, 0.0, 1280.0, 720.0)
+        res1 = cap._filter_and_config(win, bounds, SCContentFilter, SCStreamConfiguration)
+        res2 = cap._filter_and_config(win, bounds, SCContentFilter, SCStreamConfiguration)
+        self.assertIs(res1[0], res2[0])
+        self.assertIs(res1[4], res2[4])
+        self.assertEqual(allocs['filter'], 1)
+        self.assertEqual(allocs['cfg'], 1)
+        self.assertEqual(allocs['pixel_fmt'], window_capture.WindowCapture.PIXEL_FORMAT_BGRA)
+        # Moving/resizing invalidates the cached filter.
+        cap._filter_and_config(win, (10.0, 0.0, 1280.0, 720.0), SCContentFilter, SCStreamConfiguration)
+        self.assertEqual(allocs['filter'], 2)
+
+    def test_retina_high_dpi_exp_crop_avoids_4x_over_upscaling(self):
+        sizes = []
+        class FakeOcr:
+            def __call__(self, rgb):
+                sizes.append(rgb.shape[:2])
+                return SimpleNamespace(txts=('219671043 [51.32%]',), scores=(0.99,))
+        reader = tracker.LineReader(FakeOcr())
+        # Retina 2x crop (height=56): should stay at 1x/2x (height <= 120), NOT 56*4=224+40=264!
+        retina = Image.new('RGB', (400, 56), (20, 20, 20))
+        reader.read(retina, 1.0, force=True, level=170)
+        self.assertTrue(sizes)
+        self.assertLessEqual(max(h for h, _ in sizes), 120)
+
+    def test_key_repeat_bridge_backs_off_polling_when_permissions_are_ready(self):
+        import key_repeat
+        with tempfile.TemporaryDirectory() as tmp:
+            bridge = key_repeat.KeyRepeatBridge(tmp)
+            emitted = []
+            bridge.changed.connect(emitted.append)
+            steady_msg = json.dumps({
+                'type': 'status', 'enabled': False, 'active': False,
+                'accessibility': True, 'inputMonitoring': True,
+                'legacyRunning': False, 'status': '연타 꺼짐', 'error': '',
+            }).encode('utf-8') + b'\n'
+            with patch.object(bridge.process, 'readAllStandardOutput', return_value=steady_msg):
+                bridge._read()
+                bridge._read()  # identical state should not re-emit
+            self.assertEqual(len(emitted), 1)
+            self.assertEqual(bridge.poll_timer.interval(), 10000)
+
 
 if __name__ == '__main__':
     unittest.main()
